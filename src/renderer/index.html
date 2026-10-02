@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<!-- The renderer never loads remote content itself: every remote interface
+		     lives in a <webview> guest, which has its own origin, its own process
+		     and its own policy. This one only has to cover the chrome this file
+		     draws — hence `file:`, because a page loaded from disk has an opaque
+		     origin that `'self'` alone does not match.
+
+		     `'unsafe-inline'` is granted for STYLE and for nothing else: Electron's
+		     own `<webview>` implementation applies inline styles to the element as
+		     it attaches, and a policy without it blocks them — the violation fires
+		     on `appendChild(view)`, in no code of ours, and a guest whose inline
+		     styles are dropped does not lay out. Scripts stay locked to
+		     `'self' file:`. -->
+		<meta
+			http-equiv="Content-Security-Policy"
+			content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' data: file:; font-src 'self' file:"
+		/>
+		<title>dsh-tabs</title>
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<header id="bar">
+			<div id="tabs" role="tablist"></div>
+			<button id="add" type="button" title="Open or add a device">+</button>
+		</header>
+		<main id="content"></main>
+		<div id="popover" hidden></div>
+		<script src="app.js"></script>
+	</body>
+</html>

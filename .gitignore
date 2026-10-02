@@ -1,0 +1,23 @@
+# The Electron binary is ~366 MB and comes from `npm run install-electron`.
+# It is reproducible from package-lock.json and the checksum Electron publishes,
+# so it has no business in the history.
+node_modules/
+
+# Scratch directories the suites create. `DSH_TABS_TEST_HOME` moves the first one;
+# `.tmp/` is what the README's install workaround points TEMP at.
+.tmp-main-test/
+.tmp/
+
+# Connect transcripts and installer output, when anything is captured to a file.
+*.log
+
+# Scratch material from the Android feasibility research: ~120 MB of downloaded
+# JARs, extracted sources and fetched HTML. The reports that were written from it
+# are kept — those are the part worth reading — but the raw input is reproducible
+# and has no business in the history.
+.research/
+.ssh-research/
+
+# Windows filesystem noise.
+Thumbs.db
+desktop.ini
