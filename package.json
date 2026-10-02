@@ -1,0 +1,23 @@
+{
+  "name": "dsh-tabs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tabbed host for DSH web interfaces: the local one and remote ones over SSH, in a single always-visible tab bar.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "install-electron": "node node_modules/electron/install.js",
+    "test": "node tools/smoke.mjs && node tools/connect.mjs && node tools/main.mjs && node tools/renderer.mjs",
+    "test:smoke": "node tools/smoke.mjs",
+    "test:connect": "node tools/connect.mjs",
+    "test:main": "node tools/main.mjs",
+    "test:renderer": "node tools/renderer.mjs",
+    "test:live": "node tools/live-connect.mjs",
+    "contract": "node tools/contract.cjs",
+    "readiness": "node tools/readiness.cjs"
+  },
+  "devDependencies": {
+    "electron": "44.0.0",
+    "jsdom": "^30.1.1"
+  }
+}

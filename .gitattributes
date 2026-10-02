@@ -1,0 +1,13 @@
+# Every file in this project is text, and every file is authored with LF.
+#
+# Without this, `core.autocrlf` decides per machine: a clone on Windows gets CRLF
+# in the sources while the tests read those same sources and compare the bytes
+# they contain — the Windows programs and the plugin-parity check both build
+# strings out of them. Normalising to LF keeps a clone byte-identical to what the
+# suites were run against, on either platform.
+* text=auto eol=lf
+
+# The Electron binary lives in node_modules and is never tracked; this is only
+# here so a stray archive is treated as binary rather than converted.
+*.zip binary
+*.exe binary
