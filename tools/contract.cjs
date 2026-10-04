@@ -48,14 +48,16 @@ const TOOL = `tools/${basename(__filename)}`
 const CONTRACT_VERSION = 1
 
 /**
- * A real readiness line, exactly as `dsh web --no-open --port 0` printed it on
- * this machine.
+ * A readiness line in the exact shape `dsh web --no-open --port 0` prints, captured
+ * from a real run on this machine — with the session token replaced by a placeholder
+ * of the same length.
  *
- * A **fixture**, and the one value in this file that is not derived from this
- * repository: it describes a component outside it. It is the whole line rather
- * than just the URL, because the prefix is part of what a client has to match —
- * the URL alone does not satisfy `remote.readyUrl()`, which is the sort of thing
- * worth finding out here rather than in a Kotlin port.
+ * The token is a credential for as long as its server lives: the first request trades
+ * it for a session cookie. This file is published, and a second client reads it, so
+ * the value in it is not one. What has to be faithful is the line, not the secret —
+ * and it is the whole line rather than just the URL, because the prefix is part of
+ * what a client has to match: the URL alone does not satisfy `remote.readyUrl()`,
+ * which is the sort of thing worth finding out here rather than in a Kotlin port.
  */
 const READY_EXAMPLE = 'dsh web: http://127.0.0.1:56418/?token=not-a-real-token-not-a-real-token-000000000'
 
@@ -123,7 +125,10 @@ const contract = {
 		completeLinesOnly: true,
 		partialLineAllowedAfterExit: true,
 		example: READY_EXAMPLE,
-		exampleUrl: 'http://127.0.0.1:56418/?token=not-a-real-token-not-a-real-token-000000000',
+		// Derived rather than written twice: the two copies were identical by hand, and
+		// the Kotlin parity test asserts that they agree — which is a test for a
+		// mistake this line can simply not make.
+		exampleUrl: READY_EXAMPLE.replace(/^dsh web:\s*/u, ''),
 		// `--port 0` means the far side's OS picks the port, and the real one is
 		// read back out of this line. A second client must not invent a port.
 		urlCarriesPort: true,
