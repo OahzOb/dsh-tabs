@@ -11,6 +11,14 @@ node_modules/
 # Connect transcripts and installer output, when anything is captured to a file.
 *.log
 
+# Development screenshots of the application in use, kept out of the repository on
+# purpose: the device panel shows real host names and SSH users, and the tab bar
+# shows the operator's own machine labels. They are evidence for what the README
+# claims, not source, and they live beside the checkout as well. The directory is
+# ignored rather than its contents, so a capture run that re-creates it stays
+# untracked too.
+.shots/
+
 # Scratch material from the Android feasibility research: ~120 MB of downloaded
 # JARs, extracted sources and fetched HTML. The reports that were written from it
 # are kept — those are the part worth reading — but the raw input is reproducible
