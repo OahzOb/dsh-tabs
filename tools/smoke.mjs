@@ -11,9 +11,9 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 
@@ -836,6 +836,181 @@ await test('every local link in the README resolves to a file', () => {
 		)
 	}
 	assert.ok(local.length >= 2, 'the README no longer links to the feasibility studies')
+})
+
+console.log('what this repository is allowed to carry')
+
+/**
+ * The repository is about to be somebody else's checkout, and two kinds of string
+ * must not survive the trip: a path that only exists on the machine this was built
+ * on, and anything that describes that machine's owner or their network.
+ *
+ * The checks below are deliberately pattern-based rather than a list of the names to
+ * avoid. **A check that spells out a secret publishes it**, and the file that
+ * enforces this rule is read by exactly the people the rule protects it from.
+ */
+
+/**
+ * Every drive-absolute path this repository may contain, with what it is.
+ *
+ * A fixture is not a location: these are strings that make a shell or a quoting rule
+ * do something, and none of them is expected to exist anywhere.
+ */
+const ALLOWED_ABSOLUTE = [
+	'C:\\Windows', // the OS's own directory: the fallback when `SystemRoot` is unset
+	'C:\\work', // the fixture launch directory, in every branch that quotes one
+	'C:\\Program', // the same fixture with a space in it; the match stops at the space
+	'C:\\nope', // a transcript fixture for a `Set-Location` that failed
+	'C:\\definitely-not-a-directory-dsh-tabs', // the README's measured example of that same failure
+	'C:\\…', // an elided path: the redacted form is allowed, the real one is not
+	'C:\\Users\\…'
+]
+
+/**
+ * A drive-absolute path, and the two things that keep this from matching code.
+ *
+ * The drive letter must be **uppercase** and must not follow a letter. Without both
+ * rules this fires on things that are not paths at all: a regular expression's
+ * `\b:\s*` reads as drive `b`, `http:\/\/` reads as drive `p`, and a template
+ * literal's `\n${…}` reads as drive `n`. Every one of those is lowercase, and every
+ * drive letter written in this repository is not.
+ */
+const DRIVE_PATH = /(?<![A-Za-z])[A-Z]:\\[^\s"'`|<>()[\]]*/gu
+
+/**
+ * Addresses that may appear: loopback, the unspecified address, one Windows
+ * capability name that only looks like an address, and the two fixtures.
+ */
+const ALLOWED_ADDRESSES = new Set(['0.0.0.0', '0.0.1.0', '127.0.0.0', '127.0.0.1', '10.0.0.2', '10.0.0.3'])
+
+/** Ranges that describe somebody's network rather than an example. */
+const PRIVATE_RANGE = /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/u
+
+/** A user profile, in the three spellings that reach a published file. */
+const PROFILE_PATHS = [
+	/[A-Za-z]:\\Users\\(?!…)/u,
+	/\/Users\/[A-Za-z0-9._-]+\//u,
+	/\/home\/[A-Za-z0-9._-]+\//u
+]
+
+/**
+ * Every text file this repository would hand to a clone.
+ *
+ * Directories the suites and capture runs create are skipped: they hold the
+ * operator's own data by design, and `.gitignore` is what keeps them out of a commit.
+ */
+function repositoryFiles() {
+	const SKIP = new Set(['node_modules', '.git', '.shots', '.tmp', '.tmp-main-test', '.research', '.ssh-research'])
+	const TEXT = /\.(?:md|js|mjs|cjs|json|html|css|ps1|sh|yml|yaml|txt)$/u
+	const NAMES = new Set(['LICENSE', '.gitignore', '.gitattributes'])
+	const files = []
+	const walk = (directory) => {
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			if (SKIP.has(entry.name)) continue
+			const path = join(directory, entry.name)
+			if (entry.isDirectory()) walk(path)
+			else if (TEXT.test(entry.name) || NAMES.has(entry.name)) files.push(path)
+		}
+	}
+	walk(ROOT)
+	return files
+}
+
+const REPOSITORY_FILES = repositoryFiles()
+
+/**
+ * One file's lines, prepared for matching.
+ *
+ * URLs are removed first, because a URL's path segments look like a filesystem path
+ * and `github.com/home/user` is nobody's home directory. Doubled backslashes are
+ * collapsed, because `'C:\\work'` in JavaScript and `"C:\\work"` in JSON both name
+ * `C:\work` and the check has to read what the string means, not how it is escaped.
+ *
+ * @param file - the file to read.
+ * @returns the prepared lines with their numbers.
+ */
+function preparedLines(file) {
+	return readFileSync(file, 'utf8')
+		.split(/\r?\n/u)
+		.map((text, index) => ({
+			number: index + 1,
+			text: text.replace(/https?:\/\/\S+/gu, '').replace(/\\\\/gu, '\\')
+		}))
+}
+
+await test('no file names a directory that only exists on the machine this was built on', () => {
+	const offences = []
+	for (const file of REPOSITORY_FILES) {
+		for (const { number, text } of preparedLines(file)) {
+			for (const match of text.matchAll(DRIVE_PATH)) {
+				if (ALLOWED_ABSOLUTE.some((allowed) => match[0].startsWith(allowed))) continue
+				offences.push(`${relative(ROOT, file)}:${number}  ${match[0]}`)
+			}
+		}
+	}
+	assert.deepEqual(
+		offences,
+		[],
+		`a drive-absolute path a reader cannot resolve:\n${offences.join('\n')}\n` +
+			'Write the place, not the path: `<root>\\dsh-electron-test`, or an elided `C:\\…`.'
+	)
+})
+
+await test('no file names a user profile, a private address or somebody\'s machine', () => {
+	const offences = []
+	for (const file of REPOSITORY_FILES) {
+		for (const { number, text } of preparedLines(file)) {
+			for (const pattern of PROFILE_PATHS) {
+				const match = pattern.exec(text)
+				if (match !== null) offences.push(`${relative(ROOT, file)}:${number}  ${match[0]}  (a user profile)`)
+			}
+			for (const match of text.matchAll(/\b(?:\d{1,3}\.){3}\d{1,3}\b/gu)) {
+				if (ALLOWED_ADDRESSES.has(match[0])) continue
+				if (!PRIVATE_RANGE.test(match[0])) continue
+				offences.push(`${relative(ROOT, file)}:${number}  ${match[0]}  (a private address)`)
+			}
+		}
+	}
+	assert.deepEqual(
+		offences,
+		[],
+		`something that describes the machine this was built on:\n${offences.join('\n')}\n` +
+			'Use the loopback address, a documentation range, or one of the fixtures.'
+	)
+})
+
+await test('the screenshots a capture run produces cannot be committed by accident', () => {
+	// They are evidence, and they show a real device book: host names, SSH users and
+	// the operator's own machines in the tab bar. `tools/shot.ps1` writes them into
+	// `.shots`, and a directory left out of `.gitignore` is one `git add -A` away
+	// from being published.
+	const ignore = readFileSync(join(ROOT, '.gitignore'), 'utf8')
+	assert.match(ignore, /^\.shots\/$/mu, '.shots/ is not ignored, so a capture run can be committed')
+	assert.match(ignore, /^node_modules\/$/mu, 'node_modules/ is not ignored')
+})
+
+await test('the two guards above would actually fire', () => {
+	// A guard that has never been seen to fail is a guard that may be matching
+	// nothing at all — and these two are the kind that fail silently, because a
+	// pattern that stopped matching reports exactly what a clean repository reports.
+	//
+	// The samples are assembled rather than written out. This file is scanned by the
+	// checks it defines, so a literal here would be an offence in it.
+	const profile = ['C:', 'Users', 'someone', 'work', 'dsh'].join('\\')
+	const found = [...profile.matchAll(DRIVE_PATH)].map((match) => match[0])
+	assert.ok(found.length > 0, 'the drive-path pattern no longer matches a drive path')
+	assert.ok(
+		!ALLOWED_ABSOLUTE.some((allowed) => found[0].startsWith(allowed)),
+		'a path belonging to somebody is on the allowlist'
+	)
+	assert.ok(
+		PROFILE_PATHS.some((pattern) => pattern.test(profile)),
+		'the profile pattern no longer matches a user profile'
+	)
+
+	const address = ['192', '168', '1', '10'].join('.')
+	assert.ok(PRIVATE_RANGE.test(address), 'the private-range pattern no longer matches a private address')
+	assert.ok(!ALLOWED_ADDRESSES.has(address), 'a private address is on the allowlist')
 })
 
 console.log('electron api contract')

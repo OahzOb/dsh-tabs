@@ -247,8 +247,8 @@ real APPCRASH (`0xC0000005` inside `electron.exe`) while `44.0.0` produced a sil
 `STATUS_BREAKPOINT` — but that comparison was made from inside `$DSH_HOME`, where
 **every** Electron fails, so it may have been comparing two symptoms of one cause.
 
-Re-run on 2026-10-04 from `C:\Projects\dsh-electron-pin`, a directory outside the
-Harness home, with the harness's own `ELECTRON_RUN_AS_NODE` cleared:
+Re-run on 2026-10-04 from a scratch directory outside the Harness home, with the
+harness's own `ELECTRON_RUN_AS_NODE` cleared:
 
 | Binary | The file says | `--version` answers | Window | After 12 s | Closed |
 | --- | --- | --- | --- | --- | --- |
@@ -502,7 +502,7 @@ distribution copied to five places — identical bytes, verified file counts:
 | `<home>\.dsh\apps\dsh-tabs\inside-dsh-dist` | no output, exit `-2147483645` |
 | `<home>\.dsh\electron-probe3\dist` | no output, exit `-2147483645` |
 | `<home>\dsh-probe3\dist` | `v44.0.0`, exit 0 |
-| `C:\dsh-electron-test` | `v44.0.0`, exit 0 |
+| `<root>\dsh-electron-test` | `v44.0.0`, exit 0 |
 
 It is the exact directory name, not the shape of the path: `.dshX`, `.dsh2` and
 `.x` under the same parent all work, `C:\Users\…\.dsh` does not, and `.dsh` is a
@@ -523,9 +523,9 @@ the file name (renaming changes nothing), not `PATH` (a system-only `PATH`
 changes nothing), not a corrupt download (the zip's SHA-256 matches Electron's own
 `checksums.json`) and not an incomplete extraction (73 files, all present).
 
-**So: put this application anywhere outside `$DSH_HOME`.** It lives at
-`C:\Projects\dsh-workspace\dsh-tabs` for exactly that reason — the measurements above
-were taken while it was a directory shallower, at `C:\Projects\dsh-tabs`, and the move
+**So: put this application anywhere outside `$DSH_HOME`.** It lives in the workspace
+container that holds it, beside its Android sibling, for exactly that reason — the
+measurements above were taken from a directory one level shallower, and the move
 changed nothing. Nothing about it depends on the location.
 
 ## The local tab needs a current `dsh`, not a credential of its own
@@ -839,6 +839,20 @@ named a variable by a spelling no file contained — no heading may be left stan
 over nothing at all, and **every local link has to resolve**, which is the only
 thing watching the paths to the studies above: no source file names them, so a
 moved or renamed one is a dead end nothing else would notice.
+
+Four more read **every file in the repository**, this document included, and they are
+about what it is allowed to carry once it is somebody else's checkout: no
+drive-absolute path that only exists on the machine this was built on, no user
+profile, no private or carrier-grade address, and `.shots/` has to stay ignored —
+the screenshots are evidence and they show a real device book. The fourth exists
+because the first two fail silently when their patterns stop matching, which is
+exactly what a clean repository looks like: it assembles a path belonging to nobody
+and asserts that the guards would fire on it.
+
+They are written as patterns rather than as a list of names to avoid, because **a
+check that spells out what it forbids publishes it**. Every machine-local path that
+had reached this document is now written as a place rather than a path:
+`<root>\dsh-electron-test`, or an elided `C:\…`.
 
 Two tools are deliberately outside `npm test`, because the suites are offline and
 these are not:
