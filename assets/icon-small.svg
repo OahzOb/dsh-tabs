@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    The same icon for 16, 20 and 24 pixels, where the drawing above stops working:
+    the second tab is a two-pixel smudge, and a dash rhythm is below the size at
+    which a gap can be seen at all.
+
+    Three things change rather than shrink. The drawing gives up more of the tile —
+    20 pixels of margin instead of 12, because at 16 the margin is the difference
+    between an icon and a smudge. The second tab is dropped. And the links are
+    **solid**: dashes say "connection across a distance" at 64 pixels and up, and
+    at 16 they say nothing at all, while a solid line still says "these two are
+    joined". The point of the small rungs is to keep the meaning, not the detail.
+
+    These three rungs are rendered from this file; every other size comes from
+    `assets/icon.svg`, and both are packed into the same `.ico`.
+  -->
+  <defs><clipPath id="tile"><rect width="256" height="256" rx="56"/></clipPath></defs>
+  <g clip-path="url(#tile)"><rect width="256" height="256" fill="#fbfbfb"/></g>
+
+  <g stroke="#31343c" stroke-width="22" stroke-linecap="round" fill="none">
+    <path d="M130 112 L154 88"/>
+    <path d="M130 144 L154 168"/>
+  </g>
+
+  <rect x="40" y="84" width="88" height="88" rx="26" fill="#31343c"/>
+  <rect x="58" y="104" width="40" height="16" rx="8" fill="#fbfbfb"/>
+
+  <rect x="160" y="52" width="56" height="56" rx="18" fill="#b6bbc4"/>
+  <rect x="160" y="148" width="56" height="56" rx="18" fill="#dcdfe4"/>
+</svg>
