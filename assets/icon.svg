@@ -5,14 +5,14 @@
     client's two adaptive-icon layers are the same drawing split in half.
 
     What it is: the window this application is. A tab bar where one tab is live —
-    the accent blue is the tab bar's own `--accent`, the state dot is the lightened
+    the accent blue is the tab bar's own accent colour, the state dot is the lightened
     green of the dot the tab bar puts on a tab that is up, and the two tabs are the
     local Harness and a remote one. Three decisions were measured rather than
     assumed, each by rendering the ladder 16…512 and looking at it:
 
     * **The tile is lifted off the background.** At `#15151a` the tile disappeared
       into a `#1c1c1c` taskbar and the icon read as a floating blue shape. It starts
-      at `#26262f` now, two steps above the application's own `--bg`.
+      at `#26262f` now, two steps above the application's own background colour.
     * **Only two tabs.** Three, and at 16 pixels the shapes are a grey smear: there
       is not enough width for three tab silhouettes at that size.
     * **The rounding is larger than it looks like it should be.** 32 units on a 256
