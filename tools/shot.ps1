@@ -114,8 +114,15 @@ $HWND_TOPMOST = [IntPtr](-1)
 $HWND_NOTOPMOST = [IntPtr](-2)
 
 function Get-AppWindow {
-	$found = Get-Process -Name electron -ErrorAction SilentlyContinue |
-		Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -like "*$Title*" }
+	# Matched by window title rather than by process name: an installed copy is
+	# `dsh-tabs.exe`, a copy run from the checkout is `electron.exe`, and this script
+	# has to capture whichever one is up.
+	#
+	# The title is matched **exactly**, not as a substring. Measured: a browser window
+	# whose page happened to mention this project was captured instead of the
+	# application, because `-like '*dsh-tabs*'` matches a tab title too.
+	$found = Get-Process -ErrorAction SilentlyContinue |
+		Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -eq $Title }
 	if (-not $found) { return $null }
 	return $found | Select-Object -First 1
 }
