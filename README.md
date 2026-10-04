@@ -479,18 +479,33 @@ src/preload.js     the renderer's entire view of the main process
 src/remote.js      what to run on the far side — a copy, see below
 src/devices.js     the device book
 src/renderer/      the tab bar and the guest host
-assets/icon.svg    the application icon; the .ico and the PNGs beside it come from it
+assets/icon.svg    the application icon, 32 pixels and up
+assets/icon-small.svg  the same icon for 16, 20 and 24, where the detail above stops working
 tools/smoke.mjs    offline checks
-tools/render-icon.cjs  the icon SVG to PNGs, through Chromium, at the sizes a shell asks for
+tools/render-icon.cjs  an icon SVG to PNGs, through Chromium, at the sizes a shell asks for
 tools/make-ico.cjs     those PNGs into one .ico
 ```
 
-**The icon is generated, and the 16-pixel rung is rendered rather than scaled.**
-`assets/icon.svg` is the drawing; `tools/render-icon.cjs` rasterises it once per size
-through Chromium — the engine this application already is — and `tools/make-ico.cjs`
-packs the results into the `.ico`. A downscale of one large render is a different
-picture from a small render, and at 16 pixels the only question worth asking is
-whether the shape survives, which is what that rung is for.
+**The icon is generated from a drawing, once per size, and the small rungs come from
+a second drawing.** `assets/icon.svg` says what the application is — a window with a
+tab bar, a dashed link out to two more machines, which is the sentence this whole
+project is: one window, one session per machine, and the ones that are not here are
+reached over a link. `tools/render-icon.cjs` rasterises it through Chromium — the
+engine this application already is — and `tools/make-ico.cjs` packs the results into
+the `.ico`.
+
+Three things about that were decided by rendering the ladder and looking at it:
+
+- **16 is rendered at 16, not scaled from 256.** A downscale is a different picture
+  from a small render, and at 16 pixels the only question is whether the shape
+  survives.
+- **Below 32 the drawing changes rather than shrinks.** `assets/icon-small.svg` gives
+  up the second tab, takes a wider margin, and draws the links solid: a dash rhythm
+  says "across a distance" at 64 pixels and says nothing at all at 16, while a solid
+  line still says the two shapes are joined. The small rungs keep the meaning and drop
+  the detail.
+- **The palette is measured, not chosen.** `#fbfbfb` and `#31343c` are the tile and the
+  mark of the DeepSeek Harness desktop application's own icon, read out of its pixels.
 
 The Android client's launcher icon is the same drawing split into an adaptive icon's
 two layers, and its geometry lives in `design/ic_launcher.svg` there. The two are

@@ -1046,7 +1046,11 @@ await test('the icon carries every size, and each entry is the image it claims t
 		assert.ok(sizes.includes(required), `the icon has no ${String(required)} pixel entry`)
 	}
 
-	for (const file of ['icon.svg', 'icon.ico', 'icon-256.png', 'icon-512.png']) {
+	// Both drawings, because the .ico cannot be regenerated without them: the small
+	// rungs come from `icon-small.svg` and every other size from `icon.svg`. Which
+	// entry came from which file is not something this suite can see — that would need
+	// a PNG decoder — so what it pins is that both sources are still here.
+	for (const file of ['icon.svg', 'icon-small.svg', 'icon.ico', 'icon-256.png', 'icon-512.png']) {
 		assert.ok(existsSync(join(ROOT, 'assets', file)), `assets/${file} is missing`)
 	}
 })
