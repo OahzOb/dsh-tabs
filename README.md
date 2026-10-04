@@ -524,8 +524,9 @@ changes nothing), not a corrupt download (the zip's SHA-256 matches Electron's o
 `checksums.json`) and not an incomplete extraction (73 files, all present).
 
 **So: put this application anywhere outside `$DSH_HOME`.** It lives at
-`C:\Projects\dsh-tabs` for exactly that reason. Nothing about it depends on the
-location.
+`C:\Projects\dsh-workspace\dsh-tabs` for exactly that reason — the measurements above
+were taken while it was a directory shallower, at `C:\Projects\dsh-tabs`, and the move
+changed nothing. Nothing about it depends on the location.
 
 ## The local tab needs a current `dsh`, not a credential of its own
 
