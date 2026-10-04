@@ -1,8 +1,212 @@
 # dsh-tabs
 
-A tabbed host for DSH web interfaces. One window, an always-visible tab bar, and
-one tab per Harness: the local one, plus one per remote machine reached over an
-SSH tunnel.
+English | [中文](#中文)
+
+A tabbed host for **DeepSeek Harness (DSH)** web interfaces. One window, an
+always-visible tab bar, and one tab per Harness: the local one, plus one per remote
+machine reached over an SSH tunnel.
+
+**The local tab is a peer of the remote ones, not their host.** That is why this is an
+application rather than a plugin — the four things a plugin cannot have are in
+[Why this is not a plugin](#why-this-is-not-a-plugin).
+
+---
+
+## Quick start
+
+1. **A current `dsh` on `PATH`**, installed with Node. The packaged Desktop
+   application does **not** count: it ships its Harness inside `app.asar` and installs
+   no `dsh` command.
+2. **Install, then download Electron.** Electron 44 has no `postinstall` step, so the
+   ~150 MB binary is a command of its own:
+
+   ```
+   npm install
+   npm run install-electron
+   ```
+3. **Start it.**
+
+   ```
+   npm start
+   ```
+
+**Put the checkout anywhere except `$DSH_HOME`.** On Windows Electron cannot start
+from inside that directory at all — it exits silently, with no error and no output —
+and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_home).
+
+## What it does
+
+- **The local tab** runs this machine's own `dsh web --no-open --port 0`, reads the
+  port and the session token off the readiness line it prints, and points a
+  `<webview>` at it.
+- **A remote tab** runs the same program on the far side over SSH, then opens a
+  second, bare `ssh -N -L` tunnel to the port the first connection announced. Nothing
+  is installed on that machine.
+- **Teardown closes stdin**, which is what the remote program blocks on, so the far
+  side's server is reaped rather than left holding its port.
+
+## Features
+
+| | |
+| --- | --- |
+| **A tab bar that stays** | The bar *is* the window chrome, so it never scrolls away with the interface it switches. |
+| **`Alt+1…9` from anywhere** | Handled in the main process, so the key still arrives with focus deep inside a remote interface — where a listener in the page would never see it. |
+| **The local Harness as a peer** | The same tab semantics for the local Harness and for every remote one, in one window. |
+| **Nothing installed on the far side** | An SSH server and a Node-installed `dsh` are the whole requirement; the remote's own OS picks the port, so a connect cannot collide with a server someone started by hand. |
+| **A device book in the plugin's schema** | `$DSH_HOME/dsh-tabs.json` — a file of its own, seeded from the Desktop plugin's `remote-devices.json` on first run, never written by two processes at once. |
+| **A readable failure** | A connect that fails quotes the far side's own words, including the CLIXML error stream PowerShell produces on a Windows host. |
+| **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
+
+## Requirements
+
+**The machine you connect to:** an SSH server, and `dsh` on `PATH` installed with Node.
+A Windows host additionally needs `sshd` enabled, which Windows does not do by default
+— see [What the remote needs](#what-the-remote-needs).
+
+**This machine:** a Node-installed `dsh` at **`0.2.0-rc.2` or newer**, because the local
+tab runs it. Below that floor the CLI cannot read the credential store, and the failure
+it prints is about an API key rather than about an old install.
+
+**The platform:** everything documented here was built and measured on Windows. The
+POSIX and macOS branches are in the source and covered by the offline suites; neither
+has been driven against a live host from this checkout.
+
+## Install
+
+**From source, because there is no packaged build yet.** No installer, no portable
+archive, and therefore no checksum to verify: [Quick start](#quick-start) is the whole
+install. Two environment fallbacks this machine needed are in
+[Running it](#running-it) — an `ELECTRON_MIRROR` for a network where the GitHub release
+CDN is unreachable, and a writable `TEMP` for an environment that refuses `mkdtemp`
+outside its own workspace.
+
+## Using it
+
+- **Tabs** are the local Harness and every device in the book. A tab is a
+  *configured thing*, not a transient view: selecting an idle one starts it, and
+  the `×` **disconnects** it rather than removing it. Removing a device is the
+  `+` popover's job.
+- **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
+  inside a remote interface.
+- **`+`** lists the devices, adds one, and removes one.
+
+## Documentation
+
+The rest of this file is the engineering record: why the architecture is what it is,
+what was measured and how, and the failures that shaped it. It is long on purpose —
+each section is a decision that cost something to learn.
+
+| | |
+| --- | --- |
+| [Why this is not a plugin](#why-this-is-not-a-plugin) | The four things a plugin cannot have, and where the ceiling is |
+| [Running it](#running-it) | The install, the Electron pin, and the version check the environment cannot poison |
+| [Devices](#devices) | The book, its one write path, and the one field a shell sees |
+| [What the remote needs](#what-the-remote-needs) | `dsh` on `PATH`, and enabling `sshd` on a Windows host |
+| [How a connect works](#how-a-connect-works) | Two ssh connections, and the teardown contract that reaps the far side |
+| [Windows remotes](#windows-remotes) | The PowerShell program, and why the local tab must not be made symmetric with it |
+| [Layout](#layout) | Every file and what owns it |
+| [Test](#test) | The four offline suites, the live one, and the variables they read |
+| [Android: a sibling client](#android-a-sibling-client-not-a-port-of-this-one) | The second client, the protocol both implement, and the artefacts it ports from |
+| [The studies](docs/android-ssh-feasibility.md) | Why there is no embedded Node on Android — and [what a WebView does with the tunnel](docs/android-webview-proxy-feasibility.md) |
+| [contract.json](docs/contract.json) | The protocol stated in one place a non-JavaScript client can read |
+
+---
+
+<a id="中文"></a>
+# dsh-tabs 桌面端（中文）
+
+[English](#dsh-tabs) | 中文
+
+把 **DeepSeek Harness (DSH)** 的网页界面收进一个窗口：本地一个，其它机器上的若干个走 SSH
+隧道，一台机器一个标签页，标签栏常驻。
+
+**本地标签页和远程标签页是对等的**，它不是远程标签页的宿主 —— 这正是它必须做成应用、而不是
+插件的原因，四条理由见 [Why this is not a plugin](#why-this-is-not-a-plugin)。
+
+---
+
+## 快速开始
+
+1. **`PATH` 上一个足够新的 `dsh`**，用 Node 安装。**打包的桌面应用不算**：它的 Harness 装在
+   `app.asar` 里，不提供 `dsh` 命令。
+2. **装依赖，再单独下载 Electron。** Electron 44 没有 `postinstall`，那个约 150 MB 的二进制
+   要自己跑一条命令：
+
+   ```
+   npm install
+   npm run install-electron
+   ```
+3. **启动。**
+
+   ```
+   npm start
+   ```
+
+**把这个 checkout 放在 `$DSH_HOME` 以外的任何地方。** 在 Windows 上 Electron 从那个目录里
+根本起不来 —— 静默退出，没有任何报错和输出；测量过程见
+[Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_home)。
+
+## 它能做什么
+
+- **本地标签页**：在本机跑 `dsh web --no-open --port 0`，从它打印的就绪行里读回端口和会话
+  token，让一个 `<webview>` 打开它。
+- **远程标签页**：把同一个程序通过 SSH 在对端跑起来，再开一条裸的 `ssh -N -L` 隧道，转发到
+  第一条连接报出的端口。对端不装任何东西。
+- **关闭靠关 stdin**：对端程序正阻塞在 stdin 上，所以远端服务会被回收，而不是留着占住端口。
+
+## 功能
+
+| | |
+| --- | --- |
+| **标签栏常驻** | 标签栏就是窗口边框本身，不会跟着它切换的界面一起滚走。 |
+| **任何位置都能 `Alt+1…9`** | 快捷键在主进程处理，所以焦点在远程界面深处时按键照样到达 —— 页面里的监听器永远看不到那些键。 |
+| **本地 Harness 是对等的** | 本地和每一台远端在同一个窗口里共用同一套标签语义。 |
+| **对端不装任何东西** | 只需要一个 SSH 服务和对端 `PATH` 上用 Node 安装的 `dsh`；端口由**远端**系统自己挑，绝不会和谁手动起的服务撞端口。 |
+| **设备簿沿用插件 schema** | `$DSH_HOME/dsh-tabs.json`，独立一个文件，首次运行时从桌面插件的 `remote-devices.json` 播种，绝不会有两个进程同时写它。 |
+| **失败能读懂** | 连接失败会引用对端自己的原话，包括 Windows 主机上 PowerShell 产生的 CLIXML 错误流。 |
+| **版本下限会自己说话** | 本地标签页启动前，`src/localdsh.js` 先查 `dsh --version`；CLI 太旧会直接报名，而不是 45 秒后变成一个凭据错误。 |
+
+## 环境要求
+
+**被连的机器**：一个 SSH 服务，以及 `PATH` 上用 Node 安装的 `dsh`。Windows 主机还要额外启用
+`sshd`，Windows 默认不开 —— 见 [What the remote needs](#what-the-remote-needs)。
+
+**本机**：`PATH` 上 **`0.2.0-rc.2` 或更新**的 `dsh`，因为本地标签页跑的就是它。低于这个下限，
+CLI 读不了凭据库，它报出来的是"API key 缺失"，而不是"CLI 太旧"。
+
+**平台**：这里记录的一切都是在 Windows 上构建和实测的。POSIX 与 macOS 分支在源码里、也被离线
+套件覆盖，但都没有从这个 checkout 对真实主机跑过。
+
+## 安装
+
+**只能从源码跑，因为目前还没有打包产物。** 没有安装包、没有便携包，因此也没有校验和可对：
+[快速开始](#快速开始) 就是全部安装步骤。本机踩到的两个环境坑（GitHub release CDN 不可达时
+设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `mkdtemp` 时改 `TEMP`）见
+[Running it](#running-it)。
+
+## 用法
+
+- **标签页** 是本地 Harness 和设备簿里的每一台机器。标签页是*配置好的东西*，不是临时视图：
+  选中一个空闲的就会启动它，而 `×` 是**断开**、不是删除。删设备在 `+` 面板里。
+- **`Alt+1…9`** 切标签，在任何位置都有效，包括你正在远程界面里打字的时候。
+- **`+`** 列出设备、添加设备、删除设备。
+
+## 文档
+
+本文件其余部分是工程记录（英文）：架构为什么是这样、实测了什么、怎么测的，以及塑造了它的那些
+失败。它很长是有意的 —— 每一节都是一个花了代价才换来的决定。
+
+> 技术细节一律以英文原文为准，中文部分不重复翻译，避免两份说明逐渐说不到一起去。
+
+---
+
+# The engineering record
+
+The sections below are in English only. They are the record of what was measured and
+why each decision is what it is: the failures that shaped this application, the numbers
+behind its timeouts, and the two protocol artefacts a second client ports from.
+Translating them would create two descriptions that drift apart, and the code and the
+tests only ever reference one.
 
 ## Why this is not a plugin
 
@@ -37,15 +241,27 @@ desktop application on this machine runs (`Electron/44.0.0`,
 `Chrome/152.0.7977.54`, read out of its own binary) and is therefore known to work
 here.
 
-**The evidence for the pin is weaker than it first looked, and that is worth
-saying.** A later patch release, `44.5.1`, was observed producing a real APPCRASH
-(`0xC0000005` inside `electron.exe`), while `44.0.0` produced a silent
-`STATUS_BREAKPOINT`. That comparison was made *before* the directory turned out to
-be the cause — both runs were from inside `$DSH_HOME`, where **every** Electron
-fails — so the difference between the two versions may have been nothing more than
-how the same underlying failure happened to manifest. Bumping the pin is probably
-safe; it has simply not been measured from a location where Electron is known to
-start.
+**The evidence for the pin was weaker than it looked, and it has since been
+re-measured properly.** A later patch release, `44.5.1`, had been observed producing a
+real APPCRASH (`0xC0000005` inside `electron.exe`) while `44.0.0` produced a silent
+`STATUS_BREAKPOINT` — but that comparison was made from inside `$DSH_HOME`, where
+**every** Electron fails, so it may have been comparing two symptoms of one cause.
+
+Re-run on 2026-10-04 from `C:\Projects\dsh-electron-pin`, a directory outside the
+Harness home, with the harness's own `ELECTRON_RUN_AS_NODE` cleared:
+
+| Binary | The file says | `--version` answers | Window | After 12 s | Closed |
+| --- | --- | --- | --- | --- | --- |
+| `44.0.0` (pinned) | `44.0.0` | `v44.0.0` | `dsh-tabs` came up | responding | WM_CLOSE, exit 0 |
+| `44.5.1` | `44.5.1` | `v44.5.1` | `dsh-tabs` came up | responding | WM_CLOSE, exit 0 |
+
+No Application-log entry naming `electron.exe` was written during either run, and
+neither run leaked a `dsh web`. **So `44.5.1` is not broken, and the pin is not
+holding back a fix.** Two reasons keep it where it is: `44.0.0` is the version the
+Desktop application on this machine runs, which makes it the pair that is known to
+work together, and a bump buys nothing that has been measured. The claim to distrust
+was never "44.5.1 is bad" — it was "the earlier comparison showed that", and it did
+not.
 
 Whatever version is installed, the first thing to run when the window does not
 appear is the binary on its own — it bypasses npm and prints an exit code:
@@ -102,16 +318,6 @@ outside the workspace:
 $env:TEMP = "$PWD\.tmp"; $env:TMP = $env:TEMP
 npm run install-electron
 ```
-
-## Using it
-
-- **Tabs** are the local Harness and every device in the book. A tab is a
-  *configured thing*, not a transient view: selecting an idle one starts it, and
-  the `×` **disconnects** it rather than removing it. Removing a device is the
-  `+` popover's job.
-- **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
-  inside a remote interface.
-- **`+`** lists the devices, adds one, and removes one.
 
 ## Devices
 
