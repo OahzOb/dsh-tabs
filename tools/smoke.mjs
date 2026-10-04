@@ -901,7 +901,7 @@ const PROFILE_PATHS = [
  */
 function repositoryFiles() {
 	const SKIP = new Set(['node_modules', '.git', '.shots', '.tmp', '.tmp-main-test', '.research', '.ssh-research'])
-	const TEXT = /\.(?:md|js|mjs|cjs|json|html|css|ps1|sh|yml|yaml|txt)$/u
+	const TEXT = /\.(?:md|js|mjs|cjs|json|html|css|ps1|sh|yml|yaml|txt|svg|xml)$/u
 	const NAMES = new Set(['LICENSE', '.gitignore', '.gitattributes'])
 	const files = []
 	const walk = (directory) => {
@@ -1048,6 +1048,29 @@ await test('the icon carries every size, and each entry is the image it claims t
 
 	for (const file of ['icon.svg', 'icon.ico', 'icon-256.png', 'icon-512.png']) {
 		assert.ok(existsSync(join(ROOT, 'assets', file)), `assets/${file} is missing`)
+	}
+})
+
+await test('no XML in this repository carries a comment a parser would reject', () => {
+	// Measured, by the operator opening the file: `assets/icon.svg` said `--accent` and
+	// `--bg` in its comment — CSS variables, which is how the palette is named
+	// everywhere else in this project — and a double hyphen is not allowed inside an
+	// XML comment. The browser showed a parse error and nothing else, which is a
+	// spectacular way for an icon to fail: the file that draws the icon could not be
+	// opened.
+	//
+	// The render pipeline did not catch it, and could not have: Chromium was handed the
+	// SVG inside an HTML page, and HTML's parser is lenient about exactly this. Neither
+	// does the .ico check above — the rasterised assets were correct, because the parser
+	// that made them was the forgiving one.
+	const files = REPOSITORY_FILES.filter((file) => /\.(?:svg|xml)$/u.test(file))
+	assert.ok(files.length > 0, 'no SVG or XML file was scanned at all')
+	for (const file of files) {
+		const text = readFileSync(file, 'utf8')
+		for (const comment of text.matchAll(/<!--([\s\S]*?)-->/gu)) {
+			assert.doesNotMatch(comment[1], /--/u, `${relative(ROOT, file)}: a comment contains a double hyphen`)
+			assert.doesNotMatch(comment[1], /-$/u, `${relative(ROOT, file)}: a comment ends with a hyphen`)
+		}
 	}
 })
 
