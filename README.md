@@ -479,8 +479,24 @@ src/preload.js     the renderer's entire view of the main process
 src/remote.js      what to run on the far side — a copy, see below
 src/devices.js     the device book
 src/renderer/      the tab bar and the guest host
+assets/icon.svg    the application icon; the .ico and the PNGs beside it come from it
 tools/smoke.mjs    offline checks
+tools/render-icon.cjs  the icon SVG to PNGs, through Chromium, at the sizes a shell asks for
+tools/make-ico.cjs     those PNGs into one .ico
 ```
+
+**The icon is generated, and the 16-pixel rung is rendered rather than scaled.**
+`assets/icon.svg` is the drawing; `tools/render-icon.cjs` rasterises it once per size
+through Chromium — the engine this application already is — and `tools/make-ico.cjs`
+packs the results into the `.ico`. A downscale of one large render is a different
+picture from a small render, and at 16 pixels the only question worth asking is
+whether the shape survives, which is what that rung is for.
+
+The Android client's launcher icon is the same drawing split into an adaptive icon's
+two layers, and its geometry lives in `design/ic_launcher.svg` there. The two are
+kept in step by hand, so a change to the mark is a change in two repositories — the
+alternative, one repository reading the other's assets, would break the rule that
+each checkout stands on its own.
 
 `src/remote.js` is a **copy** of the pure builders in the `dsh-remote-devices`
 plugin. A standalone application cannot import from a plugin directory the

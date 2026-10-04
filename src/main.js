@@ -285,6 +285,12 @@ function createWindow() {
 		minHeight: 480,
 		backgroundColor: '#16161a',
 		show: false,
+		// The window's own icon, which is what the taskbar and Alt+Tab show while the
+		// application is running. Without it they show the Electron binary's icon,
+		// because that is the executable this runs as — `assets/icon.ico` is rendered
+		// from `assets/icon.svg` by `tools/render-icon.cjs`. A missing file is not
+		// fatal: Electron falls back to the executable's icon.
+		icon: join(__dirname, '..', 'assets', 'icon.ico'),
 		// The tab bar IS the window chrome, the way a terminal emulator does it:
 		// the OS draws its controls over the same band the tabs live in.
 		titleBarStyle: 'hidden',

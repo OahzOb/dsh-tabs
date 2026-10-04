@@ -1013,6 +1013,44 @@ await test('the two guards above would actually fire', () => {
 	assert.ok(!ALLOWED_ADDRESSES.has(address), 'a private address is on the allowlist')
 })
 
+console.log('the icon, which is generated and can therefore be regenerated wrong')
+
+await test('the icon carries every size, and each entry is the image it claims to be', () => {
+	// `assets/icon.ico` is built from `assets/icon.svg` by two scripts, and a
+	// regeneration that goes wrong produces a file that still looks like a file: an
+	// offset past the end, an entry whose declared size disagrees with its own image,
+	// a missing 16-pixel rung. None of that is visible until it is on somebody's
+	// desktop, and then it is an icon that draws as garbage.
+	const ico = readFileSync(join(ROOT, 'assets', 'icon.ico'))
+	assert.equal(ico.readUInt16LE(0), 0, 'the reserved field is not zero')
+	assert.equal(ico.readUInt16LE(2), 1, 'the file does not declare itself an icon')
+	const count = ico.readUInt16LE(4)
+	assert.ok(count >= 6, `the icon has only ${String(count)} sizes`)
+
+	const sizes = []
+	for (let index = 0; index < count; index++) {
+		const entry = 6 + index * 16
+		const width = ico.readUInt8(entry) || 256
+		const height = ico.readUInt8(entry + 1) || 256
+		const length = ico.readUInt32LE(entry + 8)
+		const offset = ico.readUInt32LE(entry + 12)
+		assert.ok(offset + length <= ico.length, `entry ${String(index)} runs past the end of the file`)
+		assert.equal(ico.readUInt32BE(offset), 0x89504e47, `entry ${String(index)} is not a PNG`)
+		assert.equal(ico.readUInt32BE(offset + 16), width, `entry ${String(index)} disagrees about its width`)
+		assert.equal(ico.readUInt32BE(offset + 20), height, `entry ${String(index)} disagrees about its height`)
+		sizes.push(width)
+	}
+	// 16 is the size that decides whether the drawing works at all; 256 is what a shell
+	// asks for when it wants a preview.
+	for (const required of [16, 32, 48, 256]) {
+		assert.ok(sizes.includes(required), `the icon has no ${String(required)} pixel entry`)
+	}
+
+	for (const file of ['icon.svg', 'icon.ico', 'icon-256.png', 'icon-512.png']) {
+		assert.ok(existsSync(join(ROOT, 'assets', file)), `assets/${file} is missing`)
+	}
+})
+
 console.log('electron api contract')
 
 /**
