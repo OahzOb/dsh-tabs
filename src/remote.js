@@ -194,11 +194,12 @@ function windowsResolve() {
  *   deterministic teardown the POSIX branch gets from `cat > /dev/null`.
  *
  * The teardown kills the whole **tree**, not just the process it started, and
- * that is not belt-and-braces: an npm global install resolves to a `.cmd` shim,
- * so the started process is `cmd.exe` and the Harness is its `node` child.
- * `Stop-Process` on the shim left `node` running — measured on the local tab,
- * which runs this same script — and the same would happen on a Windows remote,
- * where nothing would ever notice a server still holding its port.
+ * that is not belt-and-braces even though the launcher no longer starts the
+ * `.cmd` shim: the process started here is the interpreter, and the Harness is
+ * free to spawn under it. `Stop-Process` on a shim left `node` running —
+ * measured on the local tab, which runs the same family of script — and the same
+ * would happen on a Windows remote, where nothing would ever notice a server
+ * still holding its port.
  *
  * **Two additions, both paid for by the Android client**, which is why this is
  * longer than the launcher it wraps:
@@ -242,7 +243,13 @@ function windowsProgram(device) {
 		"$node = 'FALLBACK'",
 		'$shimDir = Split-Path -Parent $dsh',
 		"$binJs = Join-Path $shimDir 'node_modules\\@deepseek-ai\\dsh\\lib\\bin.js'",
-		'if (-not (Test-Path -LiteralPath $binJs)) { $binJs = $dsh }',
+		// A missing `bin.js` used to fall back to `$dsh` itself, and that cannot work
+		// here: the launcher always starts `$node`, so no script would be named and
+		// `node web --no-open --port 0` would exit on `Cannot find module …\web`,
+		// blaming the wrong thing. Refused by name instead. Reachable wherever the
+		// shim's own directory carries no `node_modules\@deepseek-ai\dsh` — a pnpm
+		// global install, or a `dsh` shimmed in from somewhere else, among them.
+		'if (-not (Test-Path -LiteralPath $binJs)) { [Console]::Error.WriteLine("dsh is at $dsh, but $binJs does not exist; this launcher starts node on bin.js rather than the .cmd shim, so bin.js has to sit in the node_modules beside the shim"); exit 127 }',
 		// The shim's own directory first, because an npm global install may put
 		// `node.exe` there; `%ProgramFiles%\nodejs` is the ordinary install, and the
 		// bare name is the last resort. Each candidate is tested before it is chosen,
@@ -267,8 +274,9 @@ function windowsProgram(device) {
 					`$dir = ${windowsLiteral(directory)}; if ($dir -eq '~') { $dir = $env:USERPROFILE } elseif ($dir.StartsWith('~/') -or $dir.StartsWith('~\\')) { $dir = Join-Path $env:USERPROFILE $dir.Substring(2) }; $null = 0`,
 					'Set-Location -LiteralPath $dir -ErrorAction Stop'
 				]),
-		'$argv = @()',
-		'if ($binJs -ne $dsh) { $argv += $binJs }',
+		// The script is named first and always: `$binJs` is the only thing this
+		// launcher starts, and the check above guarantees it exists.
+		'$argv = @($binJs)',
 		"$argv += @('web','--no-open','--port','0')",
 		// Written to stderr so it cannot be mistaken for the readiness line, which the
 		// client reads from stdout. Naming the executable, the script and the working

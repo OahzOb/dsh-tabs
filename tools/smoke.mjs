@@ -158,13 +158,26 @@ await test('Windows: the script is encoded past every layer', () => {
 await test('Windows: the stdin-EOF teardown contract is kept', () => {
 	const program = remote.windowsProgram(device)
 	assert.match(program, /\[Console\]::In\.ReadToEnd\(\)/u)
-	// The whole TREE, not the shim: an npm global install resolves to a `.cmd`, so
-	// the started process is cmd.exe and the Harness is its node child.
+	// The whole TREE, not just the process started: the launcher names the
+	// interpreter and the script rather than the `.cmd` shim, so what it starts is
+	// `node` itself — and `/T` still covers whatever the Harness spawns under it.
 	assert.match(program, /taskkill \/PID \$proc\.Id \/T \/F/u)
 	// stdout must be INHERITED: a redirect through a temp file would make the
 	// readiness line's readability depend on a file-sharing mode.
 	assert.doesNotMatch(program, /RedirectStandard/u)
 	assert.match(program, /'web','--no-open','--port','0'/u)
+})
+
+await test('Windows: a shim with no bin.js is refused by name, not launched', () => {
+	// The launcher starts the interpreter on `bin.js`, never the `.cmd` shim, so a
+	// missing `bin.js` has no fallback that works: naming the shim would
+	// reintroduce the failure the resolution exists to avoid, and naming no script
+	// at all runs `node web --no-open --port 0`, which exits on
+	// `Cannot find module …\web` and blames an argument rather than the install.
+	const program = remote.windowsProgram(device)
+	assert.doesNotMatch(program, /\{ \$binJs = \$dsh \}/u)
+	assert.match(program, /\$argv = @\(\$binJs\)/u)
+	assert.match(program, /\[Console\]::Error\.WriteLine\("dsh is at \$dsh, but \$binJs does not exist/u)
 })
 
 await test('Windows: dsh is found without nvm or a login shell', () => {
