@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Tabbed host for DSH web interfaces: the local one and remote ones over SSH, in a single always-visible tab bar.",
+  "license": "MIT",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
