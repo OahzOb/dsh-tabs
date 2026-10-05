@@ -177,7 +177,14 @@ await test('Windows: a shim with no bin.js is refused by name, not launched', ()
 	const program = remote.windowsProgram(device)
 	assert.doesNotMatch(program, /\{ \$binJs = \$dsh \}/u)
 	assert.match(program, /\$argv = @\(\$binJs\)/u)
-	assert.match(program, /\[Console\]::Error\.WriteLine\("dsh is at \$dsh, but \$binJs does not exist/u)
+	// The walk, not `Get-Command` alone: measured with a pnpm-style shim first on PATH,
+	// the old code chose it and refused while a launchable dsh sat behind it.
+	assert.match(program, /\$candidates = @\(\$dsh\)/u)
+	assert.match(program, /foreach \(\$candidate in \$candidates\)/u)
+	assert.match(program, /no launchable dsh on this Windows host/u)
+	// And the other silence: `$node` left at its sentinel is a launch of a program
+	// called FALLBACK, which is a command-not-found wearing a launch's clothes.
+	assert.match(program, /no node\.exe on this Windows host/u)
 })
 
 await test('Windows: dsh is found without nvm or a login shell', () => {
