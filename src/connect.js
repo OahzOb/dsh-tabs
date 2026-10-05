@@ -151,11 +151,60 @@ function readableStderr(text) {
 }
 
 /**
+ * Stop a spawned process, whichever of its two halves is the one that reaps it.
+ *
+ * `connectLocal` needs this to hand a teardown to its caller before it has
+ * finished connecting, and the two branches are genuinely different code:
+ * `stopLocal` on Windows walks the process tree with a synchronous `taskkill`,
+ * while a remote server's connection is reaped by closing the ssh client's stdin.
+ *
+ * @param child - the process this module spawned.
+ * @param ssh - true when the child is an ssh client rather than a local shell.
+ */
+function stopChild(child, ssh) {
+	if (ssh) {
+		try {
+			child.stdin?.end()
+		} catch {
+			/* the pipe may already be gone */
+		}
+		try {
+			child.kill()
+		} catch {
+			/* already gone */
+		}
+		return
+	}
+	stopLocal(child)
+}
+
+/**
  * Read a server's readiness line from its output.
  *
  * Both streams are watched: `dsh web` prints the URL on stdout, but anything it
  * complains about on the way lands on stderr, and a caller that waited only on
  * stdout would report a timeout with an empty transcript.
+ *
+ * **Nothing is accumulated or re-parsed once the line is settled, and the listener
+ * stays attached anyway.** Both halves of that are deliberate. Before: every chunk
+ * for the life of the connection was appended to a buffer and re-scanned with
+ * `readyUrl`, which slices at the last newline and runs a regular expression over
+ * the whole thing — so a session that ran for an hour held an hour of output, and
+ * each new chunk cost a pass over all of it. Measured with a `PassThrough` in
+ * place of the child: five chunks after the resolution produced five more `onLine`
+ * calls and 600 kB of retained text. After: the same five produce none and retain
+ * none. The listener cannot be *removed*, because a pipe nobody reads fills and the
+ * child blocks on its next write — the readiness line is printed before the Harness
+ * starts serving, so the process that would block is the very one being waited for.
+ *
+ * What this gives up is the post-readiness tail of the transcript: the tab records
+ * a connect, and what the server prints afterwards is no longer appended to it.
+ * That is what the memory and the O(total) scan were buying, and a connect is not a
+ * session log.
+ *
+ * The result carries `buffered()` — the bytes held at that moment — because "it did
+ * not grow" is otherwise a claim about a private variable, and the suite that pins
+ * this has to be able to see it.
  *
  * @param child - the server process.
  * @param onLine - receives each transcript line, already prefixed.
@@ -167,19 +216,28 @@ function awaitReady(child, onLine, timeoutMs) {
 		let raw = ''
 		let stderr = ''
 		let done = false
+		/** Whether the answer is settled and nothing more should be kept. */
+		let settled = false
 		const finish = (value) => {
 			if (done) return
 			done = true
+			settled = true
 			clearTimeout(timer)
-			resolve(value)
+			resolve({ ...value, buffered: () => raw.length + stderr.length })
 		}
 		const timer = setTimeout(() => {
+			// The same flag as the resolved path, and it matters more here: the timeout
+			// fires once, and a child that never announces a URL keeps printing for as
+			// long as the connection is up — so the failure path is the one that
+			// accumulates longest if it is left out.
+			settled = true
 			finish({ error: `the Harness never announced a URL within ${String(Math.round(timeoutMs / 1000))}s` })
 		}, timeoutMs)
 		const watch = (stream, prefix) => {
 			if (stream === null || stream === undefined) return
 			stream.setEncoding('utf8')
 			stream.on('data', (chunk) => {
+				if (settled) return
 				for (const line of String(chunk).split(/\r?\n/u)) {
 					if (line.trim() !== '') onLine(`${prefix}${line}`)
 				}
@@ -262,19 +320,71 @@ async function detectPlatform(device, ssh, onLine) {
  * machine; the second is a bare forward to whatever port the first announced.
  *
  * @param device - the device record.
- * @param options - `onLine` for the transcript, `signal` unused.
+ * @param options - `onLine` for the transcript, `onChild` for teardown in flight,
+ *   `signal` to be told the caller has given up.
  * @returns the URL, the platform, and a `stop` that honours the teardown contract.
  */
 async function connectRemote(device, options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
+	/** Told about each process the moment it exists, so a caller that cancels mid-connect has something to stop. */
+	const onChild = typeof options.onChild === 'function' ? options.onChild : () => {}
+	const signal = options.signal
 	const ssh = sshExecutable()
 	const target = `${device.user}@${device.host}`
 	onLine(`connect ${target}:${String(device.sshPort)}`)
+
+	// Two clients are spawned a long way apart — a platform probe, a readiness line,
+	// a port and a tunnel probe sit between them — so a cancellation is carried as a
+	// local flag rather than as one listener on one process. That flag is what the
+	// checks between the phases read, and what makes "the tab was stopped while it
+	// was still connecting" leave nothing behind on the far side.
+	let stopped = false
+	/** Every ssh client this call has started and not yet handed over. */
+	const live = new Set()
+	/**
+	 * Register one ssh client, tearing it down instead if the caller has already gone.
+	 * @param child - the client just spawned.
+	 * @returns false when the connect must stop here.
+	 */
+	const keep = (child) => {
+		const stop = () => {
+			stopped = true
+			stopChild(child, true)
+		}
+		if (signal?.aborted === true) {
+			stop()
+			return false
+		}
+		live.add(child)
+		onChild(stop)
+		signal?.addEventListener('abort', stop, { once: true })
+		return true
+	}
+	/**
+	 * The check between two phases: has the caller gone, and is there anything of
+	 * ours still standing? Both, because the long waits in between — the platform
+	 * probe and the port allocation — hold no child at all, so an abort during one of
+	 * them sets no flag here. Returning true means nothing of ours may continue.
+	 * @returns true when this call must unwind.
+	 */
+	const cancelled = () => {
+		if (stopped || signal?.aborted === true) {
+			for (const child of live) stopChild(child, true)
+			live.clear()
+			return true
+		}
+		return false
+	}
+	/** The connection is the caller's from here, so nothing may be torn down again. */
+	const handOver = () => {
+		live.clear()
+	}
 
 	const detected = await detectPlatform(device, ssh, onLine)
 	if (detected.error !== undefined) return { error: detected.error }
 	const platform = detected.platform
 	onLine(`remote platform: ${platform}`)
+	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 
 	//#region phase 1 — start the server, learn the port it chose
 	const program = remote.remoteProgram(device, platform)
@@ -284,22 +394,26 @@ async function connectRemote(device, options = {}) {
 		stdio: ['pipe', 'pipe', 'pipe'],
 		windowsHide: true
 	})
+	if (!keep(server)) return { error: 'the connect was stopped before it finished' }
 	const ready = await awaitReady(server, onLine, remote.START_TIMEOUT_MS)
 	if (ready.error !== undefined) {
-		server.stdin?.end()
-		server.kill()
+		stopChild(server, true)
+		live.clear()
 		return { error: ready.error }
 	}
+	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	//#endregion
 
 	//#region phase 2 — forward a local port to the port the remote announced
 	const { port: remotePort, token } = remote.parseReadyUrl(ready.url)
 	const localPort = await freePort()
+	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	onLine(`tunnel 127.0.0.1:${String(localPort)} -> 127.0.0.1:${String(remotePort)}`)
 	const tunnel = spawn(ssh, [...remote.sshOptions(device), '-N', '-L', `${String(localPort)}:127.0.0.1:${String(remotePort)}`, target], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 		windowsHide: true
 	})
+	if (!keep(tunnel)) return { error: 'the connect was stopped before it finished' }
 	tunnel.stderr?.setEncoding('utf8')
 	tunnel.stderr?.on('data', (chunk) => {
 		for (const line of String(chunk).split(/\r?\n/u)) {
@@ -307,12 +421,18 @@ async function connectRemote(device, options = {}) {
 		}
 	})
 	if (!(await waitForLocalPort(localPort, remote.TUNNEL_TIMEOUT_MS))) {
-		server.stdin?.end()
-		server.kill()
-		tunnel.kill()
+		stopChild(server, true)
+		stopChild(tunnel, true)
+		live.clear()
 		return { error: 'the ssh tunnel never began accepting connections' }
 	}
+	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	//#endregion
+
+	// From here the connection is the caller's, so a later abort must find nothing:
+	// the listener stays registered — the signal belongs to the caller, and there is
+	// no reason to spend a remover on it — but the set it walks is emptied.
+	handOver()
 
 	return {
 		platform,
@@ -404,11 +524,16 @@ function stopLocal(child) {
 
 /**
  * Start a Harness on this machine, for the local tab.
- * @param options - `onLine` for the transcript, `directory` for where it starts.
+ *
+ * @param options - `onLine` for the transcript, `directory` for where it starts,
+ *   `onChild` for teardown in flight, `signal` to be told the caller has given up.
  * @returns the URL and a `stop`.
  */
 async function connectLocal(options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
+	/** Told about the shell the moment it exists, so a caller that cancels mid-connect can stop it. */
+	const onChild = typeof options.onChild === 'function' ? options.onChild : () => {}
+	const signal = options.signal
 	// The local tab's directory comes from the device book exactly as a remote's
 	// does, and on Windows it has to survive being placed inside one `cmd` command
 	// string — the one place in this application that cannot quote a path safely.
@@ -427,15 +552,32 @@ async function connectLocal(options = {}) {
 		return { error: version.problem }
 	}
 	if (version.reported !== null) onLine(`local dsh: ${version.reported}`)
+	// The probe above is a process of its own and takes long enough to be worth
+	// cancelling across. The abort listener below covers the wait that follows; this
+	// one covers the version probe, so a `×` during it is not answered by spawning a
+	// Harness into a tab that no longer exists. Nothing is spawned by this call
+	// before here, so there is nothing to tear down — only something to not start.
+	if (signal?.aborted === true) return { error: 'the connect was stopped before it finished' }
 
 	const argv = remote.localDshArgv(process.platform, options.directory)
 	onLine(`local program: ${argv.join(' ')}`)
 	const child = spawn(argv[0], argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+	// Handed over *before* the readiness wait, which is the longest window of the
+	// whole connect and the one an operator is most likely to cancel in.
+	const stop = () => {
+		stopLocal(child)
+	}
+	onChild(stop)
+	signal?.addEventListener('abort', stop, { once: true })
 	const ready = await awaitReady(child, onLine, remote.START_TIMEOUT_MS)
 	if (ready.error !== undefined) {
 		stopLocal(child)
 		return { error: ready.error }
 	}
+	// A cancellation that arrived during the readiness wait killed the child, which is
+	// why `awaitReady` answered at all — and the caller discards this result, because
+	// the attempt that asked for it has been cancelled. Not stopping a second time is
+	// `main.js`'s job: its attempt record marks a teardown that has already run.
 	return {
 		url: ready.url,
 		port: remote.parseReadyUrl(ready.url).port,

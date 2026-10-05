@@ -350,6 +350,38 @@ a theoretical one, and the fix has a matching limit worth stating plainly:
 `mutate` serializes the writers **inside this process**. The separate file is what
 keeps the plugin's process out, and that is the whole reason the file is separate.
 
+### The book cannot hold everything the operator can type into it
+
+Two rules the schema was missing, both of which were silent when broken, and both
+reachable from a file the operator edits by hand:
+
+- **An id is a tab.** `tabs` is keyed by device id, so a record whose id is `local`
+  did not merely collide with the local tab: `tabFor` found the existing tab, wrote
+  the device's label over it, and `devices:remove('local')` then tore the local
+  Harness down and deleted its tab for the remainder of the session — nothing
+  recreates it, because `ensureLocal` runs once, at boot. Two records sharing an id
+  were the quieter half of the same problem: they collapsed into one tab and the
+  second device was unreachable. `RESERVED_IDS` and the uniqueness check are in
+  `devices.js`, checked when the book is read **and** when it is written, and
+  refused at the `devices:save` boundary with a message naming the id.
+- **A port is an argv element of `ssh`.** `Number(incoming.sshPort) || 22` turned
+  `'2222x'` into a silent 22, and passed `'-5'` straight through to `ssh -p -5`
+  because `Number` accepts it. `normalizePort` refuses anything that is not a whole
+  number in range, for the same reason `remote.directoryProblem` refuses a directory:
+  the alternative is a value that reaches a program as something other than what was
+  typed. An empty field is the documented way to say "not specified" and still takes
+  the default.
+
+**A record the checks reject is dropped and reported, not repaired and not thrown
+over.** Dropping, because the rest of the book is not made worse by its absence;
+reported, because a device that has silently disappeared is the one failure a
+hand-editable file must not have, and this application is the only thing that knows
+why. Throwing would have been worse than either: the file is JSON with no editor
+inside the window, so a single typo would lock the operator out of the application
+that would have told them what was wrong. The messages travel with `devices:list`
+and are drawn above the device rows in the `+` popover. The rewritten book is
+written back out, so the message is not repeated on every launch.
+
 ### One field is placed inside a shell, so one field is restricted
 
 `directory` is the only value in the book that is not merely *passed* to a program
@@ -439,6 +471,99 @@ it a pipe that reaches EOF the moment the connection ends, however it ends, and
 the server is always reaped. That is why the ssh client is always given a stdin
 pipe that is never written to and never closed early, and why `stopTab` closes
 that pipe *before* killing anything.
+
+### A connect in flight is owned by the tab it is for
+
+**The teardown above only ever ran on a connection that had finished connecting,
+and that leaked.** `activate` attached its connection to the tab only after every
+`await`, and `stopTab` stops what is attached — so for the whole of a connect,
+which is seconds on a slow host, the tab looked idle to everything that stops tabs.
+A read-only audit drove the real `src/main.js` through the stubbed-Electron harness
+with the connect held open, and its probe output is the shape of the defect:
+
+```
+S1 after disconnect:     local:running dev-a:idle    | stops: 0
+S1 after connect lands:  local:running dev-a:running | stops: 0
+S2 after remove:         local:running dev-a:running
+S2 after connect+quit:   local:idle dev-a:idle | stops: 2 | stopped ids: ["local","dev-a"]
+```
+
+The `×` beside a tab that said *starting* was a control that did nothing. Removing
+the device deleted the tab and left the attempt running, so the far side kept a
+`dsh web` holding a port that nothing in the application could name any more. The
+quit path walked `tabs` and found nothing to stop for the attempt either.
+
+Every activation now carries an **attempt record**, created before the first `await`
+and reachable from the tab for as long as the attempt is alive. Three things follow
+from it, and each was a separate bug found on the way:
+
+- `stopTab` cancels the attempt as well as the connection, so `×`, removal and
+  `before-quit` all reach a connect that is still running.
+- The attempt holds **two** channels of cancellation, because a connect waits on
+  things that are not processes. `abort` is the caller's `AbortSignal`, which covers
+  the device-book read, the version probe and the platform probe; `stop` is the
+  connect path's own teardown, handed over per spawn. A cancel has to work wherever
+  the operator's click lands, so the two overlap on purpose.
+- Ownership is `cancelled` on the attempt, **not** the absence of the tab's token.
+  Comparing a token against a field that `stopTab` cleared meant a cancel issued
+  before the token was written put the same value back and the attempt looked live
+  again. That is not hypothetical: it is what the test written for this fix caught,
+  and the tab came back up `running` under a `×` the operator had already pressed.
+
+The attempt also stays reachable until `activate` is finished with it, rather than
+being cleared the moment the connect returned. Clearing it there reopened a
+microtask-sized window — connect resolved, tab not yet the owner — in which nothing
+anywhere could stop two ssh clients that were already running. Measured as a removed
+device that left its connect running.
+
+### Nothing contains a throw in the connect path, and what that cost
+
+`devices.normalize` keeps a NUL byte in `host` — the book is hand-editable, and
+`spawn` answers it with `ERR_INVALID_ARG_VALUE`. With no `try` anywhere in
+`activate`, the rejection went to whichever caller happened to be awaiting it, so
+the tab stayed at `starting` with an empty panel, no `error`, and a second click
+that did nothing: the one state this application can reach with no way out of it.
+Unhandled, the same rejection terminated the process outright — Node's default for a
+promise nobody handles — before the window had drawn anything.
+
+`runConnect` now turns a throw into a result, and `activate` turns a result into
+`state='failed'` with the message on the tab, which is what the panel already
+renders and what the "Try again" button retries. The boot chain carries a `.catch`
+as well, for a rejection above the connect, and prints it rather than exiting
+silently. The message is the platform's own, not a sentence of ours: it names the
+offending value.
+
+**And the `.catch` needed something to write to, which is why two calls moved out of
+the chain it protects.** `installIpc()` and `ensureLocal()` were the first two
+statements inside `.then(...)`. A rejected `whenReady` therefore meant no IPC
+handlers and no local tab — so the handler that exists to report the failure had
+neither a channel to draw through nor a tab to draw on, and the recovery was one
+line on a terminal in front of an empty screen. Neither call needs a ready
+application (an `ipcMain.handle` is inert until a window asks; the local tab is a
+plain object), so both run at load and the `.catch` can now put the reason on the
+tab and open the window that shows it.
+
+### The readiness reader let go of the output, and kept the listener
+
+`awaitReady` accumulated everything the server ever printed and re-scanned the whole
+buffer on every chunk: `raw += chunk` and `stderr += chunk` were unconditional, and
+`readyUrl(raw)` slices at the last newline and runs a regular expression over the
+result. So a session that ran for an hour held an hour of output, and each new chunk
+cost a pass over all of it. Measured with a `PassThrough` in place of the child:
+five chunks after the resolution produced five more `onLine` calls and 600 kB of
+retained text; the same five now produce none and retain none. The failure path was
+the worse half — the timeout fires once and a child that never announces a URL keeps
+printing, on the path that already takes 45 seconds.
+
+**The listener stays attached, and that is not an oversight.** A pipe nobody reads
+fills, and the child then blocks on its next write — and the process that would
+block is the one being waited for. So the handler returns immediately once the
+question is settled, for both outcomes. What this gives up is the post-readiness
+tail of the transcript: a tab records a connect, and a connect is not a session log.
+
+The settled reader also answers `buffered()` — the bytes it is holding — because "it
+did not grow" is otherwise a claim about a private variable, and the suite that pins
+it has to be able to see the variable.
 
 ## Windows remotes
 
@@ -607,6 +732,14 @@ Two things about it are worth knowing:
   hang until the 45-second readiness timeout and *then* report a credential error, which
   is the least actionable pair this application can produce. The check answers in about a
   tenth of a second and names the thing to change.
+- **It resolves `%SystemRoot%\System32\cmd.exe` rather than trusting `PATH` to have
+  it**, which is the same rule `connect.js` applies to `ssh` and `remote.js` applies to
+  the local Harness, and it matters more here than in either of those. A packaged
+  application is not launched from a developer shell, so PATH is not something to lean
+  on — and this probe decides whether the local tab is *allowed to start*. With the bare
+  name, a PATH-less environment produced no version and the refusal that followed blamed
+  the operator's `dsh` install, sending them to `npm install -g` for a problem that was
+  a `PATH`.
 
 The POSIX probe asks for an interactive login shell (`bash -lic`), the same one the
 Harness itself is started with, because an nvm install puts its bin directory on `PATH`
@@ -738,6 +871,18 @@ That protocol has two artefacts, and they play different roles:
 > suite re-pins both, which is the only thing keeping them honest. The contract is
 > the stable artefact to port *from*; neither JavaScript file is.
 
+> **The thirteen are not the whole of what is shared, and the gap was silent.**
+> `platform.*` — the POSIX name match and the meaning of ssh's exit code 255 — had no
+> function to compare, because the plugin inlined it inside `detectPlatform`, whose
+> body is `ctx.subprocess` calls this application does not have. A change to that
+> regex regenerated nothing and failed nothing: the thirteen do not reach it, and the
+> contract is generated from *this* copy, so a regeneration would have re-pinned the
+> drift as if it were the protocol. **The plugin has since given the rule a name**,
+> `classifyRemotePlatform(stdout)`, and `test:smoke` now compares the rule itself
+> between the two files. It still prints a SKIP, rather than passing quietly, if the
+> plugin on the machine inlines it again — losing the comparison is losing the only
+> thing that would notice.
+
 ### The three rules a port gets wrong by default
 
 The contract carries them, and they are worth reading before writing Kotlin rather
@@ -860,6 +1005,33 @@ window:
 | `test:connect` | `src/connect.js` | port allocation, the readiness reader, tunnel probing |
 | `test:main` | `src/main.js` against a stubbed Electron | the tab lifecycle and **the `Alt+digit` routing** |
 | `test:renderer` | `src/renderer/app.js` in jsdom | the tab bar, guest reuse, panels, and the IPC calls it makes |
+
+**`test:main` drives a connect that has not finished, which is the state the suite
+could not describe before.** The stub used to answer before the code under test
+looked at anything, so every window in which a tab is `starting` and its processes
+exist but the tab does not own them yet collapsed to nothing — and those windows are
+where the leaks were. Three checks now fire the three triggers (`×`, removal,
+`before-quit`) into a connect that is provably in flight, and the ordering is the
+narrow part: `h.state()` and `stopTab` are synchronous, so a check that `await`s
+anything before acting lets the connect resolve and then passes against the case that
+was never in doubt. The first version of these checks did exactly that and asserted
+nothing; the comments say so where the next person will look.
+
+**`test:main` wires a guest through `did-attach-webview`, not just
+`web-contents-created`.** The headline feature is `Alt+digit` with the focus inside a
+remote interface, and the harness emitted only the first hook — so every behavioural
+check ran against the window's own contents, which is the case that was never the
+problem. A regression in the guest path would have failed nothing.
+
+**Both halves of the boot chain's failure path are asserted**, which is why the
+rejection is injected rather than caused by breaking something inside: what has to
+hold is that a throw from *anywhere* above the `await` is survivable, and that the
+recovery is visible. The injection is delicate in one place worth knowing about — the
+harness cannot answer `whenReady()` with `Promise.reject(...)`, because `main.js`
+attaches its `.catch` a microtask later and an immediately-rejected promise is
+already unhandled by then, which terminates the process under Node's default policy.
+It is settled on the next microtask instead, which is the order the real
+`whenReady` has.
 
 `test:smoke` also reads **this document**. Four of its checks exist because each
 names a defect that no amount of source inspection would have caught: the

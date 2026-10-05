@@ -328,11 +328,15 @@ await test('an empty directory is not stored', () => {
 console.log('agreement with the plugin')
 
 /**
- * Pull one top-level function's source out of a module's text.
+ * Pull one function's source out of a module's text.
  *
- * Both files are written with top-level `function name(...)` and a closing brace
- * in column zero, so the next such line ends the body. Parsing is not needed for
- * a structural equality check.
+ * Both files are written with `function name(...)` and a closing brace in column
+ * zero, so the next such line ends the body. Parsing is not needed for a structural
+ * equality check.
+ *
+ * `export ` in front is stripped, because the plugin exports the same builders this
+ * application keeps private, and an exported copy is not a different builder.
+ *
  * @param source - the module text.
  * @param name - the function name.
  * @returns the normalized body, or undefined when absent.
@@ -344,6 +348,7 @@ function extract(source, name) {
 	if (end === -1) return undefined
 	return source
 		.slice(start, end + 2)
+		.replace(/^\s*export\s+/u, '')
 		.replace(/\s+/gu, ' ')
 		.trim()
 }
@@ -380,6 +385,77 @@ await test('every copied builder is byte-identical to the plugin\'s', () => {
 		assert.ok(original !== undefined, `${name} is missing from the plugin`)
 		assert.equal(extract(mine, name), original, `${name} has drifted from the plugin`)
 	}
+})
+
+await test('the platform rule in this copy is the one the plugin actually applies', () => {
+	// **`platform` is the one shared rule with no copied function to compare, and it
+	// was therefore the one shared rule nothing watched.** The plugin used to inline it
+	// inside `detectPlatform` — the POSIX name match and the `exitCode === 255` failure
+	// test — and that body cannot be compared, because the rest of it is
+	// `ctx.subprocess` calls this application does not have. A change to the regex or to
+	// the 255 regenerated nothing and failed nothing: the thirteen byte-identical
+	// builders above do not reach it, and the contract is generated from *this* copy, so
+	// it would have re-pinned the drift as if it were the protocol.
+	//
+	// **The plugin has since given the rule a name**, `classifyRemotePlatform(stdout)`,
+	// which makes it comparable after all — and it is compared here in both halves: the
+	// name match itself, byte for byte, and the `255` test that stayed behind in
+	// `detectPlatform` because it is about an exit code rather than about output.
+	if (PLUGIN === undefined) {
+		skipped += 1
+		console.log('  SKIP the reference plugin is not on this machine; the platform rule is pinned to this copy only')
+		return
+	}
+	const plugin = readFileSync(PLUGIN, 'utf8')
+	const mine = readFileSync(join(ROOT, 'src', 'remote.js'), 'utf8')
+	const original = extract(plugin, 'classifyRemotePlatform')
+	if (original === undefined) {
+		// The older shape: the rule inlined in `detectPlatform`, where only its literal
+		// can be reached. Said out loud rather than passed over, because a narrowed
+		// check that reports nothing is the failure this whole block exists for.
+		skipped += 1
+		console.log('  SKIP the plugin inlines the platform rule; nothing compares it, and `platform.*` is pinned to this copy only')
+		return
+	}
+	// **The comparison is the rule, not the function that wraps it.** The plugin's
+	// classifier takes stdout alone — its caller tests the exit code first — while this
+	// copy takes both and answers the failure itself, so the two function bodies cannot
+	// be equal and should not be. What must be identical is the decision they make
+	// about a host's output, and that is one expression:
+	//
+	//     <literal>.test(String(stdout ?? '').trim()) ? 'posix' : 'windows'
+	//
+	// The literal is the half a change would quietly break, and it is compared as
+	// source text from each side rather than derived from one of them, so a change to
+	// *either* file fails here.
+	const rule = /(\/[^/\n]+\/[a-z]*)\.test\(String\(stdout[^)]*\)\.trim\(\)\) \? 'posix' : 'windows'/u
+	const pluginRule = rule.exec(original)
+	const mineRule = rule.exec(extract(mine, 'classifyPlatform'))
+	assert.ok(pluginRule !== null, `the plugin's classifier no longer states its rule in a form this check can read: ${original}`)
+	assert.ok(mineRule !== null, 'classifyPlatform no longer states its rule in a form this check can read')
+	assert.equal(
+		mineRule[1],
+		pluginRule[1],
+		`the plugin classifies with ${pluginRule[1]} and this copy with ${mineRule[1]}`
+	)
+	// Guards on the guard: two matchers agreeing on a literal neither of them has
+	// actually run is what a broken pattern looks like, so the literal is checked
+	// against the live function as well — rebuilt from its own source and flags.
+	const [, literal, flags] = /^(\/[^/\n]+\/)([a-z]*)$/u.exec(pluginRule[1]) ?? []
+	assert.ok(literal !== undefined, `the captured rule is not a regular expression literal: ${pluginRule[1]}`)
+	assert.ok(
+		new RegExp(literal.slice(1, -1), flags).test('Linux'),
+		`${pluginRule[1]} does not match a POSIX host name`
+	)
+	assert.equal(remote.classifyPlatform(0, 'Linux\n').platform, 'posix')
+	assert.equal(remote.classifyPlatform(1, '').platform, 'windows')
+	// The failure code: ssh's own 255 must keep meaning "the connection failed" rather
+	// than becoming a platform guess, on both sides.
+	assert.match(plugin, /if \(outcome\.exitCode === 255\)/u, 'the plugin no longer treats 255 as its own failure')
+	assert.match(mine, /if \(exitCode === 255\) return \{ error: true \}/u, 'classifyPlatform no longer treats 255 as a failure')
+	// And the rule at the values the contract's own check uses, so a comparison that
+	// somehow matched nothing cannot pass on its own.
+	assert.equal(remote.classifyPlatform(255, '').error, true)
 })
 
 await test('the drift check would actually fail', () => {

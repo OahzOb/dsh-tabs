@@ -131,8 +131,13 @@ function panelFor(tab) {
 /**
  * Reconcile the content area with the tab list.
  *
- * A guest is created once per (tab, url) pair and then left alone: recreating it
- * on every state push would reload every remote interface every three seconds.
+ * A guest is created once per (tab, url) pair and then left alone, because
+ * recreating one reloads the interface inside it: the remote Harness loses its
+ * scroll position and whatever was typed into it. This used to say the cost was a
+ * reload "every three seconds", which was never true — nothing in `src/` polls,
+ * and `main.js` publishes only when something actually changes (a tab starts,
+ * stops, fails or is saved). The reason to reconcile rather than rebuild stands on
+ * its own, so the number went rather than a timer being added to justify it.
  */
 function renderContent() {
 	const active = state.tabs.find((tab) => tab.id === state.activeId)
@@ -168,10 +173,17 @@ function renderContent() {
 
 /**
  * Render one complete state push.
+ *
+ * `tabs` and `activeId` are the state the main process pushes on its own; anything
+ * else it sent alongside them — the device list's `problems`, which is the only way
+ * a record the book had to drop is ever mentioned — is carried through rather than
+ * dropped, because the next `tabs:state` push would otherwise erase it before the
+ * popover had drawn.
+ *
  * @param next - the state from the main process.
  */
 function apply(next) {
-	if (next !== undefined && next !== null) state = next
+	if (next !== undefined && next !== null) state = { ...state, ...next }
 	renderTabs()
 	renderContent()
 }
@@ -179,6 +191,16 @@ function apply(next) {
 /** Build the device popover. */
 function renderPopover() {
 	popoverEl.replaceChildren()
+	// Any record the book could not hold is reported before anything else, because it
+	// is the one thing here the operator cannot see for themselves: the device is
+	// simply absent from the list below, and the reason is in a JSON file they may
+	// never have opened. `problems` is what `devices:list` kept from the last load.
+	for (const problem of state.problems ?? []) {
+		const complaint = document.createElement('div')
+		complaint.className = 'hint'
+		complaint.textContent = problem
+		popoverEl.appendChild(complaint)
+	}
 	// "Open" has to mean *running*, not *present in the bar*: every device in the
 	// book has a tab by design, so a set of tab ids would mark all of them and say
 	// nothing. The state is what tells the operator whether clicking will connect
@@ -277,7 +299,10 @@ function renderPopover() {
 async function refreshDevices() {
 	const result = await api.devices()
 	devices = result.devices
-	apply(result.tabs)
+	// The problems travel *with* the tabs rather than beside them, because `apply`
+	// merges into the state the panel reads: a version that dropped them here meant
+	// the panel drew with none, which is exactly what a clean book looks like.
+	apply({ ...result.tabs, problems: result.problems })
 	renderPopover()
 }
 
