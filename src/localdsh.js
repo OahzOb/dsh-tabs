@@ -31,6 +31,8 @@
  */
 
 const { spawn } = require('node:child_process')
+const { existsSync } = require('node:fs')
+const { join } = require('node:path')
 
 /**
  * The oldest `dsh` the local tab is known to work with.
@@ -43,6 +45,34 @@ const MINIMUM_VERSION = '0.2.0-rc.2'
 
 /** How long the probe may take. `dsh --version` answers in well under a second. */
 const VERSION_TIMEOUT_MS = 20_000
+
+/**
+ * The Windows command interpreter, by absolute path.
+ *
+ * **The bare name is what broke the version check this module exists for, in
+ * exactly the environment `connect.js` defends against.** A packaged application
+ * is not launched from a developer shell, so `PATH` is not assumed there: the ssh
+ * client and the local Harness are both resolved through `%SystemRoot%\System32`
+ * first, and the same reasoning applies here — except here it fails *worse than
+ * not at all*, because the probe is what decides whether the local tab is allowed
+ * to start. A `cmd.exe` that could not be found produced no version, and the
+ * refusal that followed blamed the operator's `dsh` install — sending them to
+ * `npm install -g` for a problem that was a `PATH`.
+ *
+ * `C:\Windows` is the fallback `remote.localDshArgv` uses for an unset
+ * `SystemRoot`, which is the only reason it is named rather than derived.
+ *
+ * @param platform - the platform the answer is for, so the decision is a pure
+ *   function of its inputs and can be checked from a POSIX host.
+ * @returns the path to `cmd.exe`.
+ */
+function windowsCommandShell(platform = process.platform) {
+	const candidate = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe')
+	// The file check only means something on the host that has that file: anywhere
+	// else the path is the expected answer rather than a claim about this machine,
+	// and nothing here executes it.
+	return platform === 'win32' && !existsSync(candidate) ? 'cmd.exe' : candidate
+}
 
 /**
  * The command that prints a locally installed `dsh`'s version.
@@ -63,7 +93,7 @@ const VERSION_TIMEOUT_MS = 20_000
  */
 function versionArgv(platform = process.platform) {
 	if (platform === 'win32') {
-		return ['cmd.exe', '/c', 'dsh --version']
+		return [windowsCommandShell(platform), '/c', 'dsh --version']
 	}
 	return ['bash', '-lic', 'command -v dsh >/dev/null 2>&1 || exit 127; dsh --version']
 }
@@ -215,6 +245,7 @@ function probeLocalDsh(platform = process.platform) {
 module.exports = {
 	MINIMUM_VERSION,
 	VERSION_TIMEOUT_MS,
+	windowsCommandShell,
 	versionArgv,
 	parseVersion,
 	compareVersions,

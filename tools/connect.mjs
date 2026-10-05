@@ -65,6 +65,18 @@ function fakeChild() {
 	return child
 }
 
+/**
+ * Give the event loop a few turns, so anything appended asynchronously has landed.
+ * @returns a promise that resolves after those turns.
+ */
+function settle() {
+	return new Promise((resolve) => {
+		setImmediate(() => {
+			setImmediate(resolve)
+		})
+	})
+}
+
 console.log('port allocation')
 
 await test('an allocated port is real and bindable', async () => {
@@ -245,6 +257,55 @@ await test('a spawn that never produces anything times out with a reason', async
 	assert.match(result.error, /0s|1s/u)
 })
 
+await test('nothing is kept once the readiness line has settled', async () => {
+	// **The reader used to hold the session's whole output and re-scan it per chunk.**
+	// `raw += chunk` and `stderr += chunk` were unconditional and every chunk re-ran
+	// `readyUrl(raw)`, which slices at the last newline and runs a regular expression
+	// over the whole buffer — so a session that ran for an hour retained an hour of
+	// output and each new chunk cost a pass over all of it. Measured with this same
+	// `PassThrough`: five chunks after the resolution produced five more `onLine`
+	// calls and 600 kB of retained text.
+	//
+	// The two halves are asserted separately because they are different mistakes. No
+	// further `onLine` is what the operator sees; an unchanged `buffered()` is what the
+	// process pays, and it is a claim about a private variable that only the reader
+	// itself can answer for.
+	const child = fakeChild()
+	const lines = []
+	const pending = connect.awaitReady(child, (line) => lines.push(line), 5_000)
+	child.stdout.write('dsh web: http://127.0.0.1:42341/?token=abc\n')
+	const result = await pending
+	assert.equal(result.url, 'http://127.0.0.1:42341/?token=abc')
+	const afterReady = lines.length
+	const held = result.buffered()
+	assert.ok(held > 0, 'the reader is not accumulating at all, so this check proves nothing')
+	// The trailing partial line: the original defect fed `onLine` the whole buffer as
+	// one enormous line on every subsequent chunk, because nothing split it.
+	child.stdout.write('x'.repeat(100_000))
+	for (let index = 0; index < 5; index += 1) child.stdout.write('y'.repeat(100_000))
+	child.stderr.write('z'.repeat(100_000))
+	await settle()
+	assert.equal(lines.length, afterReady, 'the reader transcribed output after it had its answer')
+	assert.equal(result.buffered(), held, `the reader kept ${String(result.buffered() - held)} more bytes after it was done`)
+})
+
+await test('the same is true of a connect that never became ready', async () => {
+	// The failure path was the worse half: the timeout fires once and a child that
+	// never announces a URL keeps printing, so the buffer grew for as long as the
+	// connection was up — on the path that already takes 45 seconds.
+	const child = fakeChild()
+	const lines = []
+	const result = await connect.awaitReady(child, (line) => lines.push(line), 60)
+	assert.match(result.error, /never announced a URL/u)
+	const afterTimeout = lines.length
+	const held = result.buffered()
+	child.stdout.write('y'.repeat(200_000))
+	child.stderr.write('y'.repeat(200_000))
+	await settle()
+	assert.equal(lines.length, afterTimeout, 'the reader transcribed output after it had given up')
+	assert.equal(result.buffered(), held, `a timed-out reader kept ${String(result.buffered() - held)} more bytes`)
+})
+
 console.log('the local dsh version')
 
 await test('a version is read out of whatever the command printed', () => {
@@ -327,9 +388,26 @@ await test('the probe command asks the shell the Harness will actually be starte
 	assert.ok(posix.includes('-lic'), 'the probe does not ask for an interactive login shell')
 	assert.ok(posix[posix.length - 1].includes('command -v dsh'), 'a missing dsh is not distinguished from a shell error')
 	// Windows needs `cmd /c`, because `dsh` is a `.cmd` shim Node cannot execute itself.
+	// And it needs the **absolute** path to `cmd.exe`, for the reason `connect.js`
+	// resolves ssh and the local Harness the same way: a packaged application is not
+	// launched from a shell, so PATH is not there to be relied on — and when this was
+	// the bare name, a PATH-less environment turned the version probe into "no
+	// version", which the operator was told was a problem with their `dsh` install.
 	const windows = localdsh.versionArgv('win32')
-	assert.equal(windows[0], 'cmd.exe')
+	assert.match(windows[0], /cmd(?:\.exe)?$/u)
+	assert.ok(windows[0].includes('System32'), `the probe names cmd without resolving it: ${windows[0]}`)
 	assert.deepEqual(windows.slice(1), ['/c', 'dsh --version'])
+})
+
+await test('the Windows command shell is resolved the way the other Windows launches are', () => {
+	// The same three branches `connect.js` and `remote.localDshArgv` use: the
+	// environment's `SystemRoot` when there is one, and the OS's own directory when
+	// there is not. Both are pinned, because the fallback is what a stripped
+	// environment gets and it is the case that was broken.
+	const resolved = localdsh.windowsCommandShell('win32')
+	assert.ok(resolved.endsWith('cmd.exe'), resolved)
+	assert.ok(resolved.startsWith(process.env.SystemRoot ?? 'C:\\Windows'), resolved)
+	assert.ok(resolved.includes('System32'), resolved)
 })
 
 await test('the version this machine actually has is found and accepted', async () => {

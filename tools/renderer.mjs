@@ -67,6 +67,7 @@ function harness(options = {}) {
 	const transcripts = options.transcripts ?? {}
 	let state = options.state ?? { activeId: 'local', tabs: [] }
 	let devices = options.devices ?? []
+	let problems = options.problems ?? []
 	let onState = () => {}
 	let onShortcut = () => {}
 	let failSave
@@ -83,7 +84,7 @@ function harness(options = {}) {
 		},
 		devices: async () => {
 			calls.push(['devices'])
-			return { devices, tabs: state }
+			return { devices, tabs: state, problems }
 		},
 		open: async (id) => {
 			calls.push(['open', id])
@@ -133,6 +134,9 @@ function harness(options = {}) {
 		},
 		setDevices(next) {
 			devices = next
+		},
+		setProblems(next) {
+			problems = next
 		},
 		failNextSave(message) {
 			failSave = message
@@ -355,8 +359,12 @@ await test('the add form submits the fields it was given', async () => {
 	assert.equal(saved[1].host, '10.0.0.3')
 	assert.equal(saved[1].user, 'builder')
 	assert.equal(saved[1].label, 'box-b')
-	// An empty port must not be sent as an empty string: the main process coerces,
-	// but sending '' would be a silent shape disagreement.
+	// The port field is passed through as the operator left it, and an empty one goes
+	// out as an empty string. That is deliberately **not** a shape disagreement: the
+	// main process's `normalizePort` reads `''` as the documented way to say "not
+	// specified" and answers 22, while anything that is not a whole number in range is
+	// refused with a message. The previous wording here claimed the empty string must
+	// not be sent, which contradicted the line below it — and the line was right.
 	assert.equal(saved[1].sshPort, '')
 })
 
@@ -374,6 +382,29 @@ await test('a rejected save surfaces the reason instead of failing silently', as
 	await h.flush()
 	await h.flush()
 	assert.match(h.popover().textContent, /host and user are required/u)
+})
+
+await test('what the book had to leave out is shown, not swallowed', async () => {
+	// The book is a file the operator edits by hand, and a record the checks reject is
+	// *dropped* rather than repaired. Absent from the list below is the one thing they
+	// cannot notice, and the reason lives in `devices:list`'s `problems` — so it has to
+	// reach the panel, above the devices it is about.
+	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	h.setProblems(['the device "box-b" was left out of the book: the ssh port has to be a whole number between 1 and 65535, and "2222x" is not one'])
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	assert.match(h.popover().textContent, /box-b/u, `the dropped device is not named: ${h.popover().textContent}`)
+	assert.match(h.popover().textContent, /whole number between 1 and 65535/u, 'the reason is not shown')
+	// And with a clean book the panel says nothing about ports.
+	const clean = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	clean.setProblems([])
+	await clean.flush()
+	clean.document.getElementById('add').dispatchEvent(new clean.window.MouseEvent('click', { bubbles: true }))
+	await clean.flush()
+	await clean.flush()
+	assert.doesNotMatch(clean.popover().textContent, /left out of the book/u)
 })
 
 console.log(`\n${String(passes)} checks passed${failures.length === 0 ? '' : `, ${String(failures.length)} failed`}`)
