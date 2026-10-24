@@ -56,6 +56,8 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **A device book in the plugin's schema** | `$DSH_HOME/dsh-tabs.json` — a file of its own, seeded from the Desktop plugin's `remote-devices.json` on first run, never written by two processes at once. |
 | **A readable failure** | A connect that fails quotes the far side's own words, including the CLIXML error stream PowerShell produces on a Windows host. |
 | **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
+| **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
+| **One instance, and a `--version` that answers** | A packaged Electron binary has no version flag of its own, so `dsh-tabs --version` used to come up as a second window *with a second local Harness*; it now prints and exits, and a second launch hands its window forward instead of starting another Harness. |
 
 ## Requirements
 
@@ -86,9 +88,16 @@ outside its own workspace.
   *configured thing*, not a transient view: selecting an idle one starts it, and
   the `×` **disconnects** it rather than removing it. Removing a device is the
   `+` popover's job.
+- **`⟲` restarts** the tab's Harness: it stops what is running, waits for the
+  process to be gone, and connects again. This is how you pick up a change to `dsh`
+  or to a profile — the operation that used to mean closing the application. The
+  local tab has `⟲` and no `×`, because nothing recreates a tab that was stopped.
 - **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
   inside a remote interface.
 - **`+`** lists the devices, adds one, and removes one.
+- **Launching it again does not start a second one.** `dsh-tabs --version` prints the
+  version and exits; any other second launch brings the existing window forward,
+  because a second copy would be a second local Harness nobody can see.
 
 ## Documentation
 
@@ -748,17 +757,179 @@ launch works.
 
 The three remedies the message suggests (store it from the Models page, export it, or
 run no second local Harness) remain valid, but none of them was the actual fix, and none
-of them is needed on a current install.
+of them is needed on a current install. The third one is no longer something an
+operator has to arrange: there is one instance and one local Harness, by construction.
 
-## Known limitation: a force-killed application leaks its Harness
+## Restarting, one instance, and what "the web process is still there" was
 
-Closing the window is clean — verified: the application quits, the tree kill in
-`connect.js` runs, and the local Harness disappears with it. That is the path an
-operator actually takes.
+Closing the window is clean — verified on a real instance with nothing else running:
+`CloseMainWindow` on the window quits the application, the tree kill in `connect.js`
+runs, and `cmd.exe`, the `dsh web` node process and its listening port all disappear
+within six seconds. That is the path an operator actually takes, and it works.
 
-**Terminating the process outright still leaks it.** Nothing inside the child can
-prevent that: the application is the one that knows the process tree, and a
-terminated application runs no code.
+**Terminating the process outright still leaks it, and that part is not fixable from
+inside.** Nothing in the child can prevent it: the application is the one that knows
+the process tree, and a terminated application runs no code. What *is* fixable — and
+what the rest of this section is about — is every case where the application was not
+what got terminated, and where the web process therefore looked permanent.
+
+**And a copy nobody closed looks exactly like a leak.** Two things used to produce a
+second `dsh-tabs` with its own `dsh web`, with nothing on screen to say so:
+
+- **`dsh-tabs.exe --version` came up as a whole application.** A packaged Electron
+  application has no version flag of its own, so the command that reads like a
+  version probe was a launch: window, local Harness, a loopback port held until
+  somebody noticed. Reproduced on this machine — probing the installed binary's
+  version left a second `dsh-tabs.exe` with its own `cmd.exe → node` tree alive, and
+  the process listing is what found it.
+- **A second launch was a second application.** There is no single-instance lock in
+  `requestSingleInstanceLock`'s absence, so double-clicking the shortcut, or a script
+  that runs the binary, produced another window and another Harness. Closing the
+  window the operator was looking at left the other one's web process serving.
+
+Both are fixed in `main.js`, before anything is created:
+
+| | |
+| --- | --- |
+| `--version`, `-v` | prints `package.json`'s version and exits — no window, no Harness |
+| `--help`, `-h` | prints what the binary does and exits |
+| a second launch | the lock is refused, one line goes to stderr, the existing window is raised, and the process exits |
+
+The exit is `app.exit(0)` rather than `app.quit()`, and the losing branch registers
+nothing at all. Both are load-bearing rather than tidy: with no window and no
+`window-all-closed` handler, a `quit()` is a process that sits there looking alive —
+measured, the refused second launch printed its line and stayed running — and anything
+registered on the way out is a Harness started by the copy that was supposed to do
+nothing.
+
+### The register-then-declare crash, which shipped and was caught in the installed build
+
+The first version of the lock put `app.on('second-instance', …)` above the module's own
+state, and the handler reads `mainWindow`. **A `let` cannot be read until its
+declaration has been evaluated**, so a second launch that arrived while `main.js` was
+still being evaluated threw
+
+```
+Uncaught Exception:
+ReferenceError: Cannot access 'mainWindow' before initialization
+    at …\resources\app\src\main.js:164:3
+```
+
+and Electron answered that with a main-process error dialog **over the running
+application**. Seen from outside, with no terminal attached: the installed window's
+title became `Error` instead of `dsh-tabs`, which is how it was found — a `shot.ps1`
+capture looking for the window by its exact title stopped matching.
+
+The window for it is the whole of the rest of the module — `startApplication`
+registers the IPC handlers, the boot chain and the local tab — so it is tens of
+milliseconds wide, wide enough to hit by double-clicking a shortcut twice. Two things
+came out of it:
+
+- **The declarations sit above the lock**, so everything a registered handler can reach
+  exists before the handler is registered. That is the fix, and it is the general rule
+  rather than a patch for this one handler.
+- **`tools/smoke.mjs` now fires the event while the module is loading**, by replacing
+  `Module._load` and calling the registered listener from a `setImmediate` scheduled
+  before `src/main.js` is evaluated — the last moment a launch can arrive while the
+  first instance is still loading. Confirmed to bite: putting the declaration back
+  where it was makes that check fail with `mainWindow is not defined`, and no timing
+  benchmark is involved.
+
+Verified afterwards in a real window across second launches at 250, 400, 700, 1200 and
+2500 ms (`e2e-lock.ps1` in the ignored `scratch/`): every one exited, said `dsh-tabs is
+already running`, and left the first instance titled `dsh-tabs`.
+
+Restarting is also a first-class control now (`⟲` on a tab), because the honest way
+to replace the local Harness should not be to close the application — that is the
+operation which, when it does not go cleanly, is what leaves the stray process behind.
+
+### A tab that says running and shows nothing
+
+**The complaint that started this: the window came up, the Local tab said running with a
+green dot, and the content area was a flat rectangle.** No panel, no message, and
+pressing F5 did not help — which ruled out a document that failed to load, because a
+failed load in Chromium draws an error page, and what was there was the application's own
+background colour. The guest renderer process existed, so a webview had been attached.
+
+What the server answers is the whole story, and it was measured against a real Harness on
+this machine:
+
+| request | answer |
+| --- | --- |
+| the URL from the readiness line, token included | `303` + `Set-Cookie: dsh-auth-…`, then the app |
+| the same URL with the token stripped, or wrong | `400`, **empty body**, in 13–16 ms |
+| the same URL with a stale `dsh-auth-…` cookie from an earlier run | `401 dsh web authentication required; reopen the URL printed by dsh web.` |
+
+A guest navigated to one of those refusals has nothing to paint: the empty `400` is a
+blank rectangle, and the one-line `401` is a blank rectangle with a sentence in it that
+disappears against the dark chrome. Either way the tab strip goes on saying **running**,
+because the *tab* is running — the Harness is up and answering; it is the URL the webview
+holds that the server will not serve. Reloading re-asks with the same URL.
+
+Two changes follow from that, and they cover the failure from both ends:
+
+1. **The connect path now requires the announced URL to serve the application.**
+   `waitForHttpReady` accepts a `303`/`302`/`307`, or a `200` whose document contains the
+   Web UI's mount point, and reports anything else as a failed connect naming what
+   answered. A refusal is *settled* rather than retried — `400` and `401` do not improve
+   with age — while a connection error is retried until the deadline, which is the
+   genuinely transient case. A tab can therefore no longer be called running on a URL that
+   serves nothing: the operator gets a failure panel with the address and the answer in it.
+2. **A guest that fails to load is repaired where it is visible.** `did-fail-load`
+   (filtered against `ERR_ABORTED` and subresource failures) and `render-process-gone`
+   reload on a short schedule, and when the schedule runs out the element is dropped so
+   the next state push rebuilds it — a fresh navigation, which is the one thing left to
+   try, and what pressing the tab's own `⟲` does without replacing a Harness that is
+   already up.
+
+The marker the check looks for is a string in the frontend's own document, so
+`tools/smoke.mjs` asserts it against the installed `dsh-web-frontend`: a future release
+that renames the mount point fails a suite here rather than producing blank windows.
+
+What is *not* claimed: the exact route by which a URL lost its token was never
+reproduced, so the cure is not "the token can no longer be lost" — it is that a URL that
+cannot serve the app can no longer be presented as a running tab, and a guest that fails
+to paint is no longer something the operator has to notice for themselves.
+
+### A restart waits for the process, and the wait is measured
+
+`restartTab` stops the tab, waits for the connection to report its process gone, and
+only then connects again. Starting the replacement first makes "restart" look like it
+did nothing: the operator's next turn is served by the process they asked to replace,
+and a tab that says "running" either way is the only evidence.
+
+Two numbers decide the shape of that wait, and both were measured on this machine
+against a real Harness (the throwaway probe `still-running-probe.cjs`, kept in the
+container's ignored `scratch/` beside this repository — the same place the end-to-end
+driver below lives):
+
+| | |
+| --- | --- |
+| `stillRunning()` immediately after `stop()` | **true** — the tree kill is synchronous, but Node has not delivered the child's `exit` yet |
+| gone after | **717 ms** and **771 ms** over two runs (one poll interval each) |
+| the port, once gone | **0 listeners**, so the replacement is not racing the old one for anything |
+
+So the wait is check → one event-loop turn → check again, not check → sleep → check:
+a process that is already dead costs one turn rather than one interval, and a process
+that is genuinely taking its time is still caught. The ceiling is **5 s**, and reaching
+it fails *open* — the replacement starts anyway and the tab's transcript says
+`still alive after 5s; started anyway`, because a restart that refuses to happen is
+worse than a restart on top of a stale backend, and the operator has to be able to
+tell the two apart.
+
+The line is written **after** the connect, not before it, and that is not a style
+choice: `activate` clears a tab's transcript when it starts, so a note written before
+the wait is erased by the very connect it was describing. Measured — the line was in
+the buffer while the old process was being waited for and gone by the time the tab was
+up, which is when somebody reads it.
+
+Verified end to end in a real window rather than only in the offline suite — the
+driver is `e2e-restart.ps1` in the same ignored `scratch/`, and it presses the actual
+`⟲` button through Electron's debugger protocol against a copy of the application
+whose connect layer writes a marker file:
+`local-1` on port 60411 → one `stop` of `local-1` → `local-2` on port 63191, with the
+guest repointed at the new port; and a second launch of the same build exited with
+`dsh-tabs is already running` while the call log stayed at two connections.
 
 ### How the Windows local tab is started, and why it is not symmetric
 

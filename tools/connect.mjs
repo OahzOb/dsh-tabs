@@ -13,6 +13,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:net'
+import { createServer as createHttpServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -77,6 +78,22 @@ function settle() {
 	})
 }
 
+/**
+ * Stand in for the check that a readiness URL actually serves.
+ *
+ * `awaitReady` confirms the announced URL answers before it hands the connect back, and
+ * that check is a real HTTP request. The line-parsing checks below write invented URLs
+ * on purpose — they are about chunking and buffering, not about a server — so they use
+ * this instead: a `fetch` to `127.0.0.1:1` would make them assertions about whatever
+ * happens to be listening, and about how long a timeout takes.
+ *
+ * The check itself is covered by its own test below, against a real HTTP server, so
+ * nothing here is stubbing the behaviour that matters — only the network.
+ *
+ * @returns the accepted answer.
+ */
+const servesImmediately = async () => ({ ok: true })
+
 console.log('port allocation')
 
 await test('an allocated port is real and bindable', async () => {
@@ -130,7 +147,7 @@ console.log('the readiness line')
 await test('the URL is found when it arrives in one chunk', async () => {
 	const child = fakeChild()
 	const lines = []
-	const pending = connect.awaitReady(child, (line) => lines.push(line), 2000)
+	const pending = connect.awaitReady(child, (line) => lines.push(line), 2000, servesImmediately)
 	child.stdout.write('dsh web: http://127.0.0.1:42341/?token=abc\n')
 	const result = await pending
 	assert.equal(result.url, 'http://127.0.0.1:42341/?token=abc')
@@ -142,7 +159,7 @@ await test('the URL is found when it is split across chunks', async () => {
 	// pipe hands over whatever the writer flushed, so a URL can arrive in pieces —
 	// and a line-oriented matcher would wait forever on a line that already passed.
 	const child = fakeChild()
-	const pending = connect.awaitReady(child, () => {}, 2000)
+	const pending = connect.awaitReady(child, () => {}, 2000, servesImmediately)
 	child.stdout.write('dsh web: http://127.0.0.')
 	child.stdout.write('1:42341/?tok')
 	child.stdout.write('en=abc\n')
@@ -167,7 +184,7 @@ await test('the URL after the split one is the one that wins', async () => {
 	// Two lines: a truncated-looking one that is genuinely complete, then the real
 	// one. The first complete line must win, exactly as the far side printed it.
 	const child = fakeChild()
-	const pending = connect.awaitReady(child, () => {}, 2000)
+	const pending = connect.awaitReady(child, () => {}, 2000, servesImmediately)
 	child.stdout.write('dsh web: http://127.0.0.1:1/?token=first\n')
 	child.stdout.write('dsh web: http://127.0.0.1:2/?token=second\n')
 	const result = await pending
@@ -180,7 +197,7 @@ await test('stderr is recorded, not ignored', async () => {
 	// actionable failure this app can produce.
 	const child = fakeChild()
 	const lines = []
-	const pending = connect.awaitReady(child, (line) => lines.push(line), 2000)
+	const pending = connect.awaitReady(child, (line) => lines.push(line), 2000, servesImmediately)
 	child.stderr.write('bash: dsh: command not found\n')
 	child.stdout.write('dsh web: http://127.0.0.1:1/?token=t\n')
 	await pending
@@ -272,7 +289,7 @@ await test('nothing is kept once the readiness line has settled', async () => {
 	// itself can answer for.
 	const child = fakeChild()
 	const lines = []
-	const pending = connect.awaitReady(child, (line) => lines.push(line), 5_000)
+	const pending = connect.awaitReady(child, (line) => lines.push(line), 5_000, servesImmediately)
 	child.stdout.write('dsh web: http://127.0.0.1:42341/?token=abc\n')
 	const result = await pending
 	assert.equal(result.url, 'http://127.0.0.1:42341/?token=abc')
@@ -304,6 +321,111 @@ await test('the same is true of a connect that never became ready', async () => 
 	await settle()
 	assert.equal(lines.length, afterTimeout, 'the reader transcribed output after it had given up')
 	assert.equal(result.buffered(), held, `a timed-out reader kept ${String(result.buffered() - held)} more bytes`)
+})
+
+await test('a readiness URL that does not serve the app is a failed connect, not a running tab', async () => {
+	// **The defect this exists for is a tab that says running and shows nothing.** The
+	// readiness line is printed before the server serves, and the URL it carries is what
+	// a `<webview>` is navigated to exactly once — with the token, which is what makes
+	// the difference. Measured on this machine against the real server:
+	//
+	//     the token URL            -> 303 + Set-Cookie, then the app
+	//     the same URL, no token   -> 400 in 13 ms, empty body
+	//
+	// An empty 400 is a blank rectangle in the window, and reloading re-asks the same
+	// question. So the check is exercised against a real HTTP server, because the whole
+	// claim is about what a real one answers.
+	const server = createHttpServer((request, response) => {
+		if (String(request.url).includes('token=')) {
+			// The ordinary answer: a redirect, no body.
+			response.writeHead(303, { location: './', 'set-cookie': 'dsh-auth-x=y; Path=/' })
+			response.end()
+			return
+		}
+		// The refusal, in the shape the real server uses: 400, no body.
+		response.writeHead(400)
+		response.end()
+	})
+	const port = await new Promise((resolve) => {
+		server.listen(0, '127.0.0.1', () => {
+			resolve(server.address().port)
+		})
+	})
+
+	try {
+		// A redirect is ready: it is the normal answer, and `303` must not be mistaken
+		// for the refusal.
+		const good = await connect.waitForHttpReady(`http://127.0.0.1:${String(port)}/?token=abc`, 4000)
+		assert.equal(good.ok, true, `a serving URL was rejected: ${String(good.reason)}`)
+
+		// A token-less URL is refused, and refused rather than waited on: no amount of
+		// waiting turns an empty 400 into the application, so the deadline must not be
+		// spent on it.
+		const started = Date.now()
+		const bad = await connect.waitForHttpReady(`http://127.0.0.1:${String(port)}/`, 4000)
+		assert.equal(bad.ok, false, 'a token-less URL was accepted')
+		assert.equal(bad.settled, true, 'a refusal was treated as something to wait for')
+		assert.match(bad.reason, /400/u)
+		assert.ok(Date.now() - started < 1500, `the refusal was waited on for ${String(Date.now() - started)}ms`)
+
+		// And `awaitReady` turns that into a connect failure that names the URL.
+		const child = fakeChild()
+		const lines = []
+		const pending = connect.awaitReady(child, (line) => lines.push(line), 4000)
+		child.stdout.write(`dsh web: http://127.0.0.1:${String(port)}/\n`)
+		const result = await pending
+		assert.equal(result.url, undefined, 'a URL that does not serve was handed over anyway')
+		assert.match(result.error, /answered HTTP 400/u)
+		// The transcript has to name the URL, because the URL is the thing the operator
+		// would otherwise go looking for — and the failure line is prefixed like every
+		// other complaint in it.
+		const named = lines.find((line) => line.startsWith('! ') && line.includes(`127.0.0.1:${String(port)}`))
+		assert.ok(named !== undefined, `the transcript does not name the URL it waited for: ${lines.join(' | ')}`)
+	} finally {
+		server.close()
+	}
+})
+
+await test('a document that is not the app is not readiness either', async () => {
+	// The other half of the same question, and the one a status code cannot answer: a
+	// `200` with the wrong body is still a blank tab. The marker is the Web UI's own
+	// mount point, so this also pins what "the app" means.
+	const server = createHttpServer((_request, response) => {
+		response.writeHead(200, { 'content-type': 'text/html' })
+		response.end('<!doctype html><html><body><p>something else entirely</p></body></html>')
+	})
+	const port = await new Promise((resolve) => {
+		server.listen(0, '127.0.0.1', () => {
+			resolve(server.address().port)
+		})
+	})
+	try {
+		const started = Date.now()
+		const answer = await connect.waitForHttpReady(`http://127.0.0.1:${String(port)}/?token=abc`, 4000)
+		assert.equal(answer.ok, false, 'a page that is not the Web UI was accepted as readiness')
+		assert.equal(answer.settled, true, 'a wrong document was treated as something to wait for')
+		assert.match(answer.reason, /not the Web UI/u)
+		assert.ok(Date.now() - started < 1500, 'a wrong document was retried until the deadline')
+
+		// A document that *is* it is accepted immediately.
+		const good = createHttpServer((_request, response) => {
+			response.writeHead(200, { 'content-type': 'text/html' })
+			response.end(`<!doctype html><html><body><div ${connect.APP_MOUNT}></div></body></html>`)
+		})
+		const goodPort = await new Promise((resolve) => {
+			good.listen(0, '127.0.0.1', () => {
+				resolve(good.address().port)
+			})
+		})
+		try {
+			const accepted = await connect.waitForHttpReady(`http://127.0.0.1:${String(goodPort)}/?token=abc`, 4000)
+			assert.equal(accepted.ok, true, `the app's own document was rejected: ${String(accepted.reason)}`)
+		} finally {
+			good.close()
+		}
+	} finally {
+		server.close()
+	}
 })
 
 console.log('the local dsh version')

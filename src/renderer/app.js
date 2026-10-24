@@ -71,9 +71,44 @@ function renderTabs() {
 		key.textContent = String(index + 1)
 		button.appendChild(key)
 
+		// The controls live in their own box so the label's width is not affected by
+		// how many of them a tab has. `flex-shrink: 0` on the box, `min-width: 0` on
+		// the label: a long device label shortens, the controls never disappear.
+		const controls = document.createElement('span')
+		controls.className = 'tab-controls'
+
+		// **Restart is a first-class action, not a debugging affordance.** The local
+		// Harness is a child process of this application, so replacing it used to mean
+		// closing the whole desktop and launching it again — which is how an operator
+		// ends up doing the one thing that can leave the old one behind, and why
+		// "restart the web process" felt like it needed the application closed. It is
+		// also the only way to pick up a change to the Harness or to the profile its
+		// config lives in, so it belongs on the tab that owns the process.
+		//
+		// Offered whenever there is something to restart *or* something to start
+		// again: a failed tab is the case an operator reaches for this in, and a
+		// running one is the case they came for.
+		if (tab.state !== 'idle') {
+			const restart = document.createElement('button')
+			restart.type = 'button'
+			restart.className = 'tab-restart'
+			restart.textContent = '⟲'
+			restart.title = tab.kind === 'local' ? 'Restart the local Harness' : 'Reconnect'
+			restart.addEventListener('click', (event) => {
+				event.stopPropagation()
+				void api.restart(tab.id).then(apply)
+			})
+			controls.appendChild(restart)
+		}
+
 		// The control stops the tab rather than removing it: a device tab is one of
 		// the configured things and stays in the bar, so the next click or
 		// Alt+digit brings it straight back. Removing a device lives in the popover.
+		//
+		// The local tab has no `×` and that is deliberate, not an omission: nothing
+		// recreates it, so stopping it there would leave a tab that can never come
+		// back. Restart above is what the local Harness gets instead, and it is the
+		// operation that is actually wanted.
 		if (tab.id !== 'local' && tab.state !== 'idle') {
 			const stop = document.createElement('button')
 			stop.type = 'button'
@@ -84,8 +119,10 @@ function renderTabs() {
 				event.stopPropagation()
 				void api.disconnect(tab.id).then(apply)
 			})
-			button.appendChild(stop)
+			controls.appendChild(stop)
 		}
+
+		button.appendChild(controls)
 
 		button.addEventListener('click', () => {
 			void api.activate(tab.id).then(apply)
@@ -129,6 +166,24 @@ function panelFor(tab) {
 }
 
 /**
+ * How many times a guest that failed to load is asked again, and how long to wait.
+ *
+ * **A guest is navigated once, and a refusal it receives then is what it keeps.** That
+ * is the shape of the failure this exists for: the tab says `running`, the harness is
+ * up, and the content area is a flat rectangle — because the document Chromium got was
+ * the server's one-line refusal (or a transport error), and reloading by hand re-asks
+ * the same question and gets the same answer. Nothing in the application used to
+ * notice, so the only ways out were to press `⟲` or restart the whole application.
+ *
+ * The delays are spaced out because the interesting case is a race: the connect path
+ * already waits for the URL to answer before the tab is called running, so a guest that
+ * still failed is either early by a hair or talking to something that is genuinely not
+ * serving. Three tries over about two seconds tells those apart without hammering a
+ * server that is down.
+ */
+const GUEST_RETRY_DELAYS_MS = [0, 500, 1500]
+
+/**
  * Reconcile the content area with the tab list.
  *
  * A guest is created once per (tab, url) pair and then left alone, because
@@ -138,6 +193,10 @@ function panelFor(tab) {
  * and `main.js` publishes only when something actually changes (a tab starts,
  * stops, fails or is saved). The reason to reconcile rather than rebuild stands on
  * its own, so the number went rather than a timer being added to justify it.
+ *
+ * A guest that fails to load is the exception, and it is handled where it happens: the
+ * reloads are a repair of the one document, so they must not go through the state that
+ * decides a tab is running.
  */
 function renderContent() {
 	const active = state.tabs.find((tab) => tab.id === state.activeId)
@@ -153,6 +212,7 @@ function renderContent() {
 		}
 		const view = document.createElement('webview')
 		view.setAttribute('src', tab.url)
+		wireGuest(view, tab.id)
 		contentEl.appendChild(view)
 		views.set(tab.id, { element: view, url: tab.url })
 	}
@@ -169,6 +229,56 @@ function renderContent() {
 	if (active !== undefined && (active.state !== 'running' || active.url === undefined)) {
 		contentEl.appendChild(panelFor(active))
 	}
+}
+
+/**
+ * Give one guest its load-failure repair.
+ *
+ * `did-fail-load` carries the error for a navigation that never produced a document, and
+ * `render-process-gone` covers the guest's process dying underneath a document that had
+ * loaded. Both leave the same blank rectangle, so both are asked again.
+ *
+ * `errorCode === -3` is `ERR_ABORTED`, which is what a navigation that was replaced by a
+ * newer one reports — every ordinary tab switch can produce it — so it is not a failure.
+ * `isMainFrame` matters for the same reason: a failed subresource is not a blank tab.
+ *
+ * @param view - the guest element.
+ * @param id - the tab it belongs to.
+ */
+function wireGuest(view, id) {
+	let attempt = 0
+	view.addEventListener('did-fail-load', (event) => {
+		if (event.errorCode === -3 || event.isMainFrame === false) return
+		if (views.get(id)?.element !== view) return
+		if (attempt >= GUEST_RETRY_DELAYS_MS.length) {
+			// Out of tries: drop the entry so the next push rebuilds the element from
+			// scratch. A new element is a new navigation, which is the one thing left
+			// to try — and it is what pressing the tab's own restart does, without
+			// replacing a Harness that is already up.
+			view.remove()
+			views.delete(id)
+			return
+		}
+		const delay = GUEST_RETRY_DELAYS_MS[attempt]
+		attempt += 1
+		setTimeout(() => {
+			// Reloading a replaced element would navigate a guest nobody is looking at.
+			if (views.get(id)?.element !== view) return
+			try {
+				view.reload()
+			} catch {
+				/* the element went away between the check and the reload */
+			}
+		}, delay)
+	})
+	view.addEventListener('render-process-gone', () => {
+		if (views.get(id)?.element !== view) return
+		try {
+			view.reload()
+		} catch {
+			/* nothing left to reload */
+		}
+	})
 }
 
 /**

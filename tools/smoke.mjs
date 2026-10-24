@@ -1230,6 +1230,8 @@ await test('every event and method the main process depends on exists', () => {
 	const wanted = [
 		["on(event: 'web-contents-created'", 'App.on(web-contents-created)'],
 		["on(event: 'before-quit'", 'App.on(before-quit)'],
+		["on(event: 'second-instance'", 'App.on(second-instance)'],
+		['requestSingleInstanceLock', 'App.requestSingleInstanceLock'],
 		["on(event: 'before-input-event'", 'WebContents.on(before-input-event)'],
 		["on(event: 'did-attach-webview'", 'WebContents.on(did-attach-webview)'],
 		['setWindowOpenHandler(', 'WebContents.setWindowOpenHandler'],
@@ -1243,6 +1245,148 @@ await test('every event and method the main process depends on exists', () => {
 	for (const [needle, label] of wanted) {
 		assert.ok(types.includes(needle), `${label} is not in electron.d.ts`)
 	}
+})
+
+await test('the version flag is answered before anything can be created', () => {
+	// A packaged Electron application has no `--version` of its own: a build that
+	// ignores the flag comes up as a *second window with a second local Harness*, and
+	// returns nothing to the shell that asked. The answers themselves are checked as
+	// behaviour in `tools/main.mjs`; this is the structural half — the answers have to
+	// be decided before the window, the boot chain or the lock, or there is something
+	// already running by the time they are printed.
+	const main = readFileSync(join(ROOT, 'src', 'main.js'), 'utf8')
+	const answer = main.indexOf('const answer = launchAnswer(')
+	const lock = main.indexOf('app.requestSingleInstanceLock()')
+	const boot = main.indexOf('void app')
+	assert.ok(answer > -1, 'the launch answer is not consulted at all')
+	assert.ok(answer < lock, 'the version answer is decided after the single-instance lock')
+	assert.ok(answer < boot, 'the version answer is decided after the boot chain')
+	assert.match(main.slice(answer, answer + 200), /process\.exit\(0\)/u)
+	// And the second instance registers nothing rather than registering and quitting:
+	// anything set up on the way out is another Harness, which is the duplicate this
+	// whole guard is for.
+	assert.match(main, /const owned = app\.requestSingleInstanceLock\(\)/u)
+	assert.match(main, /if \(!owned\) \{/u)
+	assert.match(main, /\} else \{\n\tapp\.on\('second-instance'/u)
+})
+
+await test('a second launch during startup does not crash the first one', () => {
+	// **This is a crash that shipped, and it was found in the installed build rather
+	// than here.** `app.on('second-instance', …)` reads `mainWindow`, and a `let`
+	// cannot be read until its declaration has been evaluated. With that declaration
+	// below the handler, a second launch arriving while `main.js` was still being
+	// evaluated threw `ReferenceError: Cannot access 'mainWindow' before
+	// initialization` inside the handler, and Electron answered with a main-process
+	// error dialog over the running application — the installed window's title was
+	// `Error`, and the dialog named `main.js:164:3`.
+	//
+	// The window for it is the whole of the rest of the module, which a first launch
+	// spends tens of milliseconds inside. A temporal benchmark would be a race; this
+	// is not one: `Module._load` is replaced, and the script the application's own
+	// loader runs for `src/main.js` fires `second-instance` from a `setImmediate`
+	// **scheduled before `main.js` is evaluated**. Node runs it as soon as the module
+	// body returns to the event loop, which is the last moment a launch can arrive
+	// while the first instance is still loading — so it fails on the old order every
+	// time and passes on the fixed one every time.
+	const recorded = []
+	const stub = {
+		app: {
+			on(event, listener) {
+				if (event === 'second-instance') {
+					// Before the body runs: the arrival this check exists for.
+					setImmediate(() => {
+						try {
+							listener()
+							recorded.push({ ok: true })
+						} catch (error) {
+							recorded.push({ ok: false, message: error instanceof Error ? error.message : String(error) })
+						}
+					})
+				}
+			},
+			whenReady: () => new Promise(() => {}),
+			requestSingleInstanceLock: () => true,
+			quit: () => {},
+			exit: () => {}
+		},
+		BrowserWindow: class {},
+		ipcMain: { handle: () => {} },
+		shell: { openExternal: () => {} }
+	}
+	const Module = require('node:module')
+	const original = Module._load
+	const entry = require.resolve(join(ROOT, 'src', 'main.js'))
+	Module._load = function load(request, parent, isMain) {
+		if (request === 'electron') return stub
+		return original.call(this, request, parent, isMain)
+	}
+	try {
+		delete require.cache[entry]
+		require(entry)
+	} finally {
+		Module._load = original
+		delete require.cache[entry]
+	}
+
+	// A macrotask boundary is what the `setImmediate` above needs; one turn of the
+	// event loop is not enough.
+	const waited = new Promise((resolve) => {
+		setTimeout(resolve, 50)
+	})
+	return waited.then(() => {
+		assert.equal(recorded.length, 1, 'the second-instance handler was never registered')
+		assert.equal(
+			recorded[0].ok,
+			true,
+			`the second-instance handler threw while the application was still loading: ${String(recorded[0].message)}`
+		)
+	})
+})
+
+await test('the Web UI marker the readiness check looks for is the real one', () => {
+	// `waitForHttpReady` decides "is this the app?" by looking for the mount point in the
+	// document, because a status code cannot tell the Web UI apart from the server's
+	// one-line or empty refusal — and a guest navigated to a refusal is a blank tab that
+	// reloading cannot fix. The marker is therefore a string in someone else's document,
+	// and this is where it is checked against the installed frontend: a release that
+	// renames the mount point fails here rather than in an operator's window.
+	const connect = require(join(ROOT, 'src', 'connect.js'))
+	const candidates = [
+		join(ROOT, 'node_modules', '@deepseek-ai', 'dsh-web-frontend', 'dist', 'index.html'),
+		join(homedir(), 'AppData', 'Roaming', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-web-frontend', 'dist', 'index.html')
+	]
+	const found = candidates.find((candidate) => existsSync(candidate))
+	if (found === undefined) {
+		console.log('  SKIP no dsh-web-frontend on this machine to check the marker against')
+		return
+	}
+	const html = readFileSync(found, 'utf8')
+	assert.ok(
+		html.includes(connect.APP_MOUNT),
+		`${found} does not contain ${connect.APP_MOUNT}, so every connect would be reported as a refusal`
+	)
+})
+
+await test('a guest that fails to load is retried, and then rebuilt', () => {
+	// **The blank tab, handled where it is visible.** Before this, a guest navigated to
+	// something that is not the Web UI — a refusal, a transport error — left a flat
+	// rectangle with nothing anywhere that said so, and the only ways out were the tab's
+	// restart or restarting the application. The renderer now repairs the one document:
+	// `did-fail-load` retries on a schedule, and when the schedule runs out the entry is
+	// dropped so the next state push builds a new element, which is a new navigation.
+	//
+	// Two filters in there are load-bearing and are asserted by name, because each one
+	// alone is enough to make the repair fire on healthy tabs: `ERR_ABORTED` is what a
+	// navigation replaced by a newer one reports, and a subresource failing is not a
+	// blank tab.
+	const renderer = readFileSync(join(ROOT, 'src', 'renderer', 'app.js'), 'utf8')
+	assert.match(renderer, /addEventListener\('did-fail-load'/u)
+	assert.match(renderer, /event\.errorCode === -3/u, 'ERR_ABORTED is not filtered out')
+	assert.match(renderer, /event\.isMainFrame === false/u, 'a failed subresource would trigger a reload')
+	assert.match(renderer, /addEventListener\('render-process-gone'/u)
+	assert.match(renderer, /const GUEST_RETRY_DELAYS_MS = \[/u)
+	// And the retry is wired into creation, not merely defined next to it.
+	assert.match(renderer, /wireGuest\(view, tab\.id\)/u)
 })
 
 await test('the connect path has no Electron dependency', () => {

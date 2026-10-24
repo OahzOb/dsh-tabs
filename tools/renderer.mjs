@@ -82,6 +82,10 @@ function harness(options = {}) {
 			calls.push(['disconnect', id])
 			return state
 		},
+		restart: async (id) => {
+			calls.push(['restart', id])
+			return state
+		},
 		devices: async () => {
 			calls.push(['devices'])
 			return { devices, tabs: state, problems }
@@ -220,6 +224,102 @@ await test('a changed url replaces the guest', async () => {
 	assert.equal(replaced.getAttribute('src'), 'http://127.0.0.1:2002/?token=b')
 })
 
+console.log('a guest that cannot load')
+
+/**
+ * Give a guest element the reload counter the repair needs.
+ *
+ * jsdom has no `webview`, so the reload is counted here rather than observed: the
+ * assertion is about *how many times* the application asks again, which is the whole
+ * behaviour. The events come from the window's own realm — a `new Event(...)` in this
+ * file is Node's, and jsdom refuses it as not an `Event`.
+ *
+ * @param window - the page's window, for its `Event` constructor.
+ * @param guest - the element the renderer created.
+ * @returns the handles.
+ */
+function watchGuest(window, guest) {
+	let reloads = 0
+	guest.reload = () => {
+		reloads += 1
+	}
+	return {
+		reloads: () => reloads,
+		fail(errorCode = -105, isMainFrame = true) {
+			const event = new window.Event('did-fail-load')
+			event.errorCode = errorCode
+			event.isMainFrame = isMainFrame
+			guest.dispatchEvent(event)
+		},
+		gone() {
+			guest.dispatchEvent(new window.Event('render-process-gone'))
+		}
+	}
+}
+
+await test('a failed load is retried, and a subresource failure is not', async () => {
+	// **The blank tab.** A guest navigated to something that is not the Web UI — a
+	// refusal, a transport error — leaves a flat rectangle, and nothing in the
+	// application used to notice: the tab said running and reloading by hand re-asked
+	// the same question. Now the failure is repaired, and the two filters that keep the
+	// repair off healthy tabs are checked here by name:
+	//
+	// * `ERR_ABORTED` (-3) is what a navigation replaced by a newer one reports, which
+	//   every ordinary tab switch can produce;
+	// * a failed *subresource* is not a blank tab.
+	const h = harness({ state: threeTabs(), devices: [] })
+	await h.flush()
+	const guest = h.guests()[1]
+	const watch = watchGuest(h.window, guest)
+
+	watch.fail(-3)
+	watch.fail(-105, false)
+	await h.flush()
+	assert.equal(watch.reloads(), 0, 'a healthy tab was reloaded')
+
+	// A real failure is retried, on the schedule the renderer declares.
+	watch.fail()
+	await new Promise((resolve) => {
+		setTimeout(resolve, 30)
+	})
+	assert.equal(watch.reloads(), 1, 'the first retry did not happen')
+	watch.fail()
+	await new Promise((resolve) => {
+		setTimeout(resolve, 700)
+	})
+	assert.equal(watch.reloads(), 2, 'the second retry did not happen after its delay')
+
+	// And a guest whose process died is asked again too: the document is gone either way.
+	watch.gone()
+	assert.equal(watch.reloads(), 3, 'a dead guest process was left alone')
+})
+
+await test('after the retries run out the element is rebuilt, not reloaded for ever', async () => {
+	// The end of the schedule has to *change* something: an element that keeps failing
+	// and keeps reloading is a tab that flickers and never recovers. Dropping the entry
+	// is what makes the next state push build a new element — a new navigation, and the
+	// same thing pressing the tab's own restart does without replacing a live Harness.
+	const h = harness({ state: threeTabs(), devices: [] })
+	await h.flush()
+	const guest = h.guests()[1]
+	const watch = watchGuest(h.window, guest)
+
+	for (let round = 1; round <= 3; round += 1) {
+		watch.fail()
+		await new Promise((resolve) => {
+			setTimeout(resolve, 30 + round * 600)
+		})
+	}
+	assert.equal(watch.reloads(), 3, `expected three retries, saw ${String(watch.reloads())}`)
+
+	// The entry is gone, so the same state push rebuilds instead of reusing.
+	watch.fail()
+	h.pushState(threeTabs())
+	const rebuilt = h.guests()[1]
+	assert.notEqual(rebuilt, guest, 'the failing element was reused instead of rebuilt')
+	assert.equal(h.guests().length, 2, 'rebuilding changed how many guests there are')
+})
+
 await test('a tab that stops running loses its guest', async () => {
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
@@ -287,6 +387,48 @@ await test('the disconnect control appears only when there is something to stop'
 	tabs[1].querySelector('.tab-close').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
 	await h.flush()
 	assert.deepEqual(h.calls.filter(([name]) => name === 'disconnect'), [['disconnect', 'dev-a']])
+})
+
+await test('the local tab offers a restart instead of a control that would strand it', async () => {
+	// The local tab has no `×` on purpose — nothing recreates it — so restart is the
+	// only control it can have, and it is the one the operator actually wants: the
+	// local Harness is a child process, and replacing it used to mean closing the
+	// whole application.
+	const h = harness({ state: threeTabs(), devices: [] })
+	await h.flush()
+	const local = h.tabs()[0]
+	assert.equal(local.querySelector('.tab-close'), null, 'the local tab grew a stop control')
+	const restart = local.querySelector('.tab-restart')
+	assert.ok(restart !== null, 'the local tab has no restart control')
+	assert.equal(restart.title, 'Restart the local Harness')
+	restart.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'restart'), [['restart', 'local']])
+	// A click on the control must not also select the tab: the button is inside the
+	// tab's own click target, and a restart that switched tabs would be a surprise.
+	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [])
+})
+
+await test('restart is offered wherever there is something to restart or start again', async () => {
+	// A failed tab is the case an operator reaches for this in, and an idle one has
+	// nothing to replace — so the control follows the same rule the transcript does.
+	const h = harness({
+		state: {
+			activeId: 'local',
+			tabs: [
+				{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/' },
+				{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'failed', error: 'nope' },
+				{ id: 'dev-b', kind: 'remote', label: 'box-b', state: 'idle' }
+			]
+		},
+		devices: []
+	})
+	await h.flush()
+	const tabs = h.tabs()
+	assert.ok(tabs[0].querySelector('.tab-restart') !== null, 'a running tab has no restart')
+	assert.ok(tabs[1].querySelector('.tab-restart') !== null, 'a failed tab has no restart')
+	assert.equal(tabs[2].querySelector('.tab-restart'), null, 'an idle tab offers a restart of nothing')
+	assert.equal(tabs[1].querySelector('.tab-restart').title, 'Reconnect')
 })
 
 await test('a shortcut moves the selection without asking to activate', async () => {
