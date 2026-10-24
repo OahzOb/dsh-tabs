@@ -222,6 +222,11 @@ function harness(options = {}) {
 			 * teardown — of a pipe that is already closed, or of a pid that has been
 			 * reused — and a boolean cannot see it. */
 			stopCount: () => stopped,
+			/** Test-only: the real connection answers with its children's `exitCode`s.
+			 * Only the restart tests set this — every other case keeps the "there is
+			 * nothing left to wait for" answer below and does not pay a bounded wait
+			 * for a process that does not exist. */
+			stillRunning: () => false,
 			onServerExit(listener) {
 				serverExit = listener
 			},
@@ -235,6 +240,8 @@ function harness(options = {}) {
 			crashTunnel(code = 255) {
 				tunnelExit?.(code)
 			},
+			// Last, so an override of any of the above — `stillRunning` included, which
+			// is how a restart test holds a process "alive" — actually wins.
 			...overrides
 		}
 	}
@@ -333,7 +340,17 @@ function harness(options = {}) {
 		 */
 		whenReady,
 			quit: () => {},
-			exit: () => {}
+			exit: () => {},
+			/**
+			 * The single-instance lock.
+			 *
+			 * `options.singleInstance` is what lets a test be the *second* launch. The
+			 * real main process registers nothing at all when this is refused, and the
+			 * assertions for that case are about what was **not** set up — which is the
+			 * entire point of the guard, and invisible to a test that only ever sees the
+			 * first instance.
+			 */
+			requestSingleInstanceLock: () => options.singleInstance !== false
 		},
 		BrowserWindow: class {
 			// Returning an object from a constructor replaces `this`, which is how the
@@ -470,7 +487,18 @@ function harness(options = {}) {
 			for (const listener of appListeners.get(event) ?? []) listener()
 		},
 		state: () => ipc.get('tabs:get')(),
-		call: (channel, ...args) => ipc.get(channel)({}, ...args)
+		call: (channel, ...args) => ipc.get(channel)({}, ...args),
+		/**
+		 * One tab's transcript, as the transcript channel reports it.
+		 *
+		 * Through the IPC handler rather than through a captured reference: what the
+		 * operator can read is the answer that matters, and a restart's own line about
+		 * whether the wait succeeded is only worth writing if it arrives there.
+		 *
+		 * @param id - the tab id.
+		 * @returns the transcript as one string.
+		 */
+		transcriptFor: (id) => ipc.get('devices:transcript')({}, id).lines.join('\n')
 	}
 }
 
@@ -834,6 +862,161 @@ await test('quitting tears down every tab that is up', async () => {
 	h.emitApp('before-quit')
 	// local plus dev-a.
 	assert.equal(h.stops.length, 2, `expected two stops, saw ${String(h.stops.length)}`)
+})
+
+console.log('restart')
+
+await test('restarting the local tab replaces the Harness instead of closing the application', async () => {
+	// The operation that used to require quitting the whole application, and the one
+	// that leaves a stale process behind when the quit does not go cleanly. Both
+	// halves are asserted: the old connection is torn down exactly once, and the tab
+	// comes back up on a *new* connection rather than the old one.
+	const h = harness({ devices: book })
+	await h.boot()
+	const first = (await h.state()).tabs[0]
+	assert.equal(first.state, 'running')
+	h.queue.push(h.ok({ url: 'http://127.0.0.1:20001/' }))
+	await h.call('tabs:restart', 'local')
+	const after = (await h.state()).tabs[0]
+	assert.equal(after.state, 'running')
+	assert.equal(after.url, 'http://127.0.0.1:20001/', 'the tab is still on the connection it was told to replace')
+	assert.equal(h.stops.length, 1, `the old connection was torn down ${String(h.stops.length)} times`)
+})
+
+await test('a restart connects nothing until the old process has actually gone', async () => {
+	// **Starting the replacement first makes "restart" indistinguishable from doing
+	// nothing**: the operator's next turn is served by the process they asked to
+	// replace, and the only evidence is a tab that says "running" either way.
+	//
+	// The old process is held alive for a real span and then released, and the whole
+	// span is watched rather than slept through: the replacement connect resolves in
+	// one microtask, so a tab observed in any state a *new* connection produces —
+	// `starting` with a URL, or `running` — before the release is the defect. Polling
+	// the state instead of sleeping a fixed span is what keeps this honest: a fixed
+	// sleep only proves the implementation was slower than the sleep.
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	h.queue.push(h.ok())
+	await h.call('tabs:activate', 'dev-a')
+	const held = { until: Date.now() + 600 }
+	const dying = h.ok({
+		url: 'http://127.0.0.1:27777/?dying=1',
+		stillRunning: () => Date.now() < held.until
+	})
+	h.queue.push(dying)
+
+	const restarting = h.call('tabs:restart', 'dev-a')
+	const watchUntil = Date.now() + 3000
+	let early = null
+	let sawRunning = false
+	while (Date.now() < watchUntil && early === null && !sawRunning) {
+		const tab = (await h.state()).tabs[1]
+		if (tab.state === 'running') {
+			// The release has happened, so this is the replacement arriving — which is
+			// the outcome, not the defect. The defect is only a replacement that
+			// arrived *while* the old process was alive.
+			sawRunning = Date.now() >= held.until
+			if (sawRunning) break
+		}
+		if (tab.state === 'starting' && tab.url !== undefined) early = 'starting with a URL'
+		await new Promise((resolve) => {
+			setTimeout(resolve, 25)
+		})
+	}
+
+	assert.equal(early, null, `the replacement appeared while the old process was alive (${String(early)})`)
+	assert.ok(sawRunning, 'the tab never came back up after the old process went away')
+	held.until = 0
+	await restarting
+	assert.equal((await h.state()).tabs[1].url, dying.url, 'the tab came back on something other than the replacement')
+})
+
+await test('a restart whose process is already gone does not pay the interval', async () => {
+	// The other side of the same wait, and the one every ordinary restart is: a
+	// Harness that died inside the stop must cost one event-loop turn, not one poll
+	// interval — otherwise every restart of a healthy Harness is a tab that says
+	// "starting" for no reason, which is what makes an operator press again.
+	const h = harness({ devices: book })
+	await h.boot()
+	const started = Date.now()
+	await h.call('tabs:restart', 'local')
+	assert.equal((await h.state()).tabs[0].state, 'running')
+	assert.ok(Date.now() - started < 250, `a restart of a healthy Harness took ${String(Date.now() - started)}ms`)
+})
+
+await test('a restart that cannot be waited out still starts, and says so', async () => {
+	// The bounded wait has to fail open. A teardown that never settles would
+	// otherwise leave the tab down with no way back but a relaunch, which is the one
+	// thing this feature exists to remove — and the operator has to be able to tell
+	// this restart from a clean one.
+	//
+	// The connection the tab is *on* is the stubborn one: that is the process the
+	// restart is waiting for, and an implementation that read liveness off the wrong
+	// connection would pass this check while never waiting at all.
+	//
+	// The ceiling is reached for real here, so this is one of the few checks in the
+	// file that spends seconds rather than microseconds. That is the point: an
+	// implementation whose deadline never fires is a tab that never comes back, and
+	// nothing cheaper than waiting can tell the two apart.
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	h.queue.push(h.ok({ stillRunning: () => true }))
+	await h.call('tabs:activate', 'dev-a')
+	// The replacement is healthy, so the only wait in this test is the ceiling.
+	h.queue.push(h.ok({ url: 'http://127.0.0.1:20002/' }))
+	const started = Date.now()
+	await h.call('tabs:restart', 'dev-a')
+	assert.ok(Date.now() - started >= 5_000, 'the ceiling was not reached, so nothing was actually waited for')
+	const tab = (await h.state()).tabs[1]
+	assert.equal(tab.state, 'running', 'the tab was left down by a teardown that never settled')
+	assert.match(h.transcriptFor('dev-a'), /still alive after 5s; started anyway/u)
+})
+
+await test('restarting a tab that is down starts it, without a wait', async () => {
+	// A failed tab is the case an operator reaches for this in. There is no process
+	// to wait for, so it must behave as a plain start — and it must not spend the
+	// ceiling doing it.
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	h.throwNext('spawn refused the argument')
+	await h.call('tabs:activate', 'dev-a')
+	assert.equal((await h.state()).tabs[1].state, 'failed')
+	h.queue.push(h.ok({ url: 'http://127.0.0.1:20003/' }))
+	const started = Date.now()
+	await h.call('tabs:restart', 'dev-a')
+	assert.equal((await h.state()).tabs[1].state, 'running')
+	assert.ok(Date.now() - started < 1_000, 'a tab with nothing to stop waited for a teardown anyway')
+})
+
+console.log('one instance')
+
+await test('a second launch starts no window, no local tab and no Harness', async () => {
+	// **The half of "closing the desktop does not close the web process" that has
+	// nothing to do with quitting.** A packaged binary answers no version flag of its
+	// own, so `dsh-tabs.exe --version` used to come up as a second copy — another
+	// window and another `dsh web` — and closing the window the operator was looking
+	// at left that one running. Refusing the lock has to leave *nothing* registered,
+	// because anything registered would start the duplicate on the way out.
+	const h = harness({ devices: book, singleInstance: false })
+	assert.equal(h.ipc.size, 0, `a losing instance registered IPC: ${[...h.ipc.keys()].join(', ')}`)
+	assert.deepEqual(h.sent, [], 'a losing instance drew something')
+	// And the answer to `--version` is the other way out of that binary, so the two
+	// are checked together: a version flag must never reach the lock at all.
+	const source = readFileSync(join(ROOT, 'src', 'main.js'), 'utf8')
+	assert.ok(
+		source.indexOf('const answer = launchAnswer(') < source.indexOf('app.requestSingleInstanceLock()'),
+		'the version answer is decided after the lock, so a probe could still be a second instance'
+	)
+})
+
+await test('a first launch does everything the losing one refused to', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	assert.ok(h.ipc.has('tabs:restart'), 'the restart channel was never installed')
+	assert.equal((await h.state()).tabs[0].state, 'running')
 })
 
 console.log('the device book')

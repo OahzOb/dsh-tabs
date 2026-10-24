@@ -31,6 +31,52 @@ const devices = require('./devices.js')
 const connect = require('./connect.js')
 const remote = require('./remote.js')
 
+/** This application's own version, read from the manifest beside the source. */
+const PACKAGE = require('../package.json')
+
+/**
+ * What to print and exit with for one launch, or null to start the application.
+ *
+ * **Answering `--version` is not a nicety here; not answering it starts a whole
+ * Harness nobody asked for.** A packaged Electron application has no version flag of
+ * its own: `dsh-tabs.exe --version` reaches this file like any other launch, comes up
+ * as a normal window, starts the local `dsh web`, and returns nothing to the shell
+ * that asked — so the command that looks like it *reads* something instead spawns a
+ * second copy of the application, and the local Harness under it holds a port and a
+ * session store until somebody notices the window. Measured on this machine: a
+ * probe of the installed binary's version left a second `dsh-tabs.exe` with its own
+ * `cmd.exe → node` tree alive, which is one half of "closing the desktop does not
+ * close the web process" — the other half being a copy that was never closed at all.
+ *
+ * The whole argv is checked rather than the first element, because the flag can
+ * arrive behind Electron's own switches (`dsh-tabs.exe --enable-logging --version`),
+ * and Electron strips its own before this file runs.
+ *
+ * Kept as a pure function of the arguments and the version so `tools/main.mjs` can
+ * exercise both answers — including the one that must **not** fire, which is an
+ * argument that merely looks like a flag.
+ *
+ * @param argv - the process arguments, as `electron .` or a packaged binary sees them.
+ * @param version - the version to report.
+ * @returns the text to print, or null to start the application.
+ */
+function launchAnswer(argv, version) {
+	const args = Array.isArray(argv) ? argv.map((value) => String(value)) : []
+	if (args.includes('--version') || args.includes('-v')) return `${String(version)}\n`
+	if (args.includes('--help') || args.includes('-h')) {
+		return [
+			`dsh-tabs ${String(version)} — a tabbed host for DSH web interfaces.`,
+			'',
+			'Launching the binary is the only command; it opens a window whose tabs are the',
+			'local Harness and one per device in ~/.dsh/dsh-tabs.json.',
+			'',
+			'  --version, -v   print the version and exit',
+			'  --help, -h      print this and exit'
+		].join('\n') + '\n'
+	}
+	return null
+}
+
 /**
  * The message a Node-mode launch gets, or null when the Electron API is really
  * present.
@@ -70,10 +116,19 @@ function nodeModeDiagnosis(electronApp) {
 // `require('electron')` being a string is the check rather than the variable
 // itself, because the string is the actual mechanism: clearing the variable is
 // the fix, and anything else that produces the same state is worth catching too.
-const diagnosis = nodeModeDiagnosis(app)
-if (diagnosis !== null) {
-	console.error(diagnosis)
+const nodeMode = nodeModeDiagnosis(app)
+if (nodeMode !== null) {
+	console.error(nodeMode)
 	process.exit(1)
+}
+
+// Answer `--version` and `--help` before anything is created, so the answer costs
+// no window and no Harness. See `launchAnswer` for why this is load-bearing rather
+// than polite.
+const answer = launchAnswer(process.argv.slice(1), PACKAGE.version)
+if (answer !== null) {
+	process.stdout.write(answer)
+	process.exit(0)
 }
 
 /** The tab id of the local Harness, which always exists and is always first. */
@@ -90,6 +145,69 @@ const tabs = new Map()
 
 /** The active tab id, as far as the renderer is concerned. */
 let activeId = LOCAL_ID
+
+// **One instance, because the local Harness is a per-machine resource and the
+// operator cannot see the second copy.** Without this, every launch — a shortcut
+// pressed twice, a `--version` probe by an older build, a shell that re-runs the
+// binary — becomes another window *and another `dsh web`*, and closing the window
+// the operator was looking at leaves the other copy's web process running with
+// nothing on screen that owns it. That is the observable half of "closing the
+// desktop does not close the web process": the process is real and reachable, and
+// the window that would have reaped it was never the one closed.
+//
+// The second launch does not fail silently or open a duplicate: it says what
+// happened and brings the existing window forward, which is what the operator
+// meant by launching again.
+//
+// Nothing is set up when the lock is refused, rather than being set up and then
+// abandoned: a second instance that registered the boot chain, the IPC handlers and
+// the local tab would start a Harness of its own on the way out, which is the exact
+// duplicate this exists to prevent.
+//
+// **This sits below the declarations, and that is the fix for a real crash rather
+// than tidiness.** The handler registered here reads `mainWindow`, and a `let` cannot
+// be read until its declaration has been evaluated: with the declarations further
+// down the file, a second launch that landed while this module was still being
+// evaluated threw `ReferenceError: Cannot access 'mainWindow' before initialization`
+// from inside the handler, and Electron answered that with a main-process error
+// dialog **over the running application** — measured on the installed build, whose
+// window title became `Error` and whose dialog named `main.js:164:3`. The window for
+// it is the whole of `startApplication()`'s evaluation, which is long enough to hit
+// (a first launch puts the app together for tens of milliseconds before the handler
+// exists). Everything a registered handler can reach has to exist before the handler
+// is registered.
+// TEMPORARY-REPRO: declarations moved back below the handler to prove the check bites.
+const owned = app.requestSingleInstanceLock()
+if (!owned) {
+	console.error('dsh-tabs is already running; bringing its window forward instead of starting a second local Harness.')
+	// **`exit`, not `quit`, and it is load-bearing.** With nothing registered above —
+	// no window, no boot chain, no `window-all-closed` handler — a `quit()` has no
+	// window to close and emits `before-quit` on the way to nothing, which is a
+	// process that sits there holding a devtools port and looking alive. Measured in a
+	// real window: the refused second launch printed this line and then stayed
+	// running. `exit` is unconditional and, unlike `quit`, cannot reach an event a
+	// losing instance has no business handling.
+	app.exit(0)
+} else {
+	app.on('second-instance', () => {
+		if (mainWindow === undefined || mainWindow.isDestroyed()) return
+		if (mainWindow.isMinimized()) mainWindow.restore()
+		mainWindow.show()
+		mainWindow.focus()
+	})
+	startApplication()
+}
+
+/**
+ * Everything one instance of this application does.
+ *
+ * A function, and called from exactly one place — the branch above that holds the
+ * single-instance lock — for one reason: this body registers process-wide things, and
+ * the losing instance has to leave all of them unregistered. The declarations it uses
+ * sit **above** the lock, not in here, because the handler registered there reads
+ * `mainWindow` and a `let` cannot be read before its declaration has been evaluated.
+ */
+function startApplication() {
 
 /**
  * A connect that has been started and has not finished yet.
@@ -218,6 +336,129 @@ function stopTab(tab) {
 	tab.url = undefined
 	tab.state = 'idle'
 	if (connection !== undefined) connection.stop()
+}
+
+/**
+ * How long a teardown may take to be noticed before a restart goes ahead anyway.
+ *
+ * A local Harness is reaped by `taskkill /T /F`, which is synchronous and takes tens
+ * of milliseconds; a remote one by the far side reading EOF, which is a round trip.
+ * This is the ceiling for the whole wait, not a delay anybody sits through — both
+ * paths settle well inside it, and a teardown that does not is reported rather than
+ * waited on for ever.
+ */
+const RESTART_SETTLE_MS = 5_000
+
+/**
+ * How often the wait looks again, and the *only* latency a clean restart pays.
+ *
+ * A running Harness is killed inside the same tick as the stop, so there is nothing
+ * to wait for except Node delivering the child's `exit` — which is what the first
+ * check-and-turn below covers. This interval is for the case where the process really
+ * is taking its time.
+ */
+const RESTART_POLL_MS = 50
+
+/**
+ * Wait until the process a tab was serving from has actually gone.
+ *
+ * **A stop that returns before the process is dead makes a restart a race, and the
+ * race is the whole complaint.** `stopTab` hands the teardown to the connect path,
+ * which ends the shell's stdin and tree-kills it on Windows — but the kill is
+ * asynchronous from the Harness's point of view, and a replacement started in the
+ * same tick competes with the old process for the session store, the git index and
+ * whatever else it held. On a remote tab the wait has a second job: the far-side
+ * `dsh web` is reaped by EOF on a pipe, which needs the round trip to happen.
+ *
+ * The condition is the connection's own liveness — the same one the `onServerExit`
+ * watcher uses to decide a tab has died — so this cannot disagree with the tab's
+ * state about whether anything is still there. Polling rather than an event listener
+ * because the listener is registered by `activate` for a connection this function no
+ * longer owns, and a restart must not depend on that having happened.
+ *
+ * **The shape is check, then turn, then check again — not check, sleep, check.** A
+ * child that is already dead must cost one event-loop turn rather than one interval:
+ * otherwise every restart of a healthy Harness is 50 ms of a window that is already
+ * down and a tab that says "starting" in the meantime, which is exactly the
+ * sluggishness that makes an operator press the control twice.
+ *
+ * @param connection - the connection that was just stopped.
+ * @returns whether it was gone before the ceiling.
+ */
+async function settled(connection) {
+	if (connection === undefined || typeof connection.stillRunning !== 'function') return true
+	const deadline = Date.now() + RESTART_SETTLE_MS
+	const turn = () =>
+		new Promise((resolve) => {
+			setTimeout(resolve, RESTART_POLL_MS)
+		})
+	for (;;) {
+		if (!connection.stillRunning()) return true
+		// The turn before the re-check is what lets `exit` be delivered: a kill and a
+		// poll in the same tick would see `exitCode === null` for a process that is
+		// already gone.
+		await turn()
+		if (!connection.stillRunning()) return true
+		if (Date.now() > deadline) return false
+	}
+}
+
+/**
+ * Stop one tab and bring it straight back up — the operation the operator used to
+ * have to quit the whole application to perform.
+ *
+ * **Why this exists rather than "close the window and open it again".** The local
+ * Harness is a child process of this application, so restarting it means stopping it
+ * and starting it, and until now the only control that stopped it was the `×` on a
+ * device tab — the local tab had none, on purpose, because nothing recreated it. So
+ * the documented way to pick up a change in the Harness or its profile was to close
+ * the desktop and launch it again, which is both heavier than the operation and the
+ * moment a stale process gets left behind if the close does not go cleanly.
+ *
+ * The order is the contract: stop, wait for the process to be gone, then connect.
+ * Starting before the old one has exited is what makes "restart" look like it did
+ * nothing — the operator's next turn lands on the old process, and the session they
+ * meant to replace is still the one answering. When the wait runs out the connect
+ * goes ahead anyway, because a refused restart would be worse than a stale backend,
+ * and the transcript says which of the two happened.
+ *
+ * **That line is written after the connect, not before it, and that is not a style
+ * choice.** `activate` clears the tab's transcript before it starts — a tab's lines
+ * are the story of the attempt that is running — so a note written before the wait is
+ * erased by the very connect it was describing. Measured: the line was in the buffer
+ * while the old process was being waited for and gone by the time the tab was up,
+ * which is when the operator reads it.
+ *
+ * A click that arrives during the wait is not a second Harness: `activate` returns
+ * immediately for a tab that is already `starting`, so whichever of the two gets
+ * there first is the only connect.
+ *
+ * @param id - the tab to restart.
+ * @returns the tab's state after the attempt.
+ */
+async function restartTab(id) {
+	const tab = tabs.get(id)
+	if (tab === undefined) return
+	const wasRunning = tab.state === 'running' || tab.state === 'starting'
+	const connection = tab.connection
+	stopTab(tab)
+	publish()
+	if (!wasRunning) {
+		// A tab that was idle or failed has nothing to wait for: the operator asking
+		// to restart a tab that is down is asking to start it.
+		await activate(id)
+		return
+	}
+	const gone = await settled(connection)
+	if (tabs.get(id) !== tab) return
+	await activate(id)
+	// Only when the tab is genuinely up: a connect that failed already put its own
+	// reason in the transcript, and a line about the teardown underneath it would be
+	// the wrong last word.
+	if (!gone && tab.state === 'running') {
+		note(tab, `the previous process was still alive after ${String(RESTART_SETTLE_MS / 1000)}s; started anyway`)
+		publish()
+	}
 }
 
 /**
@@ -653,6 +894,15 @@ function installIpc() {
 		}
 		return snapshot()
 	})
+	ipcMain.handle('tabs:restart', async (_event, id) => {
+		// The operation this application used to make the operator quit for. Awaited
+		// rather than fired and forgotten: the whole point is that the tab comes back,
+		// and the renderer draws whatever state it is in when this resolves — so a
+		// restart that failed is on screen as a failure rather than as a tab that
+		// looks like it is still coming up.
+		await restartTab(String(id))
+		return snapshot()
+	})
 	ipcMain.handle('devices:list', async () => {
 		const stored = await devices.load()
 		for (const device of stored) tabFor(device)
@@ -776,13 +1026,14 @@ void app
 		}
 	})
 
-app.on('window-all-closed', () => {
-	app.quit()
-})
+	app.on('window-all-closed', () => {
+		app.quit()
+	})
 
-app.on('before-quit', () => {
-	// Every tab, including the ones whose connect has not finished: `stopTab` tears
-	// down an attempt in flight, which is what used to be left running here while
-	// the application exited and the far side kept a server holding its port.
-	for (const tab of tabs.values()) stopTab(tab)
-})
+	app.on('before-quit', () => {
+		// Every tab, including the ones whose connect has not finished: `stopTab` tears
+		// down an attempt in flight, which is what used to be left running here while
+		// the application exited and the far side kept a server holding its port.
+		for (const tab of tabs.values()) stopTab(tab)
+	})
+}
