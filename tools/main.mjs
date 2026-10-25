@@ -573,17 +573,37 @@ await test('the device book becomes one tab per device, none of them started', a
 
 console.log('alt+digit')
 
-await test('alt+digit selects a tab and tells the renderer', async () => {
+await test('alt+digit selects a tab without starting it', async () => {
 	const h = harness({ devices: book })
 	await h.boot()
 	await h.call('devices:list')
 	const result = h.press({ code: 'Digit2' })
 	assert.equal(result.prevented, true, 'the key was not consumed')
-	await waitFor(async () => (await h.state()).tabs[1]?.state === 'running', 'the shortcut to start its tab')
+	await waitFor(async () => (await h.state()).activeId === 'dev-a', 'the shortcut to select its tab')
 	const state = await h.state()
 	assert.equal(state.activeId, 'dev-a')
-	assert.equal(state.tabs[1].state, 'running', 'the shortcut did not start the tab it selected')
+	// A shortcut is how an operator moves around the bar. Waking the machine it lands
+	// on is what the CONNECT panel exists to require instead.
+	assert.equal(state.tabs[1].state, 'idle', 'the shortcut started the tab it selected')
 	assert.ok(h.sent.some(([channel, payload]) => channel === 'tabs:shortcut' && payload === 'dev-a'))
+})
+
+await test('tabs:select shows a tab and starts nothing', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	const selected = await h.call('tabs:select', 'dev-a')
+	assert.equal(selected.activeId, 'dev-a')
+	assert.equal(selected.tabs.find((tab) => tab.id === 'dev-a').state, 'idle')
+})
+
+await test('tabs:activate still starts the tab it is given', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('tabs:activate', 'dev-a')
+	await waitFor(async () => (await h.state()).tabs[1]?.state === 'running', 'the connect to finish')
+	assert.equal((await h.state()).tabs[1].state, 'running')
 })
 
 await test('alt+1 goes back to the local tab', async () => {
@@ -651,9 +671,12 @@ await test('alt+digit works from inside a guest, which is the case that matters'
 	assert.notEqual(h.guest, h.window)
 	const result = h.guest.press({ code: 'Digit2' })
 	assert.equal(result.prevented, true, 'the key was not consumed by the guest')
-	await waitFor(async () => (await h.state()).tabs[1]?.state === 'running', 'the guest shortcut to start its tab')
+	await waitFor(async () => (await h.state()).activeId === 'dev-a', 'the guest shortcut to select its tab')
 	const state = await h.state()
 	assert.equal(state.activeId, 'dev-a')
+	// A shortcut is how an operator moves around the bar, from wherever the focus
+	// happens to be; it is not a request to start the machine it lands on.
+	assert.equal(state.tabs[1].state, 'idle', 'a shortcut started the tab it selected')
 	assert.ok(
 		h.sent.some(([channel, payload]) => channel === 'tabs:shortcut' && payload === 'dev-a'),
 		'the renderer was not told which tab won'

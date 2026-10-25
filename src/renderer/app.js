@@ -125,7 +125,9 @@ function renderTabs() {
 		button.appendChild(controls)
 
 		button.addEventListener('click', () => {
-			void api.activate(tab.id).then(apply)
+			// Selection, not connection: see `select` in the main process. The panel
+			// this shows offers the CONNECT itself.
+			void api.select(tab.id).then(apply)
 		})
 		tabsEl.appendChild(button)
 	})
@@ -136,6 +138,26 @@ function panelFor(tab) {
 	const panel = document.createElement('div')
 	panel.className = 'panel'
 	const heading = document.createElement('h2')
+	if (tab.state === 'idle') {
+		// **A tab that has never been up is not "starting".** Selecting it only shows
+		// it: the connection is this button, because a tab switch is a question about
+		// which tab you are looking at and not a request to start a Harness somewhere
+		// else. Alt+digit and a click both land here, and neither connects.
+		heading.textContent = `${tab.label} is not connected`
+		panel.appendChild(heading)
+		const hint = document.createElement('div')
+		hint.textContent =
+			tab.kind === 'local' ? 'the local Harness is not running' : 'nothing is running on that machine'
+		panel.appendChild(hint)
+		const connect = document.createElement('button')
+		connect.type = 'button'
+		connect.textContent = 'Connect'
+		connect.addEventListener('click', () => {
+			void api.activate(tab.id).then(apply)
+		})
+		panel.appendChild(connect)
+		return panel
+	}
 	if (tab.state === 'failed') {
 		heading.textContent = `${tab.label} could not start`
 		panel.appendChild(heading)
