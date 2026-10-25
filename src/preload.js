@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	platform: process.platform,
 	state: () => ipcRenderer.invoke('tabs:get'),
 	activate: (id) => ipcRenderer.invoke('tabs:activate', id),
+	select: (id) => ipcRenderer.invoke('tabs:select', id),
 	disconnect: (id) => ipcRenderer.invoke('tabs:disconnect', id),
 	restart: (id) => ipcRenderer.invoke('tabs:restart', id),
 	devices: () => ipcRenderer.invoke('devices:list'),

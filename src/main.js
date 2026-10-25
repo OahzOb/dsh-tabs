@@ -495,6 +495,26 @@ function abandoned(tab, attempt) {
 }
 
 /**
+ * Bring a tab to the front, and start nothing.
+ *
+ * **Selecting a tab is not asking for a connection.** A device tab is a configured
+ * thing that stays in the bar whether it is up or down, and switching past one on the
+ * way to another used to start a Harness on somebody else's machine — a side effect
+ * the operator never asked for and could only undo by finding `×`. The Android client
+ * has always drawn this line the same way: a tab shows CONNECT until it is pressed.
+ *
+ * So this is what a click and Alt+digit do; `activate` is the separate, deliberate
+ * operation, reached from the panel's CONNECT, from Try again, and from `⟲`.
+ *
+ * @param id - the tab id.
+ */
+function select(id) {
+	if (tabs.get(id) === undefined) return
+	activeId = id
+	publish()
+}
+
+/**
  * Bring one tab up, starting whatever it needs.
  *
  * **Every `await` in here is a window in which the operator can change their
@@ -838,9 +858,8 @@ function wireContents(contents) {
 		if (mainWindow !== undefined && !mainWindow.isDestroyed()) {
 			mainWindow.webContents.send('tabs:shortcut', target)
 		}
-		// A tab that has never been up still needs starting; `activate` is
-		// idempotent for one that is already running.
-		void activate(target)
+		// Selection only: Alt+digit is how an operator moves around the bar, and
+		// moving past a sleeping tab must not wake it. See `select`.
 	})
 }
 
@@ -874,6 +893,13 @@ function installIpc() {
 	ipcMain.handle('tabs:get', () => snapshot())
 	ipcMain.handle('tabs:activate', async (_event, id) => {
 		await activate(String(id))
+		return snapshot()
+	})
+	// The selection half, which a click and Alt+digit use: show the tab, start
+	// nothing. Keeping the two apart is what makes "show me that tab" and "start
+	// that machine" different requests.
+	ipcMain.handle('tabs:select', async (_event, id) => {
+		select(String(id))
 		return snapshot()
 	})
 	ipcMain.handle('tabs:disconnect', async (_event, id) => {

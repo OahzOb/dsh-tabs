@@ -57,6 +57,7 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **A readable failure** | A connect that fails quotes the far side's own words, including the CLIXML error stream PowerShell produces on a Windows host. |
 | **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
 | **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
+| **Selecting is not connecting** | A tab that is not up stays down when it is selected; its panel offers **Connect**, so moving around the bar never starts a Harness on a machine nobody asked to use. |
 | **One instance, and a `--version` that answers** | A packaged Electron binary has no version flag of its own, so `dsh-tabs --version` used to come up as a second window *with a second local Harness*; it now prints and exits, and a second launch hands its window forward instead of starting another Harness. |
 
 ## Requirements
@@ -85,9 +86,15 @@ outside its own workspace.
 ## Using it
 
 - **Tabs** are the local Harness and every device in the book. A tab is a
-  *configured thing*, not a transient view: selecting an idle one starts it, and
-  the `×` **disconnects** it rather than removing it. Removing a device is the
-  `+` popover's job.
+  *configured thing*, not a transient view, so it stays in the bar whether it is up
+  or down; the `×` **disconnects** it rather than removing it, and removing a device
+  is the `+` popover's job.
+- **Selecting a tab does not connect it.** A click and `Alt+digit` move the
+  selection and do nothing else: a tab that is not up shows a panel with **Connect**,
+  and that button is what starts the machine. A failed tab's panel offers **Try
+  again** the same way. This is the Android client's rule, adopted here because a tab
+  switch used to start a Harness on somebody else's machine as a side effect of
+  looking at it.
 - **`⟲` restarts** the tab's Harness: it stops what is running, waits for the
   process to be gone, and connects again. This is how you pick up a change to `dsh`
   or to a profile — the operation that used to mean closing the application. The

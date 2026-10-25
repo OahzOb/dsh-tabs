@@ -78,6 +78,10 @@ function harness(options = {}) {
 			calls.push(['activate', id])
 			return state
 		},
+		select: async (id) => {
+			calls.push(['select', id])
+			return state
+		},
 		disconnect: async (id) => {
 			calls.push(['disconnect', id])
 			return state
@@ -352,6 +356,23 @@ await test('a starting tab says so, and names what it is waiting for', async () 
 	assert.match(panel[0].textContent, /ssh tunnel/u)
 })
 
+await test('an idle tab is offered a CONNECT and does not start itself', async () => {
+	const h = harness({
+		state: { activeId: 'dev-a', tabs: [{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'idle' }] },
+		devices: []
+	})
+	await h.flush()
+	const panel = h.panels()
+	assert.equal(panel.length, 1)
+	assert.match(panel[0].textContent, /box-a is not connected/u)
+	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [], 'showing a tab connected it')
+	const connect = [...panel[0].querySelectorAll('button')].find((button) => button.textContent === 'Connect')
+	assert.ok(connect !== undefined, 'the idle panel has no Connect button')
+	connect.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [['activate', 'dev-a']])
+})
+
 await test('a failed tab names the reason and shows the transcript', async () => {
 	const h = harness({
 		state: { activeId: 'dev-a', tabs: [{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'failed', error: 'the ssh tunnel never began accepting connections' }] },
@@ -368,12 +389,13 @@ await test('a failed tab names the reason and shows the transcript', async () =>
 
 console.log('interaction')
 
-await test('clicking a tab asks the main process to activate it', async () => {
+await test('clicking a tab selects it and connects nothing', async () => {
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
 	h.tabs()[1].dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
 	await h.flush()
-	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [['activate', 'dev-a']])
+	assert.deepEqual(h.calls.filter(([name]) => name === 'select'), [['select', 'dev-a']])
+	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [], 'a tab click must not start a connect')
 })
 
 await test('the disconnect control appears only when there is something to stop', async () => {
@@ -431,9 +453,9 @@ await test('restart is offered wherever there is something to restart or start a
 	assert.equal(tabs[1].querySelector('.tab-restart').title, 'Reconnect')
 })
 
-await test('a shortcut moves the selection without asking to activate', async () => {
-	// The main process already ran `activate` before it sent this; asking again
-	// would restart a tab that is coming up.
+await test('a shortcut moves the selection without asking to connect', async () => {
+	// The main process already selected the tab before it sent this; asking again
+	// would be a second request for something it has already done.
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
 	h.pushShortcut('dev-a')
