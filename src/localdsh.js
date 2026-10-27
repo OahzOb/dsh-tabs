@@ -30,7 +30,7 @@
  * gets the credential error anyway.
  */
 
-const { spawn } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 const { existsSync } = require('node:fs')
 const { join } = require('node:path')
 
@@ -95,7 +95,13 @@ function versionArgv(platform = process.platform) {
 	if (platform === 'win32') {
 		return [windowsCommandShell(platform), '/c', 'dsh --version']
 	}
-	return ['bash', '-lic', 'command -v dsh >/dev/null 2>&1 || exit 127; dsh --version']
+	// `exec` so the probe's child *is* the `dsh` the timeout has to stop. Without it
+	// the child is the interactive bash that started `dsh`, and `child.kill()` on a
+	// timeout leaves the version process running — measured with a `dsh` that slept:
+	// the probe returned at 20 s and the node child kept the pipes open for another
+	// 40. `command -v` stays first so a missing `dsh` is a 127 rather than a shell
+	// error, and `exec` only runs after it succeeds.
+	return ['bash', '-lic', 'command -v dsh >/dev/null 2>&1 || exit 127; exec dsh --version']
 }
 
 /**
@@ -200,6 +206,36 @@ function versionProblem(reported, output = '') {
 }
 
 /**
+ * Stop a version probe, and the `dsh` it started.
+ *
+ * **`child.kill()` is not enough on Windows, and this was measured.** The probe is
+ * `cmd /c dsh --version`; the npm shim puts `node` underneath `cmd.exe`, so killing
+ * the shell leaves the version process running with the inherited pipes still open.
+ * A fake `dsh.cmd` that slept for a minute made the probe print its result at 20 s
+ * while the whole command stayed alive until the child's own timer expired.
+ *
+ * POSIX needs no tree walk: `versionArgv` `exec`s `dsh`, so the child is the version
+ * process itself. The single kill is kept as the fallback everywhere.
+ *
+ * @param child - the probe this module spawned.
+ * @param platform - the platform the probe was built for.
+ */
+function stopProbe(child, platform = process.platform) {
+	if (platform === 'win32' && child.pid !== undefined) {
+		try {
+			spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+		} catch {
+			/* fall through to the single kill */
+		}
+	}
+	try {
+		child.kill()
+	} catch {
+		/* already gone */
+	}
+}
+
+/**
  * Ask the local `dsh` what version it is.
  *
  * @param platform - the local platform.
@@ -218,11 +254,7 @@ function probeLocalDsh(platform = process.platform) {
 			resolve(value)
 		}
 		const timer = setTimeout(() => {
-			try {
-				child.kill()
-			} catch {
-				/* already gone */
-			}
+			stopProbe(child, platform)
 			finish({ version: null, output: '' })
 		}, VERSION_TIMEOUT_MS)
 		child.stdout?.setEncoding('utf8')

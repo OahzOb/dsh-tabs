@@ -999,12 +999,14 @@ No run in those five was reaped by EOF: every one reported `taskkill /T /F`, whi
 is independent confirmation that the Windows local tab has no `stdin` contract to
 fall back on.
 
-That reordering is **not** applied to `stopLocal` here. Doing it gives up the only
-measurement of whether the command's own `stdin` contract did anything, and on
-POSIX — where the contract is the one that works — the ordering is deliberate.
-`readiness.cjs` reaping in the safe order and reporting which case it saw
-(`stopped by exit on EOF` versus `taskkill /T /F`) is the evidence that would
-justify changing the application.
+The application now follows that order on Windows: `stopLocal` runs the tree kill
+before it closes stdin. It kept the other order for a while because that order was
+the only measurement of whether the shell's own `stdin` contract did anything — but
+the window it allowed was a real leak, and a failed local connect is exactly when the
+shell is on its way out. POSIX keeps stdin first, where the contract is the one that
+works. The remaining hole is a shell that had already exited when `stopLocal` was
+called: its pid can no longer reach the tree, and a supervisor or a Windows job
+object is the fix for that, not a different order.
 
 ## Android: a sibling client, not a port of this one
 
@@ -1254,9 +1256,9 @@ readiness line that resolved with a truncated URL when the pipe split it.
 
 `test:live` drives `src/connect.js` against a real device end to end: platform
 detection, the readiness line, the tunnel binding, the token → cookie exchange,
-the Harness document, the unauthenticated fence, the unary RPC carrier, and the
-teardown leaving no orphan on the far side. It reads the device book and never
-writes to it.
+the Harness document, the unauthenticated fence, the unary RPC carrier, the
+teardown leaving no orphan on the far side, and a throw after the readiness line
+leaving nothing behind either. It reads the device book and never writes to it.
 
 `test:main` is why the shortcut lives in the main process rather than the page:
 key events do not cross into a `<webview>` guest, so a renderer-side listener

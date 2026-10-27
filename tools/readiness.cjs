@@ -36,36 +36,39 @@ const CEILING_MS = remote.START_TIMEOUT_MS + 5_000
 /**
  * Stop the process the application started, and everything under it.
  *
- * Order matters and it is **the reverse of the application's**, which is worth
- * stating because the first version of this probe got it wrong and leaked a
+ * Order matters, and it is **the same order the application uses now** — which is
+ * worth stating because the first version of this probe got it wrong and leaked a
  * Harness holding a loopback port on one run in four.
  *
- * The application closes stdin first, because that EOF is what makes a POSIX-side
- * server reap *itself* — a deliberate contract, and on a remote host the only one
- * that works. On Windows it cannot rely on that, so it follows up with a tree
- * kill. Here the tree kill comes **first**, and the reason is this process's own
- * exit: `exitCode` is still `null` when stdin is closed, so the kill is issued
- * against a shell that may have already died of the EOF — and `taskkill /T` on a
- * dead pid kills nothing, leaving the `dsh` grandchild alive. Killing the tree
- * while the shell is definitely up avoids that window entirely.
- *
- * Closing stdin afterwards then measures the contract instead of racing it: if
- * the server were going to reap itself, it has already been given the chance, and
- * the caller reports whether the child had exited before it was killed.
+ * On Windows the tree kill comes first: `taskkill /T` walks a live pid's children,
+ * and closing stdin is what asks the shell to exit, so a kill issued after the EOF
+ * can find a shell that has already gone and leave the `dsh` grandchild alive.
+ * `hadExited` is read before either step, so the report still names the case where
+ * the child was already gone when the reap began. POSIX keeps stdin first: there the
+ * EOF is the contract, and the shell's own `kill $child` needs a shell to run it.
  *
  * @param child - the shell process this probe spawned.
  * @returns how it was stopped.
  */
 function reap(child) {
+	const hadExited = child.exitCode !== null
+	if (process.platform === 'win32' && child.pid !== undefined) {
+		// The tree kill while the shell is definitely up, then the stdin close that
+		// would otherwise have asked the shell to exit first. `hadExited` is read
+		// before both, so "exit on EOF" still names the case where the child was
+		// already gone when the reap began.
+		const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+		try {
+			child.stdin?.end()
+		} catch {
+			/* the pipe may already be gone */
+		}
+		return hadExited ? 'exit on EOF (tree kill found nothing)' : killed.status === 0 ? 'taskkill /T /F' : 'kill (taskkill found nothing)'
+	}
 	try {
 		child.stdin?.end()
 	} catch {
 		/* the pipe may already be gone */
-	}
-	const hadExited = child.exitCode !== null
-	if (process.platform === 'win32' && child.pid !== undefined) {
-		const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-		return hadExited ? 'exit on EOF (tree kill found nothing)' : killed.status === 0 ? 'taskkill /T /F' : 'kill (taskkill found nothing)'
 	}
 	try {
 		child.kill()

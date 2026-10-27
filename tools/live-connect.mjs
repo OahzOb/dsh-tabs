@@ -203,5 +203,36 @@ await test('the forwarded port stops answering', async () => {
 	ok(!alive, 'the tunnel port still accepts connections after stop()')
 })
 
+await test('a throw after the readiness line leaves no server behind', async () => {
+	// **The failure path nothing used to check.** `connectRemote` registers a teardown
+	// for each child the moment it spawns it, but a throw after that point rejected the
+	// promise with the ssh client and the far side's `dsh web` still running — and the
+	// caller that would have stopped them had already been handed an error. The wrapper
+	// now runs those registrations before it rethrows; this is the only check that can
+	// see the real processes.
+	const baseline = await remoteServers()
+	const original = remote.parseReadyUrl
+	let failure
+	try {
+		remote.parseReadyUrl = () => {
+			throw new Error('live failure injection after the readiness line')
+		}
+		await connect.connectRemote(device, { onLine: () => {} })
+	} catch (error) {
+		failure = error
+	} finally {
+		remote.parseReadyUrl = original
+	}
+	ok(failure instanceof Error, 'the injected throw was swallowed instead of reported')
+	const deadline = Date.now() + 15_000
+	while (Date.now() < deadline) {
+		const now = await remoteServers()
+		if (now.length <= baseline.length) return
+		await new Promise((resolve) => setTimeout(resolve, 700))
+	}
+	const after = await remoteServers()
+	throw new Error(`the injected throw left ${String(after.length)} servers, was ${String(baseline.length)}:\n${after.join('\n')}`)
+})
+
 console.log(`\n${String(passes)} checks passed${failures === 0 ? '' : `, ${String(failures)} failed`}`)
 if (failures > 0) process.exitCode = 1
