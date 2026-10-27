@@ -509,6 +509,9 @@ await test('the probe command asks the shell the Harness will actually be starte
 	assert.equal(posix[0], 'bash')
 	assert.ok(posix.includes('-lic'), 'the probe does not ask for an interactive login shell')
 	assert.ok(posix[posix.length - 1].includes('command -v dsh'), 'a missing dsh is not distinguished from a shell error')
+	// `exec` makes the child the version process itself, so the timeout's kill stops
+	// it rather than the interactive shell above it.
+	assert.match(posix[posix.length - 1], /exec dsh --version/u, 'the probe does not exec dsh, so a timeout can only kill the shell')
 	// Windows needs `cmd /c`, because `dsh` is a `.cmd` shim Node cannot execute itself.
 	// And it needs the **absolute** path to `cmd.exe`, for the reason `connect.js`
 	// resolves ssh and the local Harness the same way: a packaged application is not

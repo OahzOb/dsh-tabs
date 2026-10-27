@@ -456,12 +456,27 @@ function awaitReady(child, onLine, timeoutMs, check = waitForHttpReady) {
  * @param onLine - receives each transcript line.
  * @returns the platform, or the error.
  */
-async function detectPlatform(device, ssh, onLine) {
+async function detectPlatform(device, ssh, onLine, register = () => true) {
 	if (device.platform === 'posix' || device.platform === 'windows') return { platform: device.platform }
 	const target = `${device.user}@${device.host}`
 	const probe = spawn(ssh, [...remote.sshOptions(device), target, 'uname -s'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+	// The probe is a child like any other: a caller that has given up may stop it,
+	// and a throw after this point has to be able to stop it too. Before this
+	// registration, a cancel during the probe could only set a flag the probe never
+	// read, and a stalled banner or a hung login shell had no deadline at all.
+	if (!register(probe)) return { error: 'the connect was stopped before it finished' }
 	let out = ''
 	let err = ''
+	/** Whether the deadline, not the probe, ended the wait. */
+	let timedOut = false
+	const timer = setTimeout(() => {
+		timedOut = true
+		try {
+			probe.kill()
+		} catch {
+			/* already gone */
+		}
+	}, remote.PROBE_TIMEOUT_MS)
 	probe.stdout.setEncoding('utf8')
 	probe.stderr.setEncoding('utf8')
 	probe.stdout.on('data', (chunk) => {
@@ -478,6 +493,8 @@ async function detectPlatform(device, ssh, onLine) {
 			resolve(SSH_FAILURE)
 		})
 	})
+	clearTimeout(timer)
+	if (timedOut) return { error: `the platform probe did not answer within ${String(remote.PROBE_TIMEOUT_MS / 1000)}s` }
 	const classified = remote.classifyPlatform(code, out)
 	if (classified.error === true) return { error: (err.trim() || out.trim() || 'ssh failed').split(/\r?\n/u)[0] }
 	return { platform: classified.platform }
@@ -495,7 +512,7 @@ async function detectPlatform(device, ssh, onLine) {
  *   `signal` to be told the caller has given up.
  * @returns the URL, the platform, and a `stop` that honours the teardown contract.
  */
-async function connectRemote(device, options = {}) {
+async function connectRemoteBody(device, options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
 	/** Told about each process the moment it exists, so a caller that cancels mid-connect has something to stop. */
 	const onChild = typeof options.onChild === 'function' ? options.onChild : () => {}
@@ -551,7 +568,7 @@ async function connectRemote(device, options = {}) {
 		live.clear()
 	}
 
-	const detected = await detectPlatform(device, ssh, onLine)
+	const detected = await detectPlatform(device, ssh, onLine, keep)
 	if (detected.error !== undefined) return { error: detected.error }
 	const platform = detected.platform
 	onLine(`remote platform: ${platform}`)
@@ -686,26 +703,40 @@ async function connectRemote(device, options = {}) {
 /**
  * Stop a locally spawned Harness shell, and everything under it.
  *
- * Closing stdin first is the teardown contract the shell itself honours — but on
- * Windows that is not sufficient, because the shell resolves `dsh` to a `.cmd`
- * shim: the tree is `powershell → cmd.exe → node`, and killing only the process
- * this module spawned leaves the other two behind. Measured here: a force-killed
- * application left the local Harness alive and holding its port.
+ * On POSIX, closing stdin is the teardown contract the shell itself honours. On
+ * Windows that is not sufficient, because the shell resolves `dsh` to a `.cmd` shim:
+ * the tree is `cmd.exe → dsh.cmd → node`, and killing only the process this module
+ * spawned leaves the other two behind. Measured here: a force-killed application left
+ * the local Harness alive and holding its port.
  *
- * `taskkill /T` is used rather than a second `kill()` because it walks the tree,
- * and the application deliberately does not rely on the shell's own `finally` to
- * do it: when Electron is terminated outright, the shell dies before that block
- * runs, which is exactly the case that leaked.
+ * `taskkill /T` is used rather than a second `kill()` because it walks the tree, and
+ * the application deliberately does not rely on the shell's own `finally` to do it:
+ * when Electron is terminated outright, the shell dies before that block runs, which
+ * is exactly the case that leaked.
+ *
+ * **On Windows the tree kill runs before stdin is closed, and that order is a fix.**
+ * `taskkill /T` walks a live pid's children; closing stdin is what asks the shell to
+ * exit, so a kill issued after the EOF can find nothing to walk and leave the Harness
+ * underneath. The remaining hole is a shell that had already exited when this was
+ * called — its pid can no longer reach the tree, and the durable fix for that is a
+ * supervisor or a Windows job object, not a different order.
  *
  * @param child - the shell process this module spawned.
  */
 function stopLocal(child) {
 	if (child.exitCode !== null) return
-	try {
-		child.stdin?.end()
-	} catch {
-		/* the pipe may already be gone */
-	}
+	// **On Windows the tree kill comes first, and the order is the fix for a leak
+	// that was measured.** `taskkill /T` walks the children of a *live* pid; closing
+	// stdin is what asks the shell to exit, so a kill issued after the EOF can find
+	// the shell already gone and no child list left to walk — the Harness underneath
+	// survives, holding its loopback port. The README's "the kill has a window" has
+	// the measurement. The remaining case is a shell that had already exited when
+	// this was called: its pid can no longer reach the tree, and the durable fix for
+	// that belongs to a supervisor or a Windows job object rather than to this
+	// function.
+	//
+	// POSIX keeps stdin first: there the EOF is the teardown contract, and the
+	// Harness only needs the shell's last `kill $child` to have a shell to run it.
 	if (process.platform === 'win32') {
 		try {
 			// SYNCHRONOUS on purpose. An asynchronous `spawn('taskkill', …)` is a
@@ -717,6 +748,17 @@ function stopLocal(child) {
 			spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
 		} catch {
 			/* fall through to the single kill */
+		}
+		try {
+			child.stdin?.end()
+		} catch {
+			/* the pipe may already be gone */
+		}
+	} else {
+		try {
+			child.stdin?.end()
+		} catch {
+			/* the pipe may already be gone */
 		}
 	}
 	try {
@@ -733,7 +775,7 @@ function stopLocal(child) {
  *   `onChild` for teardown in flight, `signal` to be told the caller has given up.
  * @returns the URL and a `stop`.
  */
-async function connectLocal(options = {}) {
+async function connectLocalBody(options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
 	/** Told about the shell the moment it exists, so a caller that cancels mid-connect can stop it. */
 	const onChild = typeof options.onChild === 'function' ? options.onChild : () => {}
@@ -806,6 +848,68 @@ async function connectLocal(options = {}) {
 			return child.exitCode === null
 		}
 	}
+}
+
+/**
+ * Run one connect, stopping every child it handed over if it throws.
+ *
+ * **The `onChild` contract only covered a caller that was still listening.** A
+ * connect that throws after it has spawned its server has already registered a
+ * teardown for that child — but the throw leaves `connectRemoteBody`'s promise
+ * rejected, and the only holder of the registration (`main.js`'s attempt) treats
+ * the converted error as a failed tab and clears itself. The ssh client and the far
+ * side's `dsh web` then run with nothing pointing at them.
+ *
+ * The wrapper collects the same teardowns the caller is given, and runs them in
+ * registration order when the body throws. It does not run them on the ordinary
+ * `{ error }` returns: those paths stop their own children, and `main.js` has a
+ * second guard for the failure branch.
+ *
+ * @param options - the connect options, whose `onChild` is wrapped.
+ * @param run - the body, called with the wrapped options.
+ * @returns the body's result.
+ */
+async function guarded(options, run) {
+	const stops = []
+	const caller = options.onChild
+	const wrapped = {
+		...options,
+		onChild: (stop) => {
+			stops.push(stop)
+			if (typeof caller === 'function') caller(stop)
+		}
+	}
+	try {
+		return await run(wrapped)
+	} catch (error) {
+		for (const stop of stops) {
+			try {
+				stop()
+			} catch {
+				/* the original throw is the one to report */
+			}
+		}
+		throw error
+	}
+}
+
+/**
+ * Start a remote device's Harness, with the throw-safe teardown wrappers.
+ * @param device - the device record.
+ * @param options - `onLine`, `onChild`, `signal`.
+ * @returns the connection, or `{ error }`.
+ */
+async function connectRemote(device, options = {}) {
+	return guarded(options, (wrapped) => connectRemoteBody(device, wrapped))
+}
+
+/**
+ * Start a Harness on this machine, with the throw-safe teardown wrappers.
+ * @param options - `onLine`, `directory`, `onChild`, `signal`.
+ * @returns the connection, or `{ error }`.
+ */
+async function connectLocal(options = {}) {
+	return guarded(options, (wrapped) => connectLocalBody(wrapped))
 }
 
 module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, connectRemote, connectLocal, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }

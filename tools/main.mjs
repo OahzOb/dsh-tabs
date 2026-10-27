@@ -828,6 +828,27 @@ await test('a connect that throws becomes a failure the operator can see and ret
 	assert.equal((await h.state()).tabs[1].state, 'running', 'the tab could not be retried')
 })
 
+await test('a failed connect that had handed over a teardown still runs it', async () => {
+	// The real connect registers each child's stop through `onChild` the moment it
+	// spawns it, so even a connect that ends in `{ error }` may have handed over a
+	// teardown for something that is still running. Before the failure branch ran
+	// `cancelAttempt`, a connect that threw *after* the server ssh was spawned left
+	// the ssh client and the far side's `dsh web` alive with no tab holding them.
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	let stopped = 0
+	h.queue.push({
+		error: 'the ssh tunnel never began accepting connections',
+		stop() {
+			stopped += 1
+		}
+	})
+	const state = await h.call('tabs:activate', 'dev-b')
+	assert.equal(state.tabs.find((tab) => tab.id === 'dev-b')?.state, 'failed', 'the failure was not recorded')
+	assert.equal(stopped, 1, 'the failed connect left the child it had handed over running')
+})
+
 await test('a rejection above the connect does not end the process silently', async () => {
 	// **`void app.whenReady().then(async () => { … })` had no `.catch`.** Node's default
 	// for a rejection nobody handles is to terminate, so anything thrown in the boot

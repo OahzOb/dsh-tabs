@@ -306,13 +306,26 @@ function cancelAttempt(tab) {
 	// must not be able to attach itself to the tab when it resolves.
 	attempt.cancelled = true
 	// The signal before the teardown: it is the only channel that reaches the connect
-	// path while it waits on something that is not a process yet.
-	attempt.abort()
+	// path while it waits on something that is not a process yet. A listener that
+	// throws is not allowed to stop the cancellation — the tab still has to reach a
+	// state the operator can act on.
+	try {
+		attempt.abort()
+	} catch {
+		/* the attempt is marked cancelled above either way */
+	}
 	if (attempt.stop !== undefined && !attempt.stopped) {
 		// Marked before the teardown runs, not after: a teardown that throws must
 		// still leave the attempt marked, or `abandoned` would run it a second time.
 		attempt.stopped = true
-		attempt.stop()
+		try {
+			attempt.stop()
+		} catch {
+			// **A teardown that throws must not hide the outcome.** A failed connect
+			// still has to become a `failed` tab with its reason, and this is called on
+			// that path now; a stop that cannot run is reported by the process it could
+			// not stop, not by a tab stuck at `starting`.
+		}
 	}
 }
 
@@ -654,6 +667,16 @@ async function activate(id) {
 		tab.activation = undefined
 
 		if (result.error !== undefined) {
+			// **A failed connect must not leave what it had already handed over.**
+			// `connectRemote` registers a teardown for every child the moment it is
+			// spawned, and `runConnect` turns a throw into this result — but until this
+			// call existed, the only teardown on the failure path was the one the
+			// connect path had already run by hand. A throw *after* the server ssh was
+			// spawned therefore left the ssh client and the far side's `dsh web` alive
+			// with no tab holding them. `cancelAttempt` is idempotent: the ordinary
+			// failure paths have already stopped their children, and stopping a closed
+			// pipe or an ended pid again is a no-op.
+			cancelAttempt(tab)
 			tab.state = 'failed'
 			tab.error = result.error
 			note(tab, `FAILED: ${result.error}`)

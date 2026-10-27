@@ -306,6 +306,15 @@ await test('the local Harness is reaped by a tree kill, not by its own shell', (
 	// And the application must not rely on the shell's own `finally`: a terminated
 	// application takes the shell down before that block runs.
 	assert.match(source, /if \(process\.platform === 'win32'\)/u)
+	// **The Windows kill runs before stdin is closed.** `taskkill /T` walks a live
+	// pid's children; closing stdin is what asks the shell to exit, and a shell that
+	// has already exited has no child list left to walk. This is the leak the
+	// README's "the kill has a window" measured, and this ordering is its fix.
+	const body = source.slice(source.indexOf('function stopLocal'))
+	assert.ok(
+		body.indexOf("spawnSync('taskkill'") < body.indexOf('stdin?.end()'),
+		'the Windows tree kill must run before stdin is closed'
+	)
 })
 console.log('device book')
 
