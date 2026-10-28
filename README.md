@@ -76,12 +76,32 @@ has been driven against a live host from this checkout.
 
 ## Install
 
-**From source, because there is no packaged build yet.** No installer, no portable
-archive, and therefore no checksum to verify: [Quick start](#quick-start) is the whole
-install. Two environment fallbacks this machine needed are in
+**From a release.** Download `dsh-tabs-<version>-setup.exe` from
+[Releases](https://github.com/OahzOb/dsh-tabs/releases) and run it. It installs per
+user — no administrator prompt — into `%LOCALAPPDATA%\Programs\dsh-tabs`, with a Start
+Menu shortcut, and leaves `$DSH_HOME` and the device book alone.
+
+The installer is **not code-signed**, so Windows SmartScreen shows "Windows protected
+your PC" on first run: **More info → Run anyway**. The release notes carry the
+SHA-256 of the installer.
+
+**From source.** [Quick start](#quick-start) still works and is still the way to run a
+checkout. Two environment fallbacks this machine needed are in
 [Running it](#running-it) — an `ELECTRON_MIRROR` for a network where the GitHub release
 CDN is unreachable, and a writable `TEMP` for an environment that refuses `mkdtemp`
 outside its own workspace.
+
+### Updates
+
+Versions from `0.2.0` check GitHub Releases ten seconds after launch and say nothing
+when they are current. **`+` → Check for updates** asks immediately, and is the control
+to use when the launch check failed or was skipped.
+
+A newer release is offered with its notes. **Download** is a separate choice; the
+installer is fetched in the background, its hash comes from the release's `latest.yml`
+over HTTPS, and when it is ready the app offers **Restart and install** — choosing
+**Later** installs it when the application quits. The first installer has to be
+installed by hand; only the versions that contain the updater can update themselves.
 
 ## Using it
 
@@ -195,15 +215,30 @@ CLI 读不了凭据库，它报出来的是"API key 缺失"，而不是"CLI 太�
 
 ## 安装
 
-**只能从源码跑，因为目前还没有打包产物。** 没有安装包、没有便携包，因此也没有校验和可对：
-[快速开始](#快速开始) 就是全部安装步骤。本机踩到的两个环境坑（GitHub release CDN 不可达时
-设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `mkdtemp` 时改 `TEMP`）见
+**用 Release。** 从 [Releases](https://github.com/OahzOb/dsh-tabs/releases) 下载
+`dsh-tabs-<version>-setup.exe` 运行。它是按用户安装（不弹管理员授权），装到
+`%LOCALAPPDATA%\Programs\dsh-tabs`，带开始菜单快捷方式，不碰 `$DSH_HOME` 和设备簿。
+
+安装器**没有代码签名**，所以第一次运行会出现 SmartScreen 的 "Windows protected your PC"：
+点 **More info → Run anyway**。安装器的 SHA-256 写在 release notes 里。
+
+**从源码跑**仍然可用，[快速开始](#快速开始) 就是全部步骤。本机踩到的两个环境坑（GitHub
+release CDN 不可达时设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `mkdtemp` 时改 `TEMP`）见
 [Running it](#running-it)。
+
+### 更新
+
+从 `0.2.0` 起，应用启动十秒后会检查一次 GitHub Releases，已是最新时什么都不说。
+**`+` → Check for updates** 会立即检查，也是在启动检查失败或跳过时该用的入口。
+
+发现新版本会先显示说明。**Download** 是单独的一次选择；安装器在后台下载，哈希来自 Release
+的 `latest.yml`（走 HTTPS），下载完成后应用会问 **Restart and install** —— 选 **Later** 则
+在退出时安装。第一个安装器仍要手动装；只有带更新器的版本才能自己更新。
 
 ## 用法
 
 - **标签页** 是本地 Harness 和设备簿里的每一台机器。标签页是*配置好的东西*，不是临时视图：
-  选中一个空闲的就会启动它，而 `×` 是**断开**、不是删除。删设备在 `+` 面板里。
+  点击只是选中它，面板里的 **Connect** 才启动；`×` 是**断开**、不是删除。删设备在 `+` 面板里。
 - **`Alt+1…9`** 切标签，在任何位置都有效，包括你正在远程界面里打字的时候。
 - **`+`** 列出设备、添加设备、删除设备。
 

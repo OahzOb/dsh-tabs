@@ -396,3 +396,33 @@ form button:hover {
 	color: var(--dim);
 	font-size: 11px;
 }
+
+.update {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+	padding-top: 8px;
+	border-top: 1px solid var(--line);
+}
+
+.update .hint {
+	flex: 1;
+	margin: 0;
+}
+
+.update button {
+	padding: 5px 10px;
+	background: transparent;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	color: var(--dim);
+	cursor: pointer;
+	font: inherit;
+	font-size: 11px;
+}
+
+.update button:hover {
+	border-color: var(--accent);
+	color: var(--fg);
+}
