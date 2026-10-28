@@ -23,13 +23,15 @@
  *   drive it against a real device with no window anywhere.
  */
 
-const { app, BrowserWindow, ipcMain, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron')
 const { randomUUID } = require('node:crypto')
+const { existsSync } = require('node:fs')
 const { join } = require('node:path')
 
 const devices = require('./devices.js')
 const connect = require('./connect.js')
 const remote = require('./remote.js')
+const localdsh = require('./localdsh.js')
 
 /** This application's own version, read from the manifest beside the source. */
 const PACKAGE = require('../package.json')
@@ -911,6 +913,161 @@ function installShortcuts() {
 	})
 }
 
+/**
+ * The electron-updater instance, loaded only when an update is actually checked.
+ *
+ * **Lazy on purpose.** `tools/main.mjs` loads this file with an Electron stub that
+ * has no updater and no resources path, and a top-level `require('electron-updater')`
+ * would initialize a module that needs a packaged application. The installed build
+ * is the only one that can check, and only its first check pays for the load.
+ *
+ * @type {import('electron-updater').AppUpdater | undefined}
+ */
+let autoUpdater
+
+/** True while a download is in flight, so a second check cannot start another one. */
+let updating = false
+
+/**
+ * Whether this build has an update feed to ask.
+ *
+ * `electron-updater` needs the `app-update.yml` that `electron-builder` writes into
+ * `resources/`. A build from source, and the unpacked directory an earlier
+ * `electron-packager` produced, do not have one; saying so is better than a dialog
+ * about a missing file.
+ *
+ * @returns true when a check can be made.
+ */
+function updateFeedAvailable() {
+	return app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml'))
+}
+
+/**
+ * Show a message box, over the window when there is one.
+ * @param options - the dialog options.
+ * @returns the chosen button.
+ */
+function showBox(options) {
+	if (mainWindow !== undefined && !mainWindow.isDestroyed()) return dialog.showMessageBox(mainWindow, options)
+	return dialog.showMessageBox(options)
+}
+
+/**
+ * Load and configure `electron-updater`, once.
+ *
+ * **The download is the operator's decision.** `autoDownload` is off; the check
+ * offers a button and nothing is fetched until it is pressed. A downloaded update
+ * installs when the application quits (`autoInstallOnAppQuit`), so choosing "Later"
+ * is not choosing to throw it away.
+ *
+ * @returns the configured updater.
+ */
+function updater() {
+	if (autoUpdater !== undefined) return autoUpdater
+	const module = require('electron-updater')
+	autoUpdater = module.autoUpdater
+	autoUpdater.autoDownload = false
+	autoUpdater.autoInstallOnAppQuit = true
+	autoUpdater.on('download-progress', (progress) => {
+		if (mainWindow !== undefined && !mainWindow.isDestroyed()) mainWindow.setProgressBar(progress.percent / 100)
+	})
+	autoUpdater.on('update-downloaded', async (info) => {
+		updating = false
+		if (mainWindow !== undefined && !mainWindow.isDestroyed()) mainWindow.setProgressBar(-1)
+		const answer = await showBox({
+			type: 'info',
+			message: `dsh-tabs ${String(info.version)} has been downloaded`,
+			detail: 'Restart to install it now, or it will install when you quit.',
+			buttons: ['Restart and install', 'Later'],
+			defaultId: 0,
+			cancelId: 1,
+			noLink: true
+		})
+		if (answer.response === 0) autoUpdater.quitAndInstall(false, true)
+	})
+	autoUpdater.on('error', (error) => {
+		updating = false
+		if (mainWindow !== undefined && !mainWindow.isDestroyed()) mainWindow.setProgressBar(-1)
+		console.error(`[updater] ${error instanceof Error ? error.message : String(error)}`)
+	})
+	return autoUpdater
+}
+
+/**
+ * Ask the release feed, and offer a download when it names a newer version.
+ *
+ * @param automatic - the launch check, which reports nothing unless an update exists.
+ */
+async function checkForUpdates(automatic) {
+	if (!updateFeedAvailable()) {
+		if (!automatic) {
+			await showBox({
+				type: 'info',
+				message: 'Updates are not available in this build',
+				detail: 'This copy has no update feed. Install the 0.2.0 installer once, and later versions will update from inside the app.',
+				buttons: ['OK'],
+				noLink: true
+			})
+		}
+		return
+	}
+	if (updating) {
+		if (!automatic) {
+			await showBox({ type: 'info', message: 'An update is already downloading', buttons: ['OK'], noLink: true })
+		}
+		return
+	}
+	try {
+		const result = await updater().checkForUpdates()
+		const latest = result?.updateInfo?.version
+		if (latest === undefined || localdsh.compareVersions(latest, app.getVersion()) <= 0) {
+			if (!automatic) {
+				await showBox({ type: 'info', message: `dsh-tabs ${app.getVersion()} is up to date`, buttons: ['OK'], noLink: true })
+			}
+			return
+		}
+		const notes = typeof result.updateInfo.releaseNotes === 'string' ? result.updateInfo.releaseNotes : ''
+		const answer = await showBox({
+			type: 'info',
+			message: `dsh-tabs ${String(latest)} is available`,
+			detail: notes.slice(0, 1500) || 'A new version is available. Download it now?',
+			buttons: ['Download', 'Later'],
+			defaultId: 0,
+			cancelId: 1,
+			noLink: true
+		})
+		if (answer.response !== 0) return
+		updating = true
+		if (mainWindow !== undefined && !mainWindow.isDestroyed()) mainWindow.setProgressBar(0)
+		try {
+			await updater().downloadUpdate()
+		} catch (error) {
+			updating = false
+			if (mainWindow !== undefined && !mainWindow.isDestroyed()) mainWindow.setProgressBar(-1)
+			await showBox({
+				type: 'error',
+				message: 'The update could not be downloaded',
+				detail: error instanceof Error ? error.message : String(error),
+				buttons: ['OK'],
+				noLink: true
+			})
+		}
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error)
+		if (!automatic) {
+			await showBox({
+				type: 'error',
+				message: 'Could not check for updates',
+				detail: reason,
+				buttons: ['OK'],
+				noLink: true
+			})
+		} else {
+			console.error(`[updater] ${reason}`)
+		}
+	}
+}
+
 /** Wire the renderer's requests. */
 function installIpc() {
 	ipcMain.handle('tabs:get', () => snapshot())
@@ -1022,6 +1179,10 @@ function installIpc() {
 		const tab = tabs.get(String(id))
 		return { lines: tab === undefined ? [] : tab.lines }
 	})
+	ipcMain.handle('updates:check', async () => {
+		await checkForUpdates(false)
+		return { version: app.getVersion() }
+	})
 }
 
 installShortcuts()
@@ -1044,6 +1205,14 @@ void app
 		// The local Harness is what the operator opens the app for, so it comes up
 		// without being asked. A remote device waits to be selected.
 		await activate(LOCAL_ID)
+		// The launch check waits ten seconds: the local Harness is what the operator
+		// opened the application for, and an update dialog must not compete with it.
+		// The timer is unref'd so a failed boot, or a suite that loads this file, is
+		// not held open by a check that has not run yet.
+		const updateTimer = setTimeout(() => {
+			void checkForUpdates(true)
+		}, 10_000)
+		updateTimer.unref()
 		app.on('activate', () => {
 			if (BrowserWindow.getAllWindows().length === 0) createWindow()
 		})

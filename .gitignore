@@ -8,6 +8,11 @@ node_modules/
 .tmp-main-test/
 .tmp/
 
+# electron-builder's output: the NSIS installer, the unpacked app, latest.yml and
+# the blockmap. All of it is reproducible from the source and the manifest, and the
+# installer is tens of megabytes.
+dist/
+
 # Connect transcripts and installer output, when anything is captured to a file.
 *.log
 

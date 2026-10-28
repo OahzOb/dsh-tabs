@@ -1003,9 +1003,13 @@ const PROFILE_PATHS = [
  *
  * Directories the suites and capture runs create are skipped: they hold the
  * operator's own data by design, and `.gitignore` is what keeps them out of a commit.
+ * `dist` is the same rule for `npm run dist`: the installer, the unpacked app and
+ * `builder-debug.yml` are generated from this checkout, carry its absolute paths, and
+ * are in `.gitignore`; scanning them would fail the source-hygiene checks on every
+ * machine that has built the installer.
  */
 function repositoryFiles() {
-	const SKIP = new Set(['node_modules', '.git', '.shots', '.tmp', '.tmp-main-test', '.research', '.ssh-research'])
+	const SKIP = new Set(['node_modules', '.git', '.shots', '.tmp', '.tmp-main-test', '.research', '.ssh-research', 'dist'])
 	const TEXT = /\.(?:md|js|mjs|cjs|json|html|css|ps1|sh|yml|yaml|txt|svg|xml)$/u
 	const NAMES = new Set(['LICENSE', '.gitignore', '.gitattributes'])
 	const files = []

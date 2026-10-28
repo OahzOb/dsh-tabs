@@ -1,8 +1,9 @@
 {
   "name": "dsh-tabs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Tabbed host for DSH web interfaces: the local one and remote ones over SSH, in a single always-visible tab bar.",
+  "author": "OahzOb",
   "license": "MIT",
   "main": "src/main.js",
   "scripts": {
@@ -15,10 +16,54 @@
     "test:renderer": "node tools/renderer.mjs",
     "test:live": "node tools/live-connect.mjs",
     "contract": "node tools/contract.cjs",
-    "readiness": "node tools/readiness.cjs"
+    "readiness": "node tools/readiness.cjs",
+    "dist": "electron-builder --win nsis --publish never",
+    "pack": "electron-builder --dir --publish never"
+  },
+  "build": {
+    "appId": "dev.dshtabs.desktop",
+    "productName": "dsh-tabs",
+    "electronDist": "node_modules/electron/dist",
+    "artifactName": "dsh-tabs-${version}-setup.${ext}",
+    "compression": "store",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "LICENSE"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false,
+      "shortcutName": "dsh-tabs"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "OahzOb",
+        "repo": "dsh-tabs"
+      }
+    ]
   },
   "devDependencies": {
     "electron": "44.0.0",
+    "electron-builder": "^26.18.0",
     "jsdom": "^30.1.1"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
   }
 }

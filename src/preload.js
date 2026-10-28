@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	save: (device) => ipcRenderer.invoke('devices:save', device),
 	remove: (id) => ipcRenderer.invoke('devices:remove', id),
 	transcript: (id) => ipcRenderer.invoke('devices:transcript', id),
+	checkUpdates: () => ipcRenderer.invoke('updates:check'),
 	onState: (listener) => subscribe('tabs:state', listener),
 	onShortcut: (listener) => subscribe('tabs:shortcut', listener)
 })

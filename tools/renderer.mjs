@@ -108,6 +108,10 @@ function harness(options = {}) {
 			return { devices }
 		},
 		transcript: async (id) => ({ lines: transcripts[id] ?? [] }),
+		checkUpdates: async () => {
+			calls.push(['checkUpdates'])
+			return { version: 'test' }
+		},
 		onState: (listener) => {
 			onState = listener
 			return () => {}
@@ -502,6 +506,19 @@ await test('picking a device asks the main process to open it', async () => {
 	h.popover().querySelector('.row-main').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
 	await h.flush()
 	assert.deepEqual(h.calls.filter(([name]) => name === 'open'), [['open', 'dev-a']])
+})
+
+await test('the popover offers an update check that asks the main process', async () => {
+	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const button = [...h.popover().querySelectorAll('button')].find((entry) => entry.textContent === 'Check for updates')
+	assert.ok(button !== undefined, 'the popover has no update control')
+	button.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'checkUpdates'), [['checkUpdates']])
 })
 
 await test('the add form submits the fields it was given', async () => {

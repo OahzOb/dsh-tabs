@@ -425,6 +425,25 @@ function renderPopover() {
 			})
 	})
 	popoverEl.appendChild(form)
+
+	// **The update check is reachable, not automatic-only.** A sideloaded desktop
+	// build has no store to push a version; the launch check is the convenience, and
+	// this is the control that works when it said nothing or failed. The main process
+	// owns the whole flow — checking, downloading and restarting — so this button
+	// only asks.
+	const updates = document.createElement('div')
+	updates.className = 'update'
+	const updatesHint = document.createElement('div')
+	updatesHint.className = 'hint'
+	updatesHint.textContent = 'Updates come from GitHub Releases'
+	const updateButton = document.createElement('button')
+	updateButton.type = 'button'
+	updateButton.textContent = 'Check for updates'
+	updateButton.addEventListener('click', () => {
+		void api.checkUpdates()
+	})
+	updates.append(updatesHint, updateButton)
+	popoverEl.appendChild(updates)
 }
 
 /** Reload the device list and redraw the popover. */
