@@ -20,6 +20,12 @@ const addEl = document.getElementById('add')
 /** Live `<webview>` elements keyed by tab id, with the URL each one was built for. */
 const views = new Map()
 
+/** Live terminal emulators keyed by terminal tab id. */
+const terminalViews = new Map()
+
+/** The terminal that already has focus, so a state push does not take it again. */
+let focusedTerminalId
+
 /** The last state the main process pushed. */
 let state = { tabs: [], activeId: 'local' }
 
@@ -93,7 +99,8 @@ function renderTabs() {
 			restart.type = 'button'
 			restart.className = 'tab-restart'
 			restart.textContent = '⟲'
-			restart.title = tab.kind === 'local' ? 'Restart the local Harness' : 'Reconnect'
+			restart.title =
+				tab.kind === 'local' ? 'Restart the local Harness' : tab.kind === 'terminal' ? 'Reconnect the terminal' : 'Reconnect'
 			restart.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void api.restart(tab.id).then(apply)
@@ -114,7 +121,7 @@ function renderTabs() {
 			stop.type = 'button'
 			stop.className = 'tab-close'
 			stop.textContent = '×'
-			stop.title = 'Disconnect'
+			stop.title = tab.kind === 'terminal' ? 'Close terminal' : 'Disconnect'
 			stop.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void api.disconnect(tab.id).then(apply)
@@ -206,6 +213,234 @@ function panelFor(tab) {
 const GUEST_RETRY_DELAYS_MS = [0, 500, 1500]
 
 /**
+ * The terminal emulator and its fit addon, when the page managed to load them.
+ *
+ * `index.html` loads both from `node_modules`. If that file is missing — an
+ * application copied without its dependencies, or a packaging mistake — the tab
+ * says so instead of drawing an empty rectangle, and the rest of the window keeps
+ * working. jsdom also lands here, which is why the suites can drive this file
+ * without xterm.
+ *
+ * @returns the constructors, or null.
+ */
+function terminalSupport() {
+	const Terminal = globalThis.Terminal
+	const FitAddon = globalThis.FitAddon?.FitAddon
+	return typeof Terminal === 'function' && typeof FitAddon === 'function' ? { Terminal, FitAddon } : null
+}
+
+/**
+ * How a terminal view's key presses are filtered before xterm sees them.
+ *
+ * `Ctrl+Shift+C` and `Ctrl+Shift+V` are the terminal conventions, and they are
+ * checked here rather than in a document listener because xterm's textarea owns
+ * focus and stops events that it has already translated. Returning false tells
+ * xterm the key is not its own, so it is not sent to the shell as well.
+ *
+ * @param term - the terminal.
+ * @param id - its tab id.
+ * @param event - the key event.
+ * @returns whether xterm should handle the key.
+ */
+function terminalKey(term, id, event) {
+	if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return true
+	const key = String(event.key ?? '').toLowerCase()
+	if (key === 'c') {
+		if (term.hasSelection()) void api.clipboard.write(term.getSelection())
+		return false
+	}
+	if (key === 'v') {
+		void api.clipboard.read().then((text) => {
+			if (text !== '') api.terminalInput(id, text)
+		})
+		return false
+	}
+	return true
+}
+
+/**
+ * Measure a terminal to its host, and tell the pty when the answer changed.
+ *
+ * The pty is the half that matters: the far side's line discipline gets a window
+ * change from the size, and a shell that is not told keeps wrapping at the size it
+ * started with. The check before the IPC is what keeps a resize storm — dragging
+ * the window — from sending a message per frame for the same dimensions.
+ *
+ * @param view - the terminal view.
+ */
+function fitTerminal(view) {
+	if (view.broken === true || view.host.hidden) return
+	const before = { cols: view.term.cols, rows: view.term.rows }
+	view.fit.fit()
+	if (view.term.cols === before.cols && view.term.rows === before.rows) return
+	if (view.term.cols > 0 && view.term.rows > 0) api.terminalResize(view.id, view.term.cols, view.term.rows)
+}
+
+/**
+ * Draw the one line a terminal needs under its output: connecting, ended, failed.
+ *
+ * It is a banner rather than a panel over the screen on purpose — an `exit` or an
+ * ssh failure usually comes with the sentence that explains it, and covering the
+ * transcript to say "session ended" would hide the answer behind the notice.
+ *
+ * @param view - the terminal view.
+ * @param tab - the tab state being drawn.
+ */
+function renderTerminalBanner(view, tab) {
+	const key = `${tab.state}:${tab.error ?? ''}:${String(tab.exitCode ?? '')}`
+	if (view.bannerKey === key) return
+	view.bannerKey = key
+	view.banner.replaceChildren()
+	if (tab.state === 'running') {
+		view.banner.hidden = true
+		return
+	}
+	view.banner.hidden = false
+	const text = document.createElement('span')
+	text.className = 'terminal-banner-text'
+	if (tab.state === 'starting') text.textContent = 'opening the ssh session…'
+	else if (tab.state === 'failed') text.textContent = tab.error ?? 'the terminal could not start'
+	else if (tab.state === 'ended') {
+		text.textContent =
+			typeof tab.exitCode === 'number' ? `session ended (exit code ${String(tab.exitCode)})` : 'session ended'
+	} else text.textContent = 'the terminal is not running'
+	view.banner.appendChild(text)
+	if (tab.state === 'failed' || tab.state === 'ended') {
+		const again = document.createElement('button')
+		again.type = 'button'
+		again.textContent = tab.state === 'failed' ? 'Try again' : 'Reconnect'
+		again.addEventListener('click', () => {
+			void api.restart(tab.id).then(apply)
+		})
+		view.banner.appendChild(again)
+	}
+}
+
+/**
+ * The xterm for one terminal tab, created once and kept across state pushes.
+ *
+ * A terminal is not a document that can be re-created cheaply: resetting one
+ * discards the scrollback the operator may be reading. So — exactly like a
+ * `<webview>` — the element is keyed by tab id and left alone; only a new
+ * *generation* (a reconnect) clears its screen.
+ *
+ * @param tab - the terminal tab.
+ * @returns the view.
+ */
+function ensureTerminalView(tab) {
+	let view = terminalViews.get(tab.id)
+	if (view !== undefined) return view
+	const host = document.createElement('div')
+	host.className = 'terminal-host'
+	contentEl.appendChild(host)
+	const support = terminalSupport()
+	if (support === null) {
+		const broken = document.createElement('div')
+		broken.className = 'terminal-broken'
+		const heading = document.createElement('h2')
+		heading.textContent = 'The terminal could not be loaded'
+		const hint = document.createElement('div')
+		hint.textContent = 'xterm.js was not found in this application. Reinstall dsh-tabs, or run npm install in the checkout.'
+		broken.append(heading, hint)
+		host.appendChild(broken)
+		view = { id: tab.id, host, broken: true, banner: document.createElement('div'), bannerKey: '', generation: tab.generation, attached: false }
+		terminalViews.set(tab.id, view)
+		return view
+	}
+
+	const screen = document.createElement('div')
+	screen.className = 'terminal-screen'
+	const banner = document.createElement('div')
+	banner.className = 'terminal-banner'
+	banner.hidden = true
+	host.append(screen, banner)
+
+	const term = new support.Terminal({
+		cursorBlink: true,
+		fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace',
+		fontSize: 13,
+		lineHeight: 1.15,
+		scrollback: 5000,
+		// The application's own palette, restated because xterm paints on a canvas
+		// and cannot read the CSS variables the rest of the window uses.
+		theme: {
+			background: '#16161a',
+			foreground: '#e6e6ea',
+			cursor: '#5b9dff',
+			cursorAccent: '#16161a',
+			selectionBackground: '#33415c',
+			black: '#16161a',
+			red: '#e2605e',
+			green: '#4ec97a',
+			yellow: '#e0a33e',
+			blue: '#5b9dff',
+			magenta: '#b48ce6',
+			cyan: '#4ec9c9',
+			white: '#e6e6ea',
+			brightBlack: '#6f6f7a',
+			brightRed: '#ff7b78',
+			brightGreen: '#6fe39a',
+			brightYellow: '#f2bb5c',
+			brightBlue: '#8bb8ff',
+			brightMagenta: '#cda6ff',
+			brightCyan: '#6fe3e3',
+			brightWhite: '#ffffff'
+		}
+	})
+	const fit = new support.FitAddon()
+	term.loadAddon(fit)
+	term.open(screen)
+	term.onData((data) => api.terminalInput(tab.id, data))
+	if (typeof term.attachCustomKeyEventHandler === 'function') {
+		term.attachCustomKeyEventHandler((event) => terminalKey(term, tab.id, event))
+	}
+	// Right-click copies a selection, and pastes when there is none — the Windows
+	// terminal convention, and the only pointer route a keyboard-less selection has.
+	host.addEventListener('contextmenu', (event) => {
+		event.preventDefault()
+		if (term.hasSelection()) {
+			void api.clipboard.write(term.getSelection())
+			term.clearSelection()
+			return
+		}
+		void api.clipboard.read().then((text) => {
+			if (text !== '') api.terminalInput(tab.id, text)
+		})
+	})
+
+	view = {
+		id: tab.id,
+		host,
+		screen,
+		banner,
+		bannerKey: '',
+		term,
+		fit,
+		// Seeded from the tab rather than a sentinel: a terminal created for an
+		// existing session must not "reset" a screen that has nothing on it yet.
+		generation: tab.generation,
+		attached: false,
+		resizeListener: undefined,
+		observer: undefined
+	}
+	if (typeof ResizeObserver === 'function') {
+		view.observer = new ResizeObserver(() => {
+			fitTerminal(view)
+		})
+		view.observer.observe(host)
+	} else {
+		// jsdom has no ResizeObserver. Keeping the same fit path alive there is what
+		// lets the suite assert the attach/input/resize sequence without xterm.
+		view.resizeListener = () => {
+			fitTerminal(view)
+		}
+		window.addEventListener('resize', view.resizeListener)
+	}
+	terminalViews.set(tab.id, view)
+	return view
+}
+
+/**
  * Reconcile the content area with the tab list.
  *
  * A guest is created once per (tab, url) pair and then left alone, because
@@ -223,7 +458,35 @@ const GUEST_RETRY_DELAYS_MS = [0, 500, 1500]
 function renderContent() {
 	const active = state.tabs.find((tab) => tab.id === state.activeId)
 	const wanted = new Set()
+	const wantedTerminals = new Set()
 	for (const tab of state.tabs) {
+		if (tab.kind === 'terminal') {
+			wantedTerminals.add(tab.id)
+			const terminal = ensureTerminalView(tab)
+			if (terminal.broken !== true) {
+				// A new generation is a reconnect: the old session's screen is no
+				// longer the session being shown, and keeping its scrollback would put
+				// two shells' output in one buffer.
+				if (terminal.generation !== tab.generation) {
+					terminal.generation = tab.generation
+					terminal.term.reset()
+					terminal.bannerKey = ''
+					// A reconnect is a new session on the main-process side, and its
+					// output must be released by a new attach — the previous one belonged
+					// to a session that no longer exists.
+					terminal.attached = false
+				}
+				if (!terminal.attached) {
+					// Sent even while the tab is still `starting`: the main process holds
+					// the request until the pty exists, so the first prompt — or the
+					// first ssh refusal — cannot arrive before there is a screen.
+					terminal.attached = true
+					void api.terminalAttach(tab.id)
+				}
+				renderTerminalBanner(terminal, tab)
+			}
+			continue
+		}
 		if (tab.state !== 'running' || tab.url === undefined) continue
 		wanted.add(tab.id)
 		const existing = views.get(tab.id)
@@ -233,6 +496,16 @@ function renderContent() {
 			views.delete(tab.id)
 		}
 		const view = document.createElement('webview')
+		// **The guest runs in the tab's own session, not the window's.** A Harness is
+		// reached on a loopback port that is different for every connection, and its
+		// authentication cookie is named after that port — while a browser sends every
+		// cookie it has for the host, whatever the port. In one shared, persistent
+		// session those cookies accumulated until the Cookie header crossed the
+		// Harness's 16 KiB header limit, and every guest became a blank rectangle that
+		// still said `running`. The partition is in memory and per tab; the main
+		// process empties it before each connect. See `GUEST_PARTITION_PREFIX` in
+		// `src/main.js`.
+		if (tab.partition !== undefined) view.setAttribute('partition', tab.partition)
 		view.setAttribute('src', tab.url)
 		wireGuest(view, tab.id)
 		contentEl.appendChild(view)
@@ -246,9 +519,34 @@ function renderContent() {
 	for (const [id, entry] of views) {
 		entry.element.hidden = id !== state.activeId
 	}
+	for (const [id, terminal] of [...terminalViews]) {
+		if (wantedTerminals.has(id)) continue
+		if (terminal.resizeListener !== undefined) window.removeEventListener('resize', terminal.resizeListener)
+		terminal.observer?.disconnect()
+		if (terminal.broken !== true) terminal.term.dispose()
+		terminal.host.remove()
+		terminalViews.delete(id)
+		if (focusedTerminalId === id) focusedTerminalId = undefined
+	}
+	for (const [id, terminal] of terminalViews) {
+		const showing = id === state.activeId
+		terminal.host.hidden = !showing
+		if (!showing) {
+			if (focusedTerminalId === id) focusedTerminalId = undefined
+			continue
+		}
+		// The host only has a size while it is on screen, so the fit is done here
+		// rather than at creation. A hidden terminal that is shown again is refitted
+		// to the window it just inherited.
+		fitTerminal(terminal)
+		if (terminal.broken !== true && focusedTerminalId !== id) {
+			focusedTerminalId = id
+			terminal.term.focus()
+		}
+	}
 	const panels = contentEl.querySelectorAll('.panel')
 	for (const panel of panels) panel.remove()
-	if (active !== undefined && (active.state !== 'running' || active.url === undefined)) {
+	if (active !== undefined && active.kind !== 'terminal' && (active.state !== 'running' || active.url === undefined)) {
 		contentEl.appendChild(panelFor(active))
 	}
 }
@@ -365,8 +663,23 @@ function renderPopover() {
 		})
 		row.appendChild(main)
 
+		// A terminal is opened by name, from the device it belongs to, and is a tab
+		// of its own rather than a mode of the Harness tab: the two sessions are
+		// independent, and closing one must not close the other.
+		const openTerminal = document.createElement('button')
+		openTerminal.type = 'button'
+		openTerminal.className = 'terminal-open'
+		openTerminal.textContent = 'Terminal'
+		openTerminal.title = 'Open an ssh terminal on that machine'
+		openTerminal.addEventListener('click', () => {
+			popoverEl.hidden = true
+			void api.terminalOpen(device.id).then(apply)
+		})
+		row.appendChild(openTerminal)
+
 		const remove = document.createElement('button')
 		remove.type = 'button'
+		remove.className = 'danger'
 		remove.textContent = 'Remove'
 		remove.addEventListener('click', () => {
 			void api.remove(device.id).then(() => refreshDevices())
@@ -478,6 +791,16 @@ api.onShortcut((id) => {
 
 api.onState((next) => {
 	apply(next)
+})
+
+// Terminal output is deliberately not a state push: a shell prints constantly, and
+// rebuilding the bar and reconciling every guest on each line would be work with no
+// visible result. The main process sends only the bytes, keyed by the tab they
+// belong to; a tab that has gone away drops them.
+api.onTerminalData((payload) => {
+	const terminal = terminalViews.get(payload?.id)
+	if (terminal === undefined || terminal.broken === true) return
+	terminal.term.write(String(payload.data ?? ''))
 })
 
 markPlatform()

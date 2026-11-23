@@ -150,6 +150,21 @@ function harness(options = {}) {
 	const sent = []
 	const stops = []
 	const exits = { server: [], tunnel: [] }
+	/**
+	 * Every guest session the main process asked to empty, and the order of the
+	 * session and connect events it produced.
+	 *
+	 * The order is the assertion that matters: a clear that happens after the connect
+	 * has started would leave the cookie the connect is about to mint, which is the
+	 * whole failure. A count cannot see that.
+	 */
+	const guestClears = []
+	const events = []
+	/** What the stubbed default session reports, and what was removed from it. */
+	const legacyCookies = [...(options.legacyCookies ?? [])]
+	const removedCookies = []
+	/** Make the stubbed default session's store refuse to be read. */
+	const legacyCookieError = options.legacyCookieError === true
 	let readyResolve
 	const ready = new Promise((resolve) => {
 		readyResolve = resolve
@@ -279,6 +294,9 @@ function harness(options = {}) {
 	 */
 	async function pending(callOptions = {}) {
 		callOptions.onLine?.(line('connect fake'))
+		// Recorded beside the guest-session clears: "the clear happened before the
+		// connect" is the property, and only one ordered log can show it.
+		events.push({ kind: 'connect' })
 		if (throwNext !== undefined) {
 			// What a connect does when the book hands it something the platform refuses:
 			// `spawn` throws on the NUL byte in a `host`, and it throws *here*, before it
@@ -301,6 +319,20 @@ function harness(options = {}) {
 		return connection
 	}
 
+	/**
+	 * One fake ssh session, in the shape `src/terminal.js` returns.
+	 *
+	 * The native pty is not in this suite's way: what is being checked here is the
+	 * tab's ownership of a session — one start per generation, data routed to the
+	 * right tab, input and resize forwarded, kill on close — and the terminal module's
+	 * own suite exercises the real buffer and argv.
+	 */
+	const terminalSpawns = []
+	/** The family `detectPlatform` answers when the book has not cached one. */
+	const terminalPlatform = 'posix'
+	/** The probe failure a test asked for, if any. */
+	const detectError = options.detectError
+
 	const connectStub = {
 		sshExecutable: () => 'ssh',
 		async connectLocal(callOptions = {}) {
@@ -308,6 +340,64 @@ function harness(options = {}) {
 		},
 		async connectRemote(_device, callOptions = {}) {
 			return pending(callOptions)
+		},
+		/**
+		 * The shell-family probe. A terminal asks this before it has a command to
+		 * run, and the device book carries the answer afterwards — the real probe is
+		 * `ssh` with a deadline, which this suite does not need to repeat.
+		 *
+		 * @param device - the device being classified.
+		 * @returns the family, or the one the suite configured.
+		 */
+		async detectPlatform(device) {
+			if (detectError !== undefined) return { error: detectError }
+			return { platform: device.platform ?? terminalPlatform }
+		}
+	}
+
+	const terminalStub = {
+		start: (startOptions) => {
+			const session = {
+				pid: 4000 + terminalSpawns.length,
+				attached: false,
+				ended: false,
+				writes: [],
+				resizes: [],
+				killed: 0,
+				held: [],
+				attach() {
+					if (this.attached) return
+					this.attached = true
+					const held = this.held.splice(0, this.held.length)
+					for (const data of held) startOptions.onData?.(data)
+				},
+				write(data) {
+					this.writes.push(data)
+				},
+				resize(cols, rows) {
+					this.resizes.push([cols, rows])
+				},
+				kill() {
+					this.killed += 1
+					this.ended = true
+				},
+				stillRunning() {
+					return !this.ended
+				},
+				/** Test-only: the far side printed something. */
+				emit(data) {
+					if (this.attached) startOptions.onData?.(data)
+					else this.held.push(data)
+				},
+				/** Test-only: the ssh client ended. */
+				exit(code = 0) {
+					this.ended = true
+					startOptions.onExit?.({ exitCode: code, signal: undefined })
+				},
+				startOptions
+			}
+			terminalSpawns.push(session)
+			return session
 		}
 	}
 
@@ -365,9 +455,48 @@ function harness(options = {}) {
 		ipcMain: {
 			handle(channel, listener) {
 				ipc.set(channel, listener)
+			},
+			/**
+		 * The one-way channels. Kept under a prefix so a test can tell an `invoke`
+		 * handler from a `send` one, which is the distinction the terminal's hot
+		 * input path relies on.
+		 */
+			on(channel, listener) {
+				ipc.set(`on:${channel}`, listener)
 			}
 		},
-		shell: { openExternal: () => {} }
+		clipboard: { readText: () => '', writeText: () => {} },
+		shell: { openExternal: () => {} },
+		session: {
+			/**
+			 * One session per partition name.
+			 *
+			 * The name is the whole point: a partition without a `persist:` prefix is
+			 * in memory, and a persistent one would only move the cookie growth that
+			 * caused the blank windows from the window's jar into a per-tab one. A test
+			 * that reads the name back out of the state push can see which kind was
+			 * asked for.
+			 */
+			fromPartition(name) {
+				return {
+					async clearStorageData(filter) {
+						guestClears.push({ partition: name, filter })
+						events.push({ kind: 'clear', partition: name })
+					}
+				}
+			},
+			defaultSession: {
+				cookies: {
+					async get() {
+						if (legacyCookieError) throw new Error('the cookie store could not be read')
+						return legacyCookies
+					},
+					async remove(url, name) {
+						removedCookies.push({ url, name })
+					}
+				}
+			}
+		}
 	}
 
 	// Intercept the two modules the main process reaches for. Everything else —
@@ -377,6 +506,7 @@ function harness(options = {}) {
 	Module._load = function load(request, parent, isMain) {
 		if (request === 'electron') return electronStub
 		if (request === './connect.js') return connectStub
+		if (request === './terminal.js') return terminalStub
 		return original.call(this, request, parent, isMain)
 	}
 	delete require.cache[require.resolve(join(ROOT, 'src', 'main.js'))]
@@ -422,6 +552,10 @@ function harness(options = {}) {
 		queue,
 		ok,
 		pending,
+		guestClears,
+		events,
+		legacyCookies,
+		removedCookies,
 		/**
 		 * Arm the next connect so it does not settle until the test says so.
 		 *
@@ -498,7 +632,11 @@ function harness(options = {}) {
 		 * @param id - the tab id.
 		 * @returns the transcript as one string.
 		 */
-		transcriptFor: (id) => ipc.get('devices:transcript')({}, id).lines.join('\n')
+		transcriptFor: (id) => ipc.get('devices:transcript')({}, id).lines.join('\n'),
+		/** Every terminal session the stubbed terminal module started, in order. */
+		terminalSpawns,
+		/** Send on a one-way channel, as `ipcRenderer.send` would. */
+		send: (channel, ...args) => ipc.get(`on:${channel}`)?.({}, ...args)
 	}
 }
 
@@ -569,6 +707,65 @@ await test('the device book becomes one tab per device, none of them started', a
 	const state = await h.state()
 	assert.deepEqual(state.tabs.map((tab) => tab.id), ['local', 'dev-a', 'dev-b'])
 	assert.deepEqual(state.tabs.map((tab) => tab.state), ['running', 'idle', 'idle'])
+})
+
+console.log('guest sessions')
+
+await test('every Harness tab has an in-memory session of its own', async () => {
+	// **The jar must neither be shared nor persist.** A `dsh web` names its auth
+	// cookie after the authority it was reached on, and a browser sends every cookie
+	// for the host whatever the port: in one persistent jar those cookies accumulated
+	// until the Cookie header crossed the Harness's 16 KiB limit and every guest
+	// answered `431`. A session per tab, in memory, is what bounds that.
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	const partitions = (await h.state()).tabs.map((tab) => tab.partition)
+	assert.deepEqual(partitions, ['dsh-tabs-guest-local', 'dsh-tabs-guest-dev-a', 'dsh-tabs-guest-dev-b'])
+	assert.equal(new Set(partitions).size, partitions.length, 'two tabs share one guest session')
+	for (const partition of partitions) {
+		assert.equal(String(partition).startsWith('persist:'), false, `a guest session would persist: ${String(partition)}`)
+	}
+})
+
+await test('a connect empties its tab guest session first, and only its cookies', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	const mark = h.events.length
+	await h.call('tabs:activate', 'dev-a')
+	const slice = h.events.slice(mark)
+	const cleared = slice.findIndex((event) => event.kind === 'clear' && event.partition === 'dsh-tabs-guest-dev-a')
+	const connected = slice.findIndex((event) => event.kind === 'connect')
+	assert.ok(cleared > -1, 'the guest session was not emptied before the connect')
+	assert.ok(connected > -1, 'the connect never started')
+	assert.ok(cleared < connected, 'the session was emptied after the connect had started')
+	const clear = h.guestClears.find((one) => one.partition === 'dsh-tabs-guest-dev-a')
+	assert.deepEqual(clear.filter.storages, ['cookies'], 'a connect wiped more than the session cookies')
+})
+
+await test('the window session is cleaned of the cookies earlier builds left', async () => {
+	// Before partitions existed every guest ran in the default, persistent session, so
+	// that jar still holds one `dsh-auth-*` cookie per Harness ever opened. Nothing
+	// reads it now, but leaving 15 KB of them in the profile is how a downgrade — or
+	// anything that attaches a guest without a partition — walks back into the 431.
+	const h = harness({
+		devices: book,
+		legacyCookies: [
+			{ name: 'dsh-auth-aaa', domain: '127.0.0.1', path: '/', secure: false },
+			{ name: 'dsh-auth-bbb', domain: '.127.0.0.1', path: '/deep', secure: false },
+			{ name: 'not-ours', domain: '127.0.0.1', path: '/', secure: false }
+		]
+	})
+	await h.boot()
+	assert.deepEqual(h.removedCookies.map((entry) => entry.name), ['dsh-auth-aaa', 'dsh-auth-bbb'])
+	assert.deepEqual(h.removedCookies.map((entry) => entry.url), ['http://127.0.0.1/', 'http://127.0.0.1/deep'])
+})
+
+await test('a cookie store that cannot be read does not stop the local tab', async () => {
+	const h = harness({ devices: book, legacyCookieError: true })
+	await h.boot()
+	assert.equal((await h.state()).tabs[0].state, 'running')
 })
 
 console.log('alt+digit')
@@ -1238,6 +1435,114 @@ await test('the transcript is readable for a tab that failed', async () => {
 	assert.equal(activated.tabs.find((tab) => tab.id === 'dev-b')?.state, 'failed', `the tab did not reach a failed state: ${JSON.stringify(activated)}`)
 	const { lines } = await h.call('devices:transcript', 'dev-b')
 	assert.ok(lines.some((line) => line.includes('FAILED: ssh: connect to host')), `the reason is not in the transcript: ${JSON.stringify(lines)}`)
+})
+
+console.log('terminals')
+
+await test('a terminal opens as its own tab and starts exactly one session', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	const state = await h.call('terminal:open', 'dev-a')
+	const tab = state.tabs.find((entry) => entry.id === 'terminal:dev-a')
+	assert.ok(tab !== undefined, `no terminal tab: ${JSON.stringify(state.tabs)}`)
+	assert.equal(tab.kind, 'terminal')
+	assert.equal(tab.label, 'box-a — terminal')
+	assert.equal(tab.state, 'running')
+	assert.equal(tab.generation, 1)
+	assert.equal(state.activeId, 'terminal:dev-a')
+	assert.equal(h.terminalSpawns.length, 1, 'the tab started more than one session')
+	assert.equal(h.terminalSpawns[0].startOptions.device.id, 'dev-a')
+	// This book has no cached family, so the start asked the probe, and the answer
+	// was written back: the next terminal on this device must not probe again.
+	assert.equal(h.terminalSpawns[0].startOptions.platform, 'posix')
+	const listed = await h.call('devices:list')
+	assert.equal(listed.devices.find((device) => device.id === 'dev-a').platform, 'posix')
+})
+
+await test('output is held until the renderer attaches, then routed to that tab', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('terminal:open', 'dev-a')
+	const session = h.terminalSpawns[0]
+	session.emit('box-a$ ')
+	const dataBefore = h.sent.filter(([channel]) => channel === 'terminal:data')
+	assert.equal(dataBefore.length, 0, 'the prompt was sent before a screen existed to draw it on')
+
+	await h.call('terminal:attach', 'terminal:dev-a')
+	assert.equal(session.attached, true, 'attach did not reach the session')
+	assert.deepEqual(
+		h.sent.filter(([channel]) => channel === 'terminal:data').map(([, payload]) => payload),
+		[{ id: 'terminal:dev-a', data: 'box-a$ ' }],
+		'the buffered prompt was not released in order'
+	)
+
+	h.send('terminal:input', 'terminal:dev-a', 'ls\r')
+	h.send('terminal:resize', 'terminal:dev-a', 120, 30)
+	assert.deepEqual(session.writes, ['ls\r'])
+	assert.deepEqual(session.resizes, [[120, 30]])
+	// The channels are keyed by tab: input addressed to a Harness tab must not reach
+	// the pty, or a renderer bug would type into somebody's shell.
+	h.send('terminal:input', 'dev-a', 'rm -rf /\r')
+	h.send('terminal:resize', 'dev-a', 1, 1)
+	assert.deepEqual(session.writes, ['ls\r'])
+	assert.deepEqual(session.resizes, [[120, 30]])
+})
+
+await test('a session that ends keeps its tab, and reconnecting starts a new generation', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('terminal:open', 'dev-a')
+	const first = h.terminalSpawns[0]
+	first.exit(0)
+	const ended = (await h.state()).tabs.find((tab) => tab.id === 'terminal:dev-a')
+	assert.equal(ended.state, 'ended')
+	assert.equal(ended.exitCode, 0)
+
+	// The tab stays, because its output is the only record of what happened; `⟲`
+	// is how the operator gets a shell back without opening a second tab.
+	const restarted = await h.call('tabs:restart', 'terminal:dev-a')
+	const again = restarted.tabs.find((tab) => tab.id === 'terminal:dev-a')
+	assert.equal(again.state, 'running')
+	assert.equal(again.generation, 2, 'a reconnect reused the generation the renderer keys its screen on')
+	assert.equal(h.terminalSpawns.length, 2)
+})
+
+await test('closing a terminal tab ends its session and returns to the device tab', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('terminal:open', 'dev-a')
+	const session = h.terminalSpawns[0]
+	const state = await h.call('tabs:disconnect', 'terminal:dev-a')
+	assert.deepEqual(state.tabs.map((tab) => tab.id), ['local', 'dev-a', 'dev-b'])
+	assert.equal(state.activeId, 'dev-a')
+	assert.equal(session.killed, 1, 'the ssh client was left running')
+})
+
+await test('removing a device closes the terminal that belonged to it', async () => {
+	const h = harness({ devices: book })
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('terminal:open', 'dev-a')
+	const session = h.terminalSpawns[0]
+	await h.call('devices:remove', 'dev-a')
+	const state = await h.state()
+	assert.deepEqual(state.tabs.map((tab) => tab.id), ['local', 'dev-b'])
+	assert.equal(session.killed, 1, 'a terminal outlived the device it named')
+})
+
+await test('a terminal whose shell family cannot be found fails with the reason', async () => {
+	const h = harness({ devices: book, detectError: 'ssh: connect to host 10.0.0.2 port 22: Connection timed out' })
+	await h.boot()
+	await h.call('devices:list')
+	const state = await h.call('terminal:open', 'dev-a')
+	const tab = state.tabs.find((entry) => entry.id === 'terminal:dev-a')
+	assert.equal(tab.state, 'failed')
+	assert.match(tab.error ?? '', /Connection timed out/u)
+	assert.equal(h.terminalSpawns.length, 0, 'a pty was started without a command to run')
 })
 
 rmSync(HOME, { recursive: true, force: true })

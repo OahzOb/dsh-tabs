@@ -64,13 +64,92 @@ function harness(options = {}) {
 	const { window } = dom
 
 	const calls = []
+	const terminals = []
 	const transcripts = options.transcripts ?? {}
 	let state = options.state ?? { activeId: 'local', tabs: [] }
 	let devices = options.devices ?? []
 	let problems = options.problems ?? []
 	let onState = () => {}
 	let onShortcut = () => {}
+	let onTerminalData = () => {}
 	let failSave
+
+	/**
+	 * A terminal emulator with the surface `app.js` uses.
+	 *
+	 * jsdom has no canvas and no xterm, and the point of this harness is the
+	 * reconciliation logic, not the renderer inside a terminal. Every handle the tab
+	 * code touches — `open`, `reset`, `focus`, `dispose`, `write`, `onData` — is a
+	 * counter, so the tests can ask what happened instead of looking at pixels.
+	 */
+	class FakeTerminal {
+		constructor(terminalOptions) {
+			this.options = terminalOptions
+			this.cols = 80
+			this.rows = 24
+			this.writes = []
+			this.resets = 0
+			this.focuses = 0
+			this.disposed = 0
+			this.dataListeners = []
+			this.element = window.document.createElement('div')
+			this.element.className = 'xterm'
+			terminals.push(this)
+		}
+		loadAddon(addon) {
+			this.addon = addon
+			addon.activate?.(this)
+		}
+		open(host) {
+			host.appendChild(this.element)
+		}
+		onData(listener) {
+			this.dataListeners.push(listener)
+			return { dispose() {} }
+		}
+		attachCustomKeyEventHandler(handler) {
+			this.keyHandler = handler
+		}
+		hasSelection() {
+			return this.selected !== undefined
+		}
+		getSelection() {
+			return this.selected ?? ''
+		}
+		clearSelection() {
+			this.selected = undefined
+		}
+		write(data) {
+			this.writes.push(data)
+		}
+		reset() {
+			this.resets += 1
+		}
+		focus() {
+			this.focuses += 1
+		}
+		dispose() {
+			this.disposed += 1
+		}
+		/** Test-only: type into the terminal, as xterm's textarea would. */
+		type(data) {
+			for (const listener of this.dataListeners) listener(data)
+		}
+	}
+	class FakeFitAddon {
+		activate(term) {
+			this.term = term
+		}
+		fit() {
+			this.fits = (this.fits ?? 0) + 1
+			// A measurement that differs from the constructor's 80x24, so the resize
+			// path has something to report.
+			this.term.cols = 120
+			this.term.rows = 30
+		}
+	}
+	window.Terminal = FakeTerminal
+	window.FitAddon = { FitAddon: FakeFitAddon }
 
 	window.dshTabs = {
 		state: async () => state,
@@ -112,8 +191,31 @@ function harness(options = {}) {
 			calls.push(['checkUpdates'])
 			return { version: 'test' }
 		},
+		terminalOpen: async (id) => {
+			calls.push(['terminalOpen', id])
+			return state
+		},
+		terminalAttach: async (id) => {
+			calls.push(['terminalAttach', id])
+		},
+		terminalInput: (id, data) => {
+			calls.push(['terminalInput', id, data])
+		},
+		terminalResize: (id, cols, rows) => {
+			calls.push(['terminalResize', id, cols, rows])
+		},
+		clipboard: {
+			read: async () => '',
+			write: async (text) => {
+				calls.push(['clipboardWrite', text])
+			}
+		},
 		onState: (listener) => {
 			onState = listener
+			return () => {}
+		},
+		onTerminalData: (listener) => {
+			onTerminalData = listener
 			return () => {}
 		},
 		onShortcut: (listener) => {
@@ -155,6 +257,11 @@ function harness(options = {}) {
 		},
 		tabs: () => [...window.document.querySelectorAll('.tab')],
 		guests: () => [...window.document.querySelectorAll('webview')],
+		terminals,
+		terminalHosts: () => [...window.document.querySelectorAll('.terminal-host')],
+		pushTerminalData(payload) {
+			onTerminalData(payload)
+		},
 		panels: () => [...window.document.querySelectorAll('.panel')],
 		popover: () => window.document.getElementById('popover')
 	}
@@ -165,8 +272,8 @@ function threeTabs() {
 	return {
 		activeId: 'local',
 		tabs: [
-			{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/' },
-			{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'running', url: 'http://127.0.0.1:1001/?token=a' },
+			{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/', partition: 'dsh-tabs-guest-local' },
+			{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'running', url: 'http://127.0.0.1:1001/?token=a', partition: 'dsh-tabs-guest-dev-a' },
 			{ id: 'dev-b', kind: 'remote', label: 'box-b', state: 'idle' }
 		]
 	}
@@ -204,6 +311,23 @@ await test('a running tab creates exactly one guest', async () => {
 	// the inactive ones are hidden, so switching is instant and does not reload.
 	assert.equal(h.guests().length, 2)
 	assert.deepEqual(h.guests().map((guest) => guest.getAttribute('src')), ['http://127.0.0.1:1000/', 'http://127.0.0.1:1001/?token=a'])
+})
+
+await test('a guest runs in its tab\u2019s own session', async () => {
+	// **The partition is what stops one Harness's auth cookie from accumulating beside
+	// another's.** The main process names the session and empties it per connect; the
+	// renderer's half is that the element must be created in that session before it
+	// navigates. A guest without the attribute falls back to the window's persistent
+	// jar, which is the state that produced 70 cookies and a blank page.
+	const h = harness({ state: threeTabs(), devices: [] })
+	await h.flush()
+	assert.deepEqual(
+		h.guests().map((guest) => guest.getAttribute('partition')),
+		['dsh-tabs-guest-local', 'dsh-tabs-guest-dev-a']
+	)
+	for (const guest of h.guests()) {
+		assert.equal(String(guest.getAttribute('partition')).startsWith('persist:'), false, 'a guest session would persist')
+	}
 })
 
 await test('a repeated state push reuses the same guest element', async () => {
@@ -586,6 +710,152 @@ await test('what the book had to leave out is shown, not swallowed', async () =>
 	await clean.flush()
 	await clean.flush()
 	assert.doesNotMatch(clean.popover().textContent, /left out of the book/u)
+})
+
+/** A running terminal tab, plus the device tab and the local one. */
+function terminalTabs(overrides = {}) {
+	return {
+		activeId: 'terminal:dev-a',
+		tabs: [
+			{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/' },
+			{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'idle' },
+			{
+				id: 'terminal:dev-a',
+				kind: 'terminal',
+				deviceId: 'dev-a',
+				label: 'box-a — terminal',
+				state: 'running',
+				generation: 1,
+				...overrides
+			}
+		]
+	}
+}
+
+console.log('terminals')
+
+await test('a terminal tab gets one emulator, attaches once and fits to its host', async () => {
+	const h = harness({ state: terminalTabs(), devices: [] })
+	await h.flush()
+	assert.equal(h.terminalHosts().length, 1, 'the tab drew no terminal host')
+	assert.equal(h.terminals.length, 1, 'the tab created more than one emulator')
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'terminalAttach'),
+		[['terminalAttach', 'terminal:dev-a']],
+		'the main process was not told there is a screen'
+	)
+	// The fit happens after the host is on screen, and its measurement is what the
+	// pty is told; an 80x24 default would wrap a wide shell at the wrong place.
+	assert.deepEqual(h.calls.filter(([name]) => name === 'terminalResize').at(-1), ['terminalResize', 'terminal:dev-a', 120, 30])
+
+	// A repeated state push must reuse both the host and the emulator: rebuilding
+	// either would throw away the scrollback the operator is reading.
+	const term = h.terminals[0]
+	h.pushState(terminalTabs())
+	await h.flush()
+	assert.equal(h.terminals.length, 1)
+	assert.equal(h.terminals[0], term)
+	assert.equal(h.calls.filter(([name]) => name === 'terminalAttach').length, 1)
+})
+
+await test('output is written to the emulator it belongs to', async () => {
+	const state = terminalTabs()
+	state.tabs.push({
+		id: 'terminal:dev-b',
+		kind: 'terminal',
+		deviceId: 'dev-b',
+		label: 'box-b — terminal',
+		state: 'running',
+		generation: 1
+	})
+	const h = harness({ state, devices: [] })
+	await h.flush()
+	assert.equal(h.terminals.length, 2)
+	const [first, second] = h.terminals
+	h.pushTerminalData({ id: 'terminal:dev-b', data: 'box-b$ ' })
+	assert.deepEqual(second.writes, ['box-b$ '])
+	assert.deepEqual(first.writes, [], 'output for one tab was drawn in another')
+	// A payload for a tab that has been closed — an in-flight chunk racing the
+	// state push — is dropped rather than thrown.
+	h.pushTerminalData({ id: 'terminal:gone', data: 'too late' })
+})
+
+await test('a reconnect clears the screen and attaches to the new session', async () => {
+	const h = harness({ state: terminalTabs(), devices: [] })
+	await h.flush()
+	const term = h.terminals[0]
+	h.pushState(terminalTabs({ generation: 2, state: 'starting' }))
+	await h.flush()
+	assert.equal(term.resets, 1, "the previous session's screen was kept")
+	assert.equal(h.calls.filter(([name]) => name === 'terminalAttach').length, 2)
+	assert.match(h.terminalHosts()[0].textContent, /opening the ssh session/u)
+})
+
+await test('an ended session keeps its output and offers Reconnect', async () => {
+	const h = harness({ state: terminalTabs(), devices: [] })
+	await h.flush()
+	const term = h.terminals[0]
+	term.write('last words')
+	h.pushState(terminalTabs({ state: 'ended', exitCode: 255 }))
+	await h.flush()
+	const host = h.terminalHosts()[0]
+	assert.match(host.textContent, /session ended \(exit code 255\)/u)
+	assert.equal(term.resets, 0, 'the transcript was cleared when the session ended')
+	assert.equal(h.panels().length, 0, 'a panel covered the terminal the operator was reading')
+	const again = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Reconnect')
+	assert.ok(again !== undefined, 'the ended terminal has no way back')
+	again.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'restart'),
+		[['restart', 'terminal:dev-a']]
+	)
+})
+
+await test('a terminal tab that is closed disposes its emulator and its host', async () => {
+	const h = harness({ state: terminalTabs(), devices: [] })
+	await h.flush()
+	const term = h.terminals[0]
+	h.pushState({ activeId: 'local', tabs: terminalTabs().tabs.filter((tab) => tab.kind !== 'terminal') })
+	await h.flush()
+	assert.equal(term.disposed, 1, 'the emulator outlived its tab')
+	assert.equal(h.terminalHosts().length, 0)
+	// The device tab is still there, because it is a configured thing.
+	assert.deepEqual(h.tabs().map((tab) => tab.querySelector('.tab-label').textContent), ['Local', 'box-a'])
+})
+
+await test('typing into a terminal reaches its pty', async () => {
+	const h = harness({ state: terminalTabs(), devices: [] })
+	await h.flush()
+	h.terminals[0].type('ls\r')
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'terminalInput'),
+		[['terminalInput', 'terminal:dev-a', 'ls\r']]
+	)
+})
+
+await test('the popover offers a terminal for a device and asks the main process for it', async () => {
+	const h = harness({
+		state: { activeId: 'local', tabs: [{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/' }] },
+		devices: [{ id: 'dev-a', label: 'box-a', user: 'u', host: '10.0.0.2', sshPort: 22 }]
+	})
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const buttons = [...h.popover().querySelectorAll('button')].map((button) => button.textContent)
+	assert.ok(buttons.includes('Terminal'), `the device row has no terminal control: ${JSON.stringify(buttons)}`)
+	// The remove control keeps its own class, because the terminal button must not
+	// inherit the destructive red hover.
+	assert.ok(h.popover().querySelector('button.danger') !== null)
+	const open = [...h.popover().querySelectorAll('button')].find((button) => button.textContent === 'Terminal')
+	open.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'terminalOpen'),
+		[['terminalOpen', 'dev-a']]
+	)
+	assert.equal(h.popover().hidden, true, 'the popover stayed open over the new tab')
 })
 
 console.log(`\n${String(passes)} checks passed${failures.length === 0 ? '' : `, ${String(failures.length)} failed`}`)

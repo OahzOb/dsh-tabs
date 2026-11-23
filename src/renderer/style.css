@@ -196,6 +196,12 @@ body {
 	background: var(--bad);
 }
 
+/* A session that ended on its own is not a failure — `exit` is the normal way a
+   terminal finishes — so it gets the idle grey rather than the error red. */
+.dot[data-state='ended'] {
+	background: #6f6f7a;
+}
+
 @keyframes pulse {
 	50% {
 		opacity: 0.35;
@@ -235,6 +241,109 @@ body {
 
 #content webview[hidden] {
 	display: none;
+}
+
+/* ---- terminal ---- */
+
+/*
+ * The terminal fills the content area like a guest does, with one difference:
+ * the banner at the bottom is part of the tab's layout, not an overlay, so a
+ * "session ended" line never hides the shell's own last words.
+ */
+.terminal-host {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg);
+}
+
+.terminal-host[hidden] {
+	display: none;
+}
+
+.terminal-screen {
+	flex: 1;
+	min-height: 0;
+}
+
+/*
+ * Padding belongs on the `.xterm` element and not on `.terminal-screen`, because
+ * the fit addon subtracts the terminal's own padding when it measures. Moving it
+ * up one level makes every fit one row and one column too large.
+ */
+.terminal-screen .xterm {
+	height: 100%;
+	padding: 6px 8px 4px;
+}
+
+.terminal-screen .xterm-viewport {
+	background: transparent !important;
+}
+
+.terminal-banner {
+	display: flex;
+	flex: none;
+	align-items: center;
+	gap: 10px;
+	padding: 6px 10px;
+	background: var(--bar);
+	border-top: 1px solid var(--line);
+	color: var(--dim);
+	font-size: 12px;
+}
+
+.terminal-banner[hidden] {
+	display: none;
+}
+
+.terminal-banner-text {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	user-select: text;
+}
+
+.terminal-banner button {
+	flex: none;
+	padding: 4px 10px;
+	background: var(--tab);
+	border: 1px solid var(--line);
+	border-radius: 5px;
+	color: var(--fg);
+	cursor: pointer;
+	font: inherit;
+	font-size: 11px;
+}
+
+.terminal-banner button:hover {
+	border-color: var(--accent);
+}
+
+/*
+ * The terminal component failing to load is a different failure from the ssh
+ * session failing, and it needs its own message: the session never existed.
+ */
+.terminal-broken {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	padding: 32px;
+	color: var(--dim);
+	text-align: center;
+}
+
+.terminal-broken h2 {
+	margin: 0;
+	color: var(--fg);
+	font-size: 15px;
+	font-weight: 600;
 }
 
 .panel {
@@ -351,6 +460,13 @@ body {
 }
 
 .row button:hover {
+	border-color: var(--accent);
+	color: var(--fg);
+}
+
+/* Removing a device is the one destructive control in the popover, so it is the
+   one that keeps the red hover. */
+.row button.danger:hover {
 	border-color: var(--bad);
 	color: var(--bad);
 }

@@ -39,6 +39,20 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	remove: (id) => ipcRenderer.invoke('devices:remove', id),
 	transcript: (id) => ipcRenderer.invoke('devices:transcript', id),
 	checkUpdates: () => ipcRenderer.invoke('updates:check'),
+	terminalOpen: (id) => ipcRenderer.invoke('terminal:open', id),
+	terminalAttach: (id) => ipcRenderer.invoke('terminal:attach', id),
+	// One-way on purpose: a keystroke is hot, and an `invoke` would wrap every key
+	// in a promise the renderer has no use for. The main process validates both.
+	terminalInput: (id, data) => ipcRenderer.send('terminal:input', id, data),
+	terminalResize: (id, cols, rows) => ipcRenderer.send('terminal:resize', id, cols, rows),
+	// The clipboard is reached in the main process. `clipboard` is not one of the
+	// modules a preload gets from `require('electron')`, so a preload-side copy is
+	// `undefined` until somebody actually copies something.
+	clipboard: {
+		read: () => ipcRenderer.invoke('clipboard:read'),
+		write: (text) => ipcRenderer.invoke('clipboard:write', text)
+	},
 	onState: (listener) => subscribe('tabs:state', listener),
+	onTerminalData: (listener) => subscribe('terminal:data', listener),
 	onShortcut: (listener) => subscribe('tabs:shortcut', listener)
 })

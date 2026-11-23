@@ -4,7 +4,8 @@ English | [中文](#中文)
 
 A tabbed host for **DeepSeek Harness (DSH)** web interfaces. One window, an
 always-visible tab bar, and one tab per Harness: the local one, plus one per remote
-machine reached over an SSH tunnel.
+machine reached over an SSH tunnel. A device can also be opened as an **interactive
+ssh terminal** in a tab of its own.
 
 **The local tab is a peer of the remote ones, not their host.** That is why this is an
 application rather than a plugin — the four things a plugin cannot have are in
@@ -42,6 +43,9 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 - **A remote tab** runs the same program on the far side over SSH, then opens a
   second, bare `ssh -N -L` tunnel to the port the first connection announced. Nothing
   is installed on that machine.
+- **A terminal tab** runs `ssh -tt` on a local pseudo-terminal, so a device can be
+  used as an interactive shell as well as a Harness: the window's size reaches the far
+  side, and `Ctrl+C` and full-screen programs behave as they do in a terminal.
 - **Teardown closes stdin**, which is what the remote program blocks on, so the far
   side's server is reaped rather than left holding its port.
 
@@ -58,6 +62,7 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
 | **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
 | **Selecting is not connecting** | A tab that is not up stays down when it is selected; its panel offers **Connect**, so moving around the bar never starts a Harness on a machine nobody asked to use. |
+| **A terminal per device** | `+` → the device row → **Terminal** opens an interactive shell over the same ssh, on a real pty: the account's login shell on POSIX, PowerShell 7 (falling back to Windows PowerShell) on Windows. Resizing the window resizes the far-side terminal, and `Ctrl+C`, `vim` and a full-screen prompt behave as they do in a terminal. |
 | **One instance, and a `--version` that answers** | A packaged Electron binary has no version flag of its own, so `dsh-tabs --version` used to come up as a second window *with a second local Harness*; it now prints and exits, and a second launch hands its window forward instead of starting another Harness. |
 
 ## Requirements
@@ -122,6 +127,11 @@ installed by hand; only the versions that contain the updater can update themsel
 - **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
   inside a remote interface.
 - **`+`** lists the devices, adds one, and removes one.
+- **Terminal** in a device's row opens an interactive ssh shell in a tab of its own.
+  `×` closes it and ends the session, `⟲` reconnects it in place, and `exit` leaves
+  the transcript on screen with a **Reconnect** button. `Ctrl+Shift+C` and
+  `Ctrl+Shift+V` copy and paste; right-click copies a selection, or pastes when there
+  is none.
 - **Launching it again does not start a second one.** `dsh-tabs --version` prints the
   version and exits; any other second launch brings the existing window forward,
   because a second copy would be a second local Harness nobody can see.
@@ -140,8 +150,9 @@ each section is a decision that cost something to learn.
 | [What the remote needs](#what-the-remote-needs) | `dsh` on `PATH`, and enabling `sshd` on a Windows host |
 | [How a connect works](#how-a-connect-works) | Two ssh connections, and the teardown contract that reaps the far side |
 | [Windows remotes](#windows-remotes) | The PowerShell program, and why the local tab must not be made symmetric with it |
+| [Terminals](#terminals) | A pty, xterm, the PowerShell selection, and the one native dependency |
 | [Layout](#layout) | Every file and what owns it |
-| [Test](#test) | The four offline suites, the live one, and the variables they read |
+| [Test](#test) | The five offline suites, the live one, and the variables they read |
 | [Android: a sibling client](#android-a-sibling-client-not-a-port-of-this-one) | The second client, the protocol both implement, and the artefacts it ports from |
 | [The studies](docs/android-ssh-feasibility.md) | Why there is no embedded Node on Android — and [what a WebView does with the tunnel](docs/android-webview-proxy-feasibility.md) |
 | [contract.json](docs/contract.json) | The protocol stated in one place a non-JavaScript client can read |
@@ -189,6 +200,9 @@ each section is a decision that cost something to learn.
 - **远程标签页**：把同一个程序通过 SSH 在对端跑起来，再开一条裸的 `ssh -N -L` 隧道，转发到
   第一条连接报出的端口。对端不装任何东西。
 - **关闭靠关 stdin**：对端程序正阻塞在 stdin 上，所以远端服务会被回收，而不是留着占住端口。
+- **终端标签页**：通过同一条 SSH 打开一个真正的交互式终端（pty）：POSIX 是账号的登录
+  shell，Windows 优先 PowerShell 7、没有就退回 Windows PowerShell。窗口缩放会同步到远端，
+  `Ctrl+C`、`vim` 和全屏提示符都按终端的方式工作。
 
 ## 功能
 
@@ -201,6 +215,7 @@ each section is a decision that cost something to learn.
 | **设备簿沿用插件 schema** | `$DSH_HOME/dsh-tabs.json`，独立一个文件，首次运行时从桌面插件的 `remote-devices.json` 播种，绝不会有两个进程同时写它。 |
 | **失败能读懂** | 连接失败会引用对端自己的原话，包括 Windows 主机上 PowerShell 产生的 CLIXML 错误流。 |
 | **版本下限会自己说话** | 本地标签页启动前，`src/localdsh.js` 先查 `dsh --version`；CLI 太旧会直接报名，而不是 45 秒后变成一个凭据错误。 |
+| **每台设备一个终端** | `+` → 设备行 → **Terminal**，用同一条 SSH 打开交互式 shell：POSIX 用登录 shell，Windows 优先 PowerShell 7、退回 Windows PowerShell。窗口缩放会改变远端终端尺寸，`Ctrl+C`、`vim` 和全屏程序都正常。 |
 
 ## 环境要求
 
@@ -241,6 +256,10 @@ release CDN 不可达时设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `m
   点击只是选中它，面板里的 **Connect** 才启动；`×` 是**断开**、不是删除。删设备在 `+` 面板里。
 - **`Alt+1…9`** 切标签，在任何位置都有效，包括你正在远程界面里打字的时候。
 - **`+`** 列出设备、添加设备、删除设备。
+- **Terminal** 在设备行里，点开是一个独立的终端标签页。`×` 关闭并结束会话，`⟲` 原地重连，
+  在远端输入 `exit` 则保留输出并给出 **Reconnect**。`Ctrl+Shift+C/V` 复制粘贴；右键在有
+  选中内容时复制、没有时粘贴。终端和 Harness 标签一样只支持密钥登录，从登录 shell 的家目录
+  开始，不吃设备的 `directory` 字段。
 
 ## 文档
 
@@ -647,6 +666,110 @@ is passed with `-EncodedCommand` (base64 UTF-16LE), which is the only quoting
 strategy that survives ssh joining its argv, the remote's `cmd.exe`, and a script
 full of characters cmd would otherwise eat.
 
+## Terminals
+
+A device can also be opened as an interactive shell: **`+` → the device row →
+Terminal** creates a tab of its own and runs `ssh -tt` into the account's shell. It is
+not a Harness tab in disguise — the two sessions are independent, and closing one does
+not close the other — and it is not a separate terminal window: it lives in the bar
+like everything else, which is the point of the application.
+
+### A shell needs a terminal, not two pipes
+
+`src/terminal.js` runs ssh on a **local pseudo-terminal** (`node-pty`) and the page
+draws it with xterm.js. Both halves are load-bearing:
+
+- The local pty has a size, and ssh forwards it as the far side's window size; a
+  shell on pipes gets 80×24 for ever, and `vim`, `top` and a wide prompt all wrap at
+  the wrong column. Measured against a live Ubuntu host: `stty size` reported `42 130`
+  in a 1024×768 window, and `33 103` after the window was resized to 820×620 — the
+  window-change path works end to end.
+- It also puts the local ssh client in raw mode, which is what lets `Ctrl+C` reach the
+  far side as the byte its line discipline turns into a signal, and what lets a
+  full-screen program talk to a terminal. `-tt` is still passed, because a
+  command-carrying session (the Windows one) needs a pty of its own on the far side;
+  the local pty is what gives that remote pty a size.
+
+xterm is the other half. A `<pre>` can show the bytes, but it cannot answer the cursor
+position report `vim` waits for, and it cannot repaint a prompt in place.
+
+### Windows gets PowerShell, and the selection is not a shell one-liner
+
+A Windows host's ssh default shell is whatever `DefaultShell` says, often `cmd.exe`.
+The terminal starts a real PowerShell instead, preferring **PowerShell 7** and falling
+back to Windows PowerShell 5.1:
+
+```powershell
+$shell = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue
+if ($null -ne $shell) { & $shell.Source -NoLogo } else { & powershell -NoLogo }
+```
+
+It is sent as `powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand
+<base64>`, for the reason `remote.windowsCommand` already documents: ssh joins its argv
+with spaces and hands the result to the far side's default shell, and Windows has three
+of those in common use, each parsing quotes and metacharacters differently. Base64 of
+UTF-16LE contains no character any of them acts on. The outer PowerShell is only the
+selector; the inner one is interactive and loads the operator's profile, so `exit` ends
+the session rather than dropping them into a wrapper prompt.
+
+The obvious `where pwsh >nul 2>nul && pwsh -NoLogo || powershell -NoLogo` was rejected:
+cmd's `||` also fires when pwsh exits with a **non-zero code**, so typing `exit 1` in
+PowerShell 7 would start Windows PowerShell underneath it. The selection above runs
+once, before the interactive shell starts, and cannot be re-entered.
+
+POSIX takes the opposite approach on purpose: **no command at all**. ssh then starts
+the account's login shell, which is the literal thing the operator would have got.
+`terminalCommand` has no POSIX branch for that reason.
+
+### The first thing a failing ssh prints has nowhere to go yet
+
+The tab is `running` the moment the pty exists, but the renderer still has to receive
+the state push, create an xterm and send `attach` back. A successful connect spends that
+window printing a login banner; a failed one prints the reason, and the reason is the
+only part anybody needs. So the session holds its output until `attach` (512 kB, oldest
+dropped first) and releases it in order. Without the buffer a failed terminal would show
+an empty screen and an exit code, which is the least useful pair it can produce.
+
+### A terminal tab is a session, not a configured thing
+
+A device's Harness tab stays in the bar whether it is up or down, because the device is
+configured. A terminal is not: it appears when the operator asks for it, `×` closes it
+(and ends the session), `⟲` reconnects in place, and `exit` leaves the tab with its
+transcript and a **Reconnect** button rather than making the output disappear. The tab
+carries a `generation`; a new one is what tells the renderer to clear the screen and
+attach to the new session, because a state push alone cannot distinguish "this session
+printed more" from "this is a different session".
+
+The ssh options are the Harness tabs' — `BatchMode=yes`,
+`StrictHostKeyChecking=accept-new`, the device's port — so a terminal is key-only like
+everything else here: a device whose ssh needs a password cannot be opened this way.
+The shell starts in the account's home directory; the device's `directory` field
+belongs to the Harness tab and is not applied to a terminal.
+
+`Ctrl+Shift+C` and `Ctrl+Shift+V` copy and paste, right-click copies a selection or
+pastes when there is none, and `Alt+1…9` still selects tabs from inside the terminal —
+the shortcut lives in the main process and never depends on the page.
+
+### The one native dependency
+
+`node-pty` is a native module, and this is the only one in the application. Three
+things make it survive packaging:
+
+- **`npmRebuild: false`.** The published package carries a Node-API prebuild for
+  win32-x64 (and darwin). A Node-API binary does not need rebuilding for Electron's
+  ABI, and a rebuild would require a compiler on every machine that packages the app.
+  The packaged build was launched and a terminal opened in it, which is the check that
+  this is not just an intention.
+- **`asarUnpack: ["node_modules/node-pty/**"]`**, because a `.node` file cannot be
+  loaded from inside an asar archive, and the ConPTY helper (`OpenConsole.exe`,
+  `conpty.dll`, `winpty-agent.exe`) has to sit beside it as a real file. The `.pdb`
+  files that come with the prebuilds are excluded; they are debug symbols and most of
+  the package's size.
+- **A lazy `require`.** `src/terminal.js` loads the module on the first terminal, not
+  at application start, so a machine where the binary cannot load still gets the local
+  Harness, the device book and the offline suites; the one terminal tab reports the
+  load error instead of the application failing to start.
+
 ## Layout
 
 ```
@@ -654,13 +777,23 @@ src/main.js        the window, the tabs, the tunnels, the shortcuts
 src/preload.js     the renderer's entire view of the main process
 src/remote.js      what to run on the far side — a copy, see below
 src/devices.js     the device book
-src/renderer/      the tab bar and the guest host
+src/terminal.js    a device's terminal: the ssh argv, the pty, and its buffer
+src/renderer/      the tab bar, the guest host and the terminal host
 assets/icon.svg    the application icon, 32 pixels and up
 assets/icon-small.svg  the same icon for 16, 20 and 24, where the detail above stops working
 tools/smoke.mjs    offline checks
+tools/terminal.mjs the terminal module against a fake pty
 tools/render-icon.cjs  an icon SVG to PNGs, through Chromium, at the sizes a shell asks for
 tools/make-ico.cjs     those PNGs into one .ico
 ```
+
+**Two dependencies are application components rather than build tooling.**
+`@xterm/xterm` and `@xterm/addon-fit` are loaded by the renderer from
+`../../node_modules/…` and are inside the application archive in a packaged build;
+`node-pty` is the pty binding and is unpacked beside the archive. Neither is copied into
+`src/`, which would make a vendored file that nothing updates; the cost is that the
+paths in `index.html` are relative to the packaged layout, and `test:smoke` is what
+pins the files they name.
 
 **The icon is generated from a drawing, once per size, and the small rungs come from
 a second drawing.** `assets/icon.svg` says what the application is — a window with a
@@ -932,6 +1065,69 @@ What is *not* claimed: the exact route by which a URL lost its token was never
 reproduced, so the cure is not "the token can no longer be lost" — it is that a URL that
 cannot serve the app can no longer be presented as a running tab, and a guest that fails
 to paint is no longer something the operator has to notice for themselves.
+
+### The cookie jar outgrew the header limit, and the guest went blank again
+
+**The second failure with this symptom is not the token at all, and the application had
+been making it worse by using itself.** It arrived as the same report — every tab says
+`running`, the content area is a rectangle — but the server was not refusing the URL: it
+was refusing the *request*, before any handler ran.
+
+The chain is in the name of `dsh web`'s authentication cookie.
+`@deepseek-ai/dsh-client-connection` names it `dsh-auth-` plus a digest of the request's
+**authority**, so it is `127.0.0.1:<port>` — one cookie per Harness *port*. Cookies have
+no port dimension: a browser sends every cookie it holds for `127.0.0.1` to every port on
+it. `dsh-tabs` started a fresh Harness on a fresh port for the local tab and for every
+remote connect, and every guest shared the window's one persistent session, so each
+connection left one more cookie in a jar in which all of them were sent on every
+request. Measured on this machine on 2026-11-21: **70 cookies, 15,750 bytes of
+name+value** for `127.0.0.1`, accumulated in about four weeks of ordinary use (the
+cookies' own 30-day expiry dates date the oldest to 2026-10-24). Every one of the 70 had
+its `last_access` written at the same instant, 07:58:56 — that is one page load sending
+all of them.
+
+With Chromium's own request headers on top, the Cookie header block crossed Node's 16 KiB
+`maxHeaderSize`, and Node answers an over-long header block with `431` and an empty body
+**before the request reaches the Harness**. That is why nothing was logged on either
+side, and why the tab stayed `running`: the connect path's own check is a Node `fetch`,
+which holds no cookies — it got its `303` and declared the tab up, and then the
+`<webview>` asked again, with the jar. Reproduced end to end against the installed build
+and a copy of the operator's own profile: with the 70-cookie jar, the guest's document
+was `<html><head></head><body></body></html>` and a `fetch` from inside the guest to the
+Harness origin answered `431` with 0 bytes; with the same profile trimmed to five
+cookies, the same build painted the whole Web UI. Both halves are worth knowing because
+either alone sends you looking at the Harness or at the token.
+
+**The fix is a session per tab, in memory, emptied before each connect.** `src/main.js`
+names the partition (`dsh-tabs-guest-<tab id>`), `src/renderer/app.js` creates the guest in
+it, and `activate` calls `clearStorageData({ storages: ['cookies'] })` on it before the
+Harness is started. That is what a guest's cookies actually are: they are minted by the
+Harness for the authority of *that process*, so a cookie from a previous connection can
+never authenticate anything, and the partition is emptied rather than pruned. In memory,
+because the alternative — a persistent partition per tab — would only move the same leak
+into a smaller jar: one cookie per restart, kept for 30 days.
+
+**It is deliberately not "delete stale cookies from the default session".** Every running
+tab's cookie lives in the same jar there, so a cleanup that made room for a new connection
+would sign the other tabs out — the failure would move from "blank page" to "some tabs
+suddenly need their URLs reopened". A session per tab makes the cleanup local to the tab
+that is connecting. The window session's own jar is still cleaned at boot
+(`clearLegacyGuestCookies`), because that is where earlier builds accumulated the 16 KB;
+nothing reads it any more, but a pre-fix build is one launch away and the profile should
+not keep the debris.
+
+Verified on the same machine and profile: after the fix, the guest's own session held
+**one** cookie (225 bytes) instead of 70, its document was the whole Web UI, and a
+`fetch` from inside it answered `200` with the mount point. `tools/main.mjs` pins the
+ordering that is load-bearing — the session is emptied *before* the connect starts, with
+one ordered event log rather than two counts — and the in-memory part of the partition
+name; `tools/renderer.mjs` pins that the element is created in that session. Removing the
+clear or the attribute makes those checks fail rather than pass quietly.
+
+For a build that predates this section the immediate cure is the same one the Android
+client documents: with the application closed, delete the `dsh-auth-` cookies from
+`%APPDATA%\dsh-tabs\Network\Cookies` — they are worth nothing, and there are about 70 of
+them.
 
 ### A restart waits for the process, and the wait is measured
 
@@ -1211,15 +1407,24 @@ npm run contract -- --check           # fail if docs/contract.json is stale
 npm run readiness                     # start a real local dsh web, time it, stop it
 ```
 
-`npm test` runs four suites, each aimed at a layer that can be exercised without a
+`npm test` runs five suites, each aimed at a layer that can be exercised without a
 window:
 
 | Suite | What it drives | Why it exists |
 | --- | --- | --- |
 | `test:smoke` | the source, the builders' output, and this document | drift, platform rules, byte-parity with the plugin, the protocol contract, and the runbook's own claims |
 | `test:connect` | `src/connect.js` | port allocation, the readiness reader, tunnel probing |
+| `test:terminal` | `src/terminal.js` against a fake pty | the ssh argv, the buffer before attach, clamped input and size, and the Windows command's encoding |
 | `test:main` | `src/main.js` against a stubbed Electron | the tab lifecycle and **the `Alt+digit` routing** |
-| `test:renderer` | `src/renderer/app.js` in jsdom | the tab bar, guest reuse, panels, and the IPC calls it makes |
+| `test:renderer` | `src/renderer/app.js` in jsdom | the tab bar, guest reuse, panels, terminal views, and the IPC calls it makes |
+
+**`test:terminal` is about the parts a real device cannot be asked about offline.**
+The pty is not the risk — `node-pty` has its own suite — and neither is xterm. What is
+ours is the argv that reaches ssh, the environment the far side inherits, and the window
+between "the pty exists" and "the renderer has a screen": a fake pty makes all three
+observable, including the buffer releasing in order and the caps on what a renderer can
+ask a pty to swallow. The real pty is exercised by running the application; the
+`stty size` measurement in [Terminals](#terminals) is what that check looks like.
 
 **`test:main` drives a connect that has not finished, which is the state the suite
 could not describe before.** The stub used to answer before the code under test
@@ -1284,10 +1489,11 @@ Both are CommonJS (`.cjs`) rather than ESM (`.mjs`) like the suites: they `requi
 `src/remote.js`, which is CommonJS, and `.mjs` cannot `require`.
 
 jsdom is not Chromium, so `test:renderer` does not prove the window looks right.
-What it proves is the reconciliation logic — one guest per (tab, url), correct
-hiding, correct panels, correct calls — which is where the bugs were: it caught a
-popover marker that was true for every device, and `test:connect` caught a
-readiness line that resolved with a truncated URL when the pipe split it.
+What it proves is the reconciliation logic — one guest per (tab, url), one xterm per
+terminal tab, correct hiding, correct panels and terminal banners, correct calls —
+which is where the bugs were: it caught a popover marker that was true for every device,
+and `test:connect` caught a readiness line that resolved with a truncated URL when the
+pipe split it.
 
 `test:live` drives `src/connect.js` against a real device end to end: platform
 detection, the readiness line, the tunnel binding, the token → cookie exchange,

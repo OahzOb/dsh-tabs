@@ -1323,7 +1323,7 @@ await test('a second launch during startup does not crash the first one', () => 
 			exit: () => {}
 		},
 		BrowserWindow: class {},
-		ipcMain: { handle: () => {} },
+		ipcMain: { handle: () => {}, on: () => {} },
 		shell: { openExternal: () => {} }
 	}
 	const Module = require('node:module')
@@ -1472,6 +1472,37 @@ await test('the content policy covers the chrome this app draws', () => {
 	const html = readFileSync(join(ROOT, 'src', 'renderer', 'index.html'), 'utf8')
 	assert.match(html, /Content-Security-Policy/u)
 	assert.match(html, /default-src 'none'/u)
+})
+
+await test('every local file the renderer loads exists, and is a runtime dependency', () => {
+	// The renderer now loads xterm from `node_modules` as well as its own two files.
+	// A path that is right in the checkout and wrong in the archive, or a library
+	// dropped from `dependencies` (electron-builder installs production dependencies
+	// only), is a blank or a broken terminal in the packaged application — and the
+	// packaged application has no console to say why. The path is resolved exactly as
+	// the file URL would resolve it, which is what makes this catch the archive case.
+	const htmlPath = join(ROOT, 'src', 'renderer', 'index.html')
+	const html = readFileSync(htmlPath, 'utf8')
+	const sources = [...html.matchAll(/(?:src|href)="([^"]+)"/gu)]
+		.map((match) => match[1])
+		.filter((source) => !/^(?:https?:|data:|#)/u.test(source))
+	assert.ok(sources.length >= 3, `the renderer loads only ${JSON.stringify(sources)}`)
+	for (const source of sources) {
+		const resolved = resolve(dirname(htmlPath), source)
+		assert.ok(existsSync(resolved), `the renderer loads ${source}, which does not exist at ${resolved}`)
+	}
+
+	const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+	for (const name of ['@xterm/xterm', '@xterm/addon-fit', 'node-pty']) {
+		assert.ok(manifest.dependencies?.[name] !== undefined, `${name} is not a runtime dependency`)
+	}
+	// A `.node` file cannot be loaded from inside an asar archive. Without this the
+	// application still starts and the terminal fails with the binding's error, which
+	// is exactly the kind of failure a packaging change introduces silently.
+	assert.ok(
+		(manifest.build?.asarUnpack ?? []).some((pattern) => pattern.includes('node-pty')),
+		'node-pty is not unpacked from the asar'
+	)
 })
 
 // Take the scratch book away again when this run created it. A directory left in

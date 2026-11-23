@@ -20,6 +20,13 @@
 		/>
 		<title>dsh-tabs</title>
 		<link rel="stylesheet" href="style.css" />
+		<!-- The terminal is a real terminal emulator, not a styled <pre>: a shell
+		     asks its terminal for its size, emits cursor movements and reads the
+		     answer, and `vim` or a PowerShell prompt is unusable without that. The
+		     library is loaded from `node_modules`, which is inside the application
+		     archive in a packaged build; `script-src 'self' file:` above is what
+		     lets a page loaded from disk reach it. -->
+		<link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
 	</head>
 	<body>
 		<header id="bar">
@@ -28,6 +35,8 @@
 		</header>
 		<main id="content"></main>
 		<div id="popover" hidden></div>
+		<script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+		<script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
 		<script src="app.js"></script>
 	</body>
 </html>

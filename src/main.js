@@ -23,7 +23,7 @@
  *   drive it against a real device with no window anywhere.
  */
 
-const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron')
+const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, session } = require('electron')
 const { randomUUID } = require('node:crypto')
 const { existsSync } = require('node:fs')
 const { join } = require('node:path')
@@ -32,6 +32,7 @@ const devices = require('./devices.js')
 const connect = require('./connect.js')
 const remote = require('./remote.js')
 const localdsh = require('./localdsh.js')
+const terminal = require('./terminal.js')
 
 /** This application's own version, read from the manifest beside the source. */
 const PACKAGE = require('../package.json')
@@ -136,8 +137,55 @@ if (answer !== null) {
 /** The tab id of the local Harness, which always exists and is always first. */
 const LOCAL_ID = 'local'
 
+/**
+ * The prefix that keeps a terminal tab's id out of the device book's namespace.
+ *
+ * `tabs` is keyed by id and a device tab's id is the device's own, so a terminal
+ * for `dev-a` needs an id no device can hold by accident. The prefix is not a
+ * guarantee — the book is hand-editable and an operator can call a device
+ * `terminal:dev-a` — so `terminalTabFor` checks the other tab's kind before it
+ * writes anything, and refuses rather than overwriting a Harness tab.
+ */
+const TERMINAL_PREFIX = 'terminal:'
+
 /** The ids the chrome owns, from the one place that decides them. */
 const { RESERVED_IDS } = devices
+
+/**
+ * The session partition one Harness tab's guest runs in.
+ *
+ * **A guest's session must not be shared with any other guest, and it must not be
+ * the window's.** `dsh web` authenticates a browser with a cookie named after the
+ * request's authority — `dsh-auth-` plus a digest of `host:port` — so every Harness
+ * process a guest is pointed at contributes one more cookie for `127.0.0.1`, and a
+ * browser sends **every** cookie for a host regardless of the port it was minted
+ * for. In the default, persistent session those cookies accumulated across launches
+ * and restarts until the Cookie request header crossed Node's 16 KiB
+ * `maxHeaderSize`: the Harness then answered every request, the readiness URL
+ * included, with `431` and an empty body, every tab said `running`, and every guest
+ * was a blank rectangle with nothing logged on either side. Measured 2026-11-21:
+ * 70 cookies, 15,750 bytes of name+value, after about a month of ordinary use.
+ *
+ * The partition is **in memory** (no `persist:` prefix) on purpose. The cookie it
+ * holds dies with the Harness process that minted it, so there is nothing worth
+ * carrying across a launch, and a persistent partition would only become a slow
+ * version of the same leak — one cookie per restart. It is also per tab, because
+ * the tab is what a session belongs to: `clearGuestSession` can empty one tab's
+ * session without signing any other tab out.
+ */
+const GUEST_PARTITION_PREFIX = 'dsh-tabs-guest-'
+
+/**
+ * The session partition name for one tab.
+ * @param id - the tab id.
+ * @returns the partition name.
+ */
+function guestPartition(id) {
+	return `${GUEST_PARTITION_PREFIX}${id}`
+}
+
+/** The prefix `dsh web` gives its browser-session cookie. */
+const AUTH_COOKIE_PREFIX = 'dsh-auth-'
 
 /** @type {BrowserWindow | undefined} */
 let mainWindow
@@ -239,13 +287,19 @@ function startApplication() {
 /**
  * @typedef {object} Tab
  * @property {string} id
- * @property {'local'|'remote'} kind
+ * @property {'local'|'remote'|'terminal'} kind
+ * @property {string} [deviceId] - the device a terminal tab belongs to.
  * @property {string} label
- * @property {'idle'|'starting'|'running'|'failed'} state
+ * @property {'idle'|'starting'|'running'|'failed'|'ended'} state
  * @property {string} [url]
  * @property {string} [error]
+ * @property {number} [exitCode] - how a terminal's ssh client ended.
+ * @property {number} [generation] - which session a terminal tab is showing.
+ * @property {boolean} [attachRequested] - whether the renderer is waiting for the pty.
  * @property {ReturnType<typeof connect.connectLocal>} [connection]
+ * @property {ReturnType<typeof terminal.start>} [terminal]
  * @property {Attempt} [attempt]
+ * @property {{cancelled: boolean, stop: () => void}} [terminalAttempt]
  * @property {string[]} lines
  */
 
@@ -272,7 +326,23 @@ function snapshot() {
 			label: tab.label,
 			state: tab.state,
 			...(tab.url === undefined ? {} : { url: tab.url }),
-			...(tab.error === undefined ? {} : { error: tab.error })
+			...(tab.error === undefined ? {} : { error: tab.error }),
+			// A terminal's renderer needs to know whether the session it is looking at
+			// is still the one the main process owns — that is what a reconnect of the
+			// same tab changes — and how a finished one ended. Both are ordinary fields
+			// of a serializable state push, not a second IPC channel.
+			//
+			// A Harness tab's renderer needs the session partition its guest must be
+			// created in, for the reason `GUEST_PARTITION_PREFIX` records. The renderer
+			// does not derive the name, so the one place that decides what a partition
+			// means stays in this file.
+			...(tab.kind === 'terminal'
+				? {
+						generation: tab.generation ?? 0,
+						...(tab.deviceId === undefined ? {} : { deviceId: tab.deviceId }),
+						...(tab.exitCode === undefined ? {} : { exitCode: tab.exitCode })
+					}
+				: { partition: guestPartition(tab.id) })
 		}))
 	}
 }
@@ -345,12 +415,290 @@ function cancelAttempt(tab) {
  * @param tab - the tab to stop.
  */
 function stopTab(tab) {
+	if (tab.kind === 'terminal') {
+		// A terminal is not a Harness: there is no far-side process to reap with an
+		// EOF, so stopping it is the local ssh client's kill and nothing else. The
+		// tab is left in place for the quit path, which is the only caller that
+		// stops tabs without deciding what should be shown afterwards.
+		cancelTerminal(tab)
+		const session = tab.terminal
+		tab.terminal = undefined
+		tab.state = 'idle'
+		if (session !== undefined) session.kill()
+		return
+	}
 	cancelAttempt(tab)
 	const connection = tab.connection
 	tab.connection = undefined
 	tab.url = undefined
 	tab.state = 'idle'
 	if (connection !== undefined) connection.stop()
+}
+
+/**
+ * The id of one device's terminal tab.
+ * @param deviceId - the device the terminal belongs to.
+ * @returns the tab id.
+ */
+function terminalTabId(deviceId) {
+	return `${TERMINAL_PREFIX}${deviceId}`
+}
+
+/**
+ * The tab one device's terminal lives in, created on first use.
+ *
+ * A terminal tab is **on demand**, unlike a device's Harness tab: a terminal is a
+ * session, not a configured thing, and every device in the book having a second
+ * permanent tab would double the bar for the one thing an operator opens
+ * occasionally. It closes when the operator closes it and is not in the book.
+ *
+ * @param device - the device the terminal is for.
+ * @returns the tab.
+ */
+function terminalTabFor(device) {
+	const id = terminalTabId(device.id)
+	const existing = tabs.get(id)
+	if (existing !== undefined) {
+		// The prefix is a convention, not a rule the book enforces. A device whose id
+		// is `terminal:dev-a` gets one of these ids too, and overwriting the other
+		// tab would hand a Harness tab's controls to a terminal. Refused, and the
+		// caller reports it rather than deleting something.
+		if (existing.kind !== 'terminal' || existing.deviceId !== device.id) {
+			throw new Error(`the tab id "${id}" is already used by "${existing.label}"`)
+		}
+		existing.label = `${device.label} — terminal`
+		return existing
+	}
+	const created = {
+		id,
+		kind: /** @type {'terminal'} */ ('terminal'),
+		deviceId: device.id,
+		label: `${device.label} — terminal`,
+		state: /** @type {'idle'} */ ('idle'),
+		generation: 0,
+		lines: []
+	}
+	tabs.set(id, created)
+	return created
+}
+
+/**
+ * Cancel a terminal start that has not finished, wherever it is.
+ *
+ * The two stages are genuinely different: before the pty exists there is only the
+ * platform probe to kill, and after it exists there is the ssh client. The
+ * attempt's `stop` is replaced as the start moves from one to the other, so a `×`
+ * works in both windows — the same problem `Attempt` solves for Harness connects,
+ * with far less machinery because a terminal has no readiness line or tunnel.
+ *
+ * @param tab - the terminal tab being cancelled.
+ */
+function cancelTerminal(tab) {
+	const attempt = tab.terminalAttempt
+	if (attempt === undefined) return
+	attempt.cancelled = true
+	try {
+		attempt.stop()
+	} catch {
+		/* the attempt is marked cancelled above either way */
+	}
+}
+
+/**
+ * Put a terminal's failure on its tab and tear down whatever it had started.
+ * @param tab - the terminal tab.
+ * @param attempt - the start this failure belongs to.
+ * @param message - what the operator should read.
+ */
+function failTerminal(tab, attempt, message) {
+	if (tab.terminalAttempt !== attempt) return
+	attempt.stop()
+	tab.terminal = undefined
+	tab.state = 'failed'
+	tab.error = message
+	note(tab, `FAILED: ${message}`)
+	publish()
+}
+
+/**
+ * Start (or restart) one terminal tab's ssh session.
+ *
+ * A terminal has no readiness line to wait for: ssh either starts and hands the
+ * channel to the remote shell, or prints why it could not and exits. So the tab is
+ * `running` as soon as the pty exists, and an ssh that fails appears as output
+ * followed by an `ended` tab with its exit code. What *is* awaited is the shell
+ * family, because that decides the command to run, and it is cached on the device
+ * after the first time.
+ *
+ * @param tab - the terminal tab.
+ */
+async function startTerminal(tab) {
+	if (tab.kind !== 'terminal' || tab.deviceId === undefined) return
+	/** @type {{cancelled: boolean, stop: () => void}} */
+	const attempt = { cancelled: false, stop: () => {} }
+	tab.terminalAttempt = attempt
+	tab.generation = (tab.generation ?? 0) + 1
+	tab.state = 'starting'
+	tab.error = undefined
+	tab.exitCode = undefined
+	tab.attachRequested = false
+	tab.lines = []
+	publish()
+
+	// A session that ends while its start is still on the stack must not overwrite
+	// the state of a later attempt for the same tab.
+	const generation = tab.generation
+
+	try {
+		const stored = await devices.load()
+		if (attempt.cancelled) return
+		const device = stored.find((entry) => entry.id === tab.deviceId)
+		if (device === undefined) {
+			failTerminal(tab, attempt, 'this device is no longer in the book')
+			return
+		}
+		tab.label = `${device.label} — terminal`
+
+		let platform = device.platform
+		if (platform === undefined) {
+			const ssh = connect.sshExecutable()
+			const detected = await connect.detectPlatform(device, ssh, (line) => note(tab, line), (probe) => {
+				if (attempt.cancelled) {
+					try {
+						probe.kill()
+					} catch {
+						/* already gone */
+					}
+					return false
+				}
+				attempt.stop = () => {
+					try {
+						probe.kill()
+					} catch {
+						/* already gone */
+					}
+				}
+				return true
+			})
+			if (attempt.cancelled) return
+			if (detected.error !== undefined) {
+				failTerminal(tab, attempt, detected.error)
+				return
+			}
+			platform = detected.platform
+			if (device.platform !== platform) {
+				device.platform = platform
+				await persistPlatform(device)
+			}
+			if (attempt.cancelled) return
+		}
+
+		const session = terminal.start({
+			device,
+			platform,
+			ssh: connect.sshExecutable(),
+			onData: (data) => {
+				// A replaced session's output belongs to the tab generation that owned
+				// it. Delivering it into the replacement would interleave two shells.
+				if (tab.generation !== generation) return
+				if (mainWindow === undefined || mainWindow.isDestroyed()) return
+				mainWindow.webContents.send('terminal:data', { id: tab.id, data })
+			},
+			onExit: (status) => {
+				if (tab.generation !== generation || tab.terminal !== session) return
+				tab.exitCode = status.exitCode
+				tab.state = 'ended'
+				publish()
+			}
+		})
+		if (attempt.cancelled) {
+			session.kill()
+			return
+		}
+		tab.terminal = session
+		attempt.stop = () => {
+			session.kill()
+		}
+		tab.state = 'running'
+		publish()
+		// The renderer may have attached while the platform probe was running; the
+		// session could not be attached to then because it did not exist yet.
+		if (tab.attachRequested === true) session.attach()
+	} catch (error) {
+		if (attempt.cancelled) return
+		failTerminal(tab, attempt, error instanceof Error ? error.message : String(error))
+	} finally {
+		if (tab.terminalAttempt === attempt) tab.terminalAttempt = undefined
+	}
+}
+
+/**
+ * Show a terminal tab, starting its session when there is nothing to show.
+ * @param tab - the terminal tab.
+ */
+async function activateTerminal(tab) {
+	activeId = tab.id
+	if (tab.state === 'running' || tab.state === 'starting') {
+		publish()
+		return
+	}
+	await startTerminal(tab)
+}
+
+/**
+ * Open (or focus) one device's terminal from the popover.
+ * @param deviceId - the device id.
+ */
+async function openTerminal(deviceId) {
+	const stored = await devices.load()
+	const device = stored.find((entry) => entry.id === String(deviceId))
+	if (device === undefined) return
+	let tab
+	try {
+		tab = terminalTabFor(device)
+	} catch (error) {
+		// There is no tab to draw a collision on — the id belongs to another tab —
+		// so the console is the only place left to say it. The case needs a device
+		// renamed to this application's own prefix by hand.
+		console.error(`[terminal] ${error instanceof Error ? error.message : String(error)}`)
+		return
+	}
+	await activateTerminal(tab)
+}
+
+/**
+ * Reconnect a terminal in place, keeping its tab.
+ * @param tab - the terminal tab.
+ */
+async function restartTerminal(tab) {
+	cancelTerminal(tab)
+	const session = tab.terminal
+	tab.terminal = undefined
+	tab.state = 'idle'
+	if (session !== undefined) session.kill()
+	publish()
+	await startTerminal(tab)
+}
+
+/**
+ * Close a terminal tab and its session.
+ *
+ * This is the `×` on the tab, and it is deliberately different from the `×` on a
+ * Harness tab: a device tab stays in the bar because the device is configured, but
+ * a terminal is an open session and closing it is how it ends.
+ *
+ * @param tab - the terminal tab.
+ */
+function closeTerminalTab(tab) {
+	cancelTerminal(tab)
+	const session = tab.terminal
+	tab.terminal = undefined
+	if (session !== undefined) session.kill()
+	tabs.delete(tab.id)
+	if (activeId === tab.id) {
+		activeId = tab.deviceId !== undefined && tabs.has(tab.deviceId) ? tab.deviceId : LOCAL_ID
+	}
+	publish()
 }
 
 /**
@@ -510,6 +858,73 @@ function abandoned(tab, attempt) {
 }
 
 /**
+ * Empty one Harness tab's guest session before it is given a new Harness to show.
+ *
+ * **The cookie is per connection, so the jar is reset per connection.** The cookie
+ * `dsh web` mints names the authority — `host:port` — of the process that minted it,
+ * and the next connect starts a *new* process on a *new* port, so every cookie left
+ * in this tab's session by the previous connection is already dead. `guestPartition`
+ * keeps that session private to the tab; this is what keeps it bounded: a tab
+ * carries at most the one cookie its current connection set, however many times the
+ * operator restarts it, and the Cookie header can never grow with the application's
+ * history again.
+ *
+ * **It is not a shared cleanup, which is why it is safe.** Every Harness tab has a
+ * partition of its own, so this cannot sign out a tab somebody is using — the other
+ * half of why the fix was not "delete stale cookies from the default session".
+ *
+ * @param partition - the tab's session partition.
+ */
+async function clearGuestSession(partition) {
+	// A stub Electron — the offline suites, and node mode before the diagnosis
+	// fires — has no session module. Nothing in a connect depends on the clear.
+	if (session === undefined) return
+	try {
+		await session.fromPartition(partition).clearStorageData({ storages: ['cookies'] })
+	} catch {
+		/* A guard, not a step: the guest still starts in a session of its own, and a
+		   clear that was refused only means the previous connection's cookie is still
+		   there. The connect must not fail over housekeeping. */
+	}
+}
+
+/**
+ * Remove the authentication cookies earlier builds left in the window's own session.
+ *
+ * **This is history, not a live path.** Before guests had partitions they all ran in
+ * the default, persistent session, so its jar grew with every Harness that had ever
+ * been opened — 70 cookies and 15,750 bytes on this machine on 2026-11-21, which is
+ * what produced the `431` blank windows. Nothing reads that jar any more, but the
+ * cookies are still in the operator's profile, and removing them at boot is what
+ * makes it healthy rather than merely unused: a build that predates `guestPartition`
+ * is one launch away from a regression, and anything else that ever attaches a
+ * guest without one would inherit the same jar.
+ *
+ * Only the `dsh-auth-` cookies are touched, each removed on its own, and a failure is
+ * not fatal: this is housekeeping that must never be able to stop the local Harness
+ * from coming up.
+ */
+async function clearLegacyGuestCookies() {
+	if (session === undefined) return
+	try {
+		const stored = await session.defaultSession.cookies.get({})
+		for (const cookie of stored) {
+			if (!cookie.name.startsWith(AUTH_COOKIE_PREFIX)) continue
+			const host = String(cookie.domain ?? '').replace(/^\./u, '')
+			if (host === '') continue
+			const path = cookie.path === undefined || cookie.path === '' ? '/' : cookie.path
+			try {
+				await session.defaultSession.cookies.remove(`${cookie.secure === true ? 'https' : 'http'}://${host}${path}`, cookie.name)
+			} catch {
+				/* One cookie that refuses to go is not worth failing the boot for. */
+			}
+		}
+	} catch {
+		/* A session module that cannot be read is a build this does not apply to. */
+	}
+}
+
+/**
  * Bring a tab to the front, and start nothing.
  *
  * **Selecting a tab is not asking for a connection.** A device tab is a configured
@@ -548,6 +963,13 @@ function select(id) {
 async function activate(id) {
 	const tab = tabs.get(id)
 	if (tab === undefined) return
+	// A terminal's "activate" is its start: the tab exists because the operator
+	// asked for a session, and re-entering it from the panel or Alt+digit is the
+	// same request. Its state machine has no connect result to wait on.
+	if (tab.kind === 'terminal') {
+		await activateTerminal(tab)
+		return
+	}
 	activeId = id
 	publish()
 	if (tab.state === 'running' || tab.state === 'starting') return
@@ -628,12 +1050,22 @@ async function activate(id) {
 	const signal = controller.signal
 
 	try {
+		// **The guest's session is emptied before the Harness it will show is
+		// started.** The auth cookie a `dsh web` mints names the authority of *its own*
+		// process (`host:port`), so after a restart every cookie this tab's session
+		// holds belongs to a connection that is already gone. Clearing first is what
+		// keeps the tab's Cookie header at one cookie instead of one per restart — see
+		// `clearGuestSession` and `GUEST_PARTITION_PREFIX` for the failure that came of
+		// not doing it.
+		await clearGuestSession(guestPartition(tab.id))
+		if (abandoned(tab, attempt)) return
+
 		/** @type {{url?: string, error?: string} & Record<string, unknown>} */
 		let result
 		if (tab.kind === 'local') {
-			// No `await` before the connect here, so there is no window to check: the
-			// local tab's own launch directory is not a device field, and the book is
-			// not read for it at all.
+			// The local tab's own launch directory is not a device field, and the book
+			// is not read for it at all: after the session clear above there is nothing
+			// between here and the spawn that could change the operator's mind.
 			result = await runConnect((onChild) =>
 				connect.connectLocal({
 					signal,
@@ -774,6 +1206,12 @@ function tabFor(device) {
 	const existing = tabs.get(device.id)
 	if (existing !== undefined) {
 		existing.label = device.label
+		// A rename reaches the terminal tab too, or the bar keeps the old name on a
+		// session the operator just opened from the renamed row.
+		const terminalTab = tabs.get(terminalTabId(device.id))
+		if (terminalTab !== undefined && terminalTab.kind === 'terminal') {
+			terminalTab.label = `${device.label} — terminal`
+		}
 		return existing
 	}
 	const created = {
@@ -1095,6 +1533,13 @@ function installIpc() {
 		if (key === LOCAL_ID) return snapshot()
 		const tab = tabs.get(key)
 		if (tab !== undefined) {
+			// A terminal's `×` is a close: the tab is a session, not a device, and
+			// there is nothing left to show after its shell has gone. A Harness tab
+			// keeps its place in the bar because the device is configured.
+			if (tab.kind === 'terminal') {
+				closeTerminalTab(tab)
+				return snapshot()
+			}
 			stopTab(tab)
 			publish()
 		}
@@ -1106,7 +1551,13 @@ function installIpc() {
 		// and the renderer draws whatever state it is in when this resolves — so a
 		// restart that failed is on screen as a failure rather than as a tab that
 		// looks like it is still coming up.
-		await restartTab(String(id))
+		const key = String(id)
+		const tab = tabs.get(key)
+		if (tab !== undefined && tab.kind === 'terminal') {
+			await restartTerminal(tab)
+			return snapshot()
+		}
+		await restartTab(key)
 		return snapshot()
 	})
 	ipcMain.handle('devices:list', async () => {
@@ -1162,6 +1613,11 @@ function installIpc() {
 		// the local tab and tearing the local Harness down with it, which is a state
 		// nothing recreates: `ensureLocal` runs once, at boot.
 		if (RESERVED_IDS.includes(key)) return { devices: await devices.load() }
+		// A terminal tab belongs to the device and would otherwise outlive it: the
+		// label would name a machine that is no longer in the book, and the ssh
+		// client would keep running with nothing left that could name it.
+		const terminalTab = tabs.get(terminalTabId(key))
+		if (terminalTab !== undefined) closeTerminalTab(terminalTab)
 		const tab = tabs.get(key)
 		if (tab !== undefined) {
 			// Before the tab leaves the map, which is what makes the connect in flight
@@ -1178,6 +1634,43 @@ function installIpc() {
 	ipcMain.handle('devices:transcript', (_event, id) => {
 		const tab = tabs.get(String(id))
 		return { lines: tab === undefined ? [] : tab.lines }
+	})
+	// Opening a terminal is a deliberate request, unlike selecting a tab: the
+	// operator pressed a control that says Terminal, so the session starts.
+	ipcMain.handle('terminal:open', async (_event, deviceId) => {
+		await openTerminal(String(deviceId))
+		return snapshot()
+	})
+	// The renderer has an xterm for this tab and is ready to draw. Until this
+	// arrives the session holds its output, because the first thing a failing ssh
+	// prints is the reason, and it prints it inside this window.
+	ipcMain.handle('terminal:attach', (_event, id) => {
+		const tab = tabs.get(String(id))
+		if (tab === undefined || tab.kind !== 'terminal') return
+		tab.attachRequested = true
+		tab.terminal?.attach()
+	})
+	// Keystrokes and sizes are hot: `invoke` would put a promise on every key. The
+	// two channels are one-way and the handler validates what it accepts, so a
+	// renderer bug cannot reach a pty with a value it did not expect.
+	ipcMain.on('terminal:input', (_event, id, data) => {
+		const tab = tabs.get(String(id))
+		if (tab === undefined || tab.kind !== 'terminal' || typeof data !== 'string') return
+		if (data.length > 1_000_000) return
+		tab.terminal?.write(data)
+	})
+	ipcMain.on('terminal:resize', (_event, id, cols, rows) => {
+		const tab = tabs.get(String(id))
+		if (tab === undefined || tab.kind !== 'terminal') return
+		tab.terminal?.resize(Number(cols), Number(rows))
+	})
+	// The clipboard belongs to the main process. `clipboard` is not among the
+	// modules a preload gets from `require('electron')`, so exposing it from there
+	// was a runtime `undefined` that only a click could find; the preload asks here
+	// instead, and the renderer's calls are promises.
+	ipcMain.handle('clipboard:read', () => clipboard.readText())
+	ipcMain.handle('clipboard:write', (_event, text) => {
+		clipboard.writeText(String(text ?? ''))
 	})
 	ipcMain.handle('updates:check', async () => {
 		await checkForUpdates(false)
@@ -1201,6 +1694,11 @@ ensureLocal()
 void app
 	.whenReady()
 	.then(async () => {
+		// The session jar that earlier builds grew belongs to no guest any more; it is
+		// removed before the window exists so the first Harness tab starts on a clean
+		// profile rather than beside a 15 KB Cookie header. See
+		// `clearLegacyGuestCookies`.
+		await clearLegacyGuestCookies()
 		createWindow()
 		// The local Harness is what the operator opens the app for, so it comes up
 		// without being asked. A remote device waits to be selected.
