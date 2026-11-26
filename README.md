@@ -46,6 +46,9 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 - **A terminal tab** runs `ssh -tt` on a local pseudo-terminal, so a device can be
   used as an interactive shell as well as a Harness: the window's size reaches the far
   side, and `Ctrl+C` and full-screen programs behave as they do in a terminal.
+- **A local terminal tab** runs a shell, or a coding agent such as `pi` or
+  `opencode`, on this machine. It is the same pty and the same xterm as a device
+  terminal; what is missing is ssh, the device record and the network.
 - **Teardown closes stdin**, which is what the remote program blocks on, so the far
   side's server is reaped rather than left holding its port.
 
@@ -63,7 +66,9 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
 | **Selecting is not connecting** | A tab that is not up stays down when it is selected; its panel offers **Connect**, so moving around the bar never starts a Harness on a machine nobody asked to use. |
 | **A terminal per device** | `+` → the device row → **Terminal** opens an interactive shell over the same ssh, on a real pty: the account's login shell on POSIX, PowerShell 7 (falling back to Windows PowerShell) on Windows. Resizing the window resizes the far-side terminal, and `Ctrl+C`, `vim` and a full-screen prompt behave as they do in a terminal. |
+| **This machine's own shell and agents** | `+` → **On this machine** opens a local shell, or a coding agent (`pi`, `opencode`) in a project folder you pick. The programs are resolved on `PATH` when the popover is drawn, so a missing one is a disabled button that says why, and a tab that starts anyway fails with the sentence its resolver produced. |
 | **One instance, and a `--version` that answers** | A packaged Electron binary has no version flag of its own, so `dsh-tabs --version` used to come up as a second window *with a second local Harness*; it now prints and exits, and a second launch hands its window forward instead of starting another Harness. |
+| **A host that outlives the connection** | Turn **Persistent** on for a device and its Harness keeps running when the tab closes, the window quits or the network drops. The next connection adopts that same process instead of starting a second one, so the Sessions it holds — every Session in that DSH home — are the ones you left, and a lost tunnel reconnects on its own. **Stop host** (`■`) is the one control that ends it. |
 
 ## Requirements
 
@@ -132,6 +137,11 @@ installed by hand; only the versions that contain the updater can update themsel
   the transcript on screen with a **Reconnect** button. `Ctrl+Shift+C` and
   `Ctrl+Shift+V` copy and paste; right-click copies a selection, or pastes when there
   is none.
+- **On this machine** in the `+` popover opens a local tab with no device involved:
+  **Shell** starts in your home directory, and **pi** or **opencode** asks for a
+  project folder first and starts the agent there. They are terminal tabs like any
+  other — `×` ends the session, `⟲` reconnects in the same folder, and `Alt+digit`
+  reaches them from anywhere.
 - **Launching it again does not start a second one.** `dsh-tabs --version` prints the
   version and exits; any other second launch brings the existing window forward,
   because a second copy would be a second local Harness nobody can see.
@@ -203,6 +213,8 @@ each section is a decision that cost something to learn.
 - **终端标签页**：通过同一条 SSH 打开一个真正的交互式终端（pty）：POSIX 是账号的登录
   shell，Windows 优先 PowerShell 7、没有就退回 Windows PowerShell。窗口缩放会同步到远端，
   `Ctrl+C`、`vim` 和全屏提示符都按终端的方式工作。
+- **本机终端标签页**：不开 SSH，直接在本机跑 shell 或 coding agent（`pi`、`opencode`）：
+  同一个 pty、同一个 xterm，少的是 ssh、设备记录和网络。
 
 ## 功能
 
@@ -216,6 +228,7 @@ each section is a decision that cost something to learn.
 | **失败能读懂** | 连接失败会引用对端自己的原话，包括 Windows 主机上 PowerShell 产生的 CLIXML 错误流。 |
 | **版本下限会自己说话** | 本地标签页启动前，`src/localdsh.js` 先查 `dsh --version`；CLI 太旧会直接报名，而不是 45 秒后变成一个凭据错误。 |
 | **每台设备一个终端** | `+` → 设备行 → **Terminal**，用同一条 SSH 打开交互式 shell：POSIX 用登录 shell，Windows 优先 PowerShell 7、退回 Windows PowerShell。窗口缩放会改变远端终端尺寸，`Ctrl+C`、`vim` 和全屏程序都正常。 |
+| **本机自己的 shell 和 agent** | `+` → **On this machine** 打开本地 shell，或在选定的项目目录里跑 `pi` / `opencode`。程序在弹出面板绘制时就从 `PATH` 解析好，没装的是带原因的禁用按钮；真启动失败时，标签页上留着解析器给的原话。 |
 
 ## 环境要求
 
@@ -260,6 +273,10 @@ release CDN 不可达时设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `m
   在远端输入 `exit` 则保留输出并给出 **Reconnect**。`Ctrl+Shift+C/V` 复制粘贴；右键在有
   选中内容时复制、没有时粘贴。终端和 Harness 标签一样只支持密钥登录，从登录 shell 的家目录
   开始，不吃设备的 `directory` 字段。
+- **On this machine** 在 `+` 面板顶部：**Shell** 从家目录开一个本地终端；**pi** / **opencode**
+  会先让你选项目目录，再从那个目录启动。它们就是普通终端标签页：`×` 结束会话，`⟲` 在同一个
+  目录重连，`Alt+数字` 照样能切过去。重连是**新进程**，不是续接对话 —— 会话记录在 agent
+  自己那里，用 `pi --continue`（或它的 `/resume`）接回来。
 
 ## 文档
 
@@ -666,6 +683,150 @@ is passed with `-EncodedCommand` (base64 UTF-16LE), which is the only quoting
 strategy that survives ssh joining its argv, the remote's `cmd.exe`, and a script
 full of characters cmd would otherwise eat.
 
+One consequence of the watchdog is worth knowing before reading the next
+section: the program spends its first **60 seconds** in the "did the child
+exit?" loop and only then starts watching stdin. A connect that dies inside that
+window is therefore torn down late rather than immediately (measured: the launch
+exits at the end of the window, not at the moment stdin closes), which is
+harmless — the pipe is already at EOF by then — and is not what the record below
+is about.
+
+### A launch that outlived its own connection
+
+The stdin contract fires when the connection **ends**. It cannot fire while the
+connection still exists, and sshd has no idle timeout of its own — so a client
+that goes away without ending it (an app killed in the background, a Wi-Fi drop
+with no FIN) can leave a Harness running on the far side with no client anywhere
+that knows it exists. On POSIX that was measured to reap anyway; on Windows it
+was written down in the sibling repository as a known leak with "minutes later"
+as its symptom, and the two ended up mattering together:
+
+> 2026-11-25, `box-a`, from the tablet. A Harness started by the 18:35 connection
+> was still serving at 20:42, four minutes after the same tablet had reconnected at
+> 20:41 on a new port. Every Session it had open stayed unopenable in the new
+> window: DSH gives a Session **one writer**, the older Harness held the kernel
+> lease on each, and the attempt failed with `session/writer-held` — the UI's
+> "当前会话已被占用，可能是其他正在运行的 DSH 导致的…". Nothing was wrong with
+> the Sessions; they were held by a process nobody could see.
+
+Two Harnesses over one DSH home can never share those leases, so the useful
+states are "one" and "none" — and the only place that can enforce that is the
+**next launch**, because it is the first thing to arrive after the leak. So the
+Windows program now records what it started and reaps that record before it
+starts anything:
+
+- the record is `%LOCALAPPDATA%\dsh-tabs\remote-harness.json`, written right after
+  `Start-Process` returns (a failure to write it is swallowed — refusing a launch
+  over bookkeeping would leak the very Harness the bookkeeping exists to find);
+- it holds both `sup` (the launcher's own `$PID`) and `pid` (the Harness), because
+  the supervisor is the ancestor `taskkill /T` can walk and a supervisor whose
+  connection never ended otherwise waits on stdin for ever — the incident left two
+  of them;
+- a pid is not evidence on its own, so each is killed only while it still carries
+  the identity this launcher gave it: a `powershell.exe` running `-EncodedCommand`,
+  or a `node.exe` whose command line carries ` web --no-open --port 0`. A recycled
+  pid, an operator's own `dsh web`, and the local tab's Harness are all out of
+  reach;
+- the launch that wrote the record removes it in its own teardown, so an ordinary
+  quit never leaves the next launch something to kill.
+
+Verified end to end against a fake shim and a fake `bin.js`, so no real DSH home
+was involved: two launches that never see EOF, the second reaps both processes of
+the first, takes the record over, and cleans up after itself; and a normal launch
+torn down by stdin EOF removes the record and its Harness. What the mechanism
+cannot do is stop a *live* second client: two windows open at the same time on one
+far-side home still cannot share Session leases, and the newer launch wins. That
+is the same rule as before, now with a repair instead of a manual cleanup.
+
+The `dsh-remote-devices` plugin is the normative copy of these builders and was
+not on this machine when the change was made, so `tools/smoke.mjs`'s
+byte-identity check against it is one of the two checks it reports as **skipped**.
+The same statements have to be carried into the plugin the next time it is
+touched, or that check will fail on a machine that has it.
+
+## Persistent hosts
+
+A device can be marked **Persistent** in the popover. The ordinary connect is
+built around the opposite promise: the far-side `dsh web` is a child of the ssh
+session and is reaped by that session's stdin, because an orphan holding a remote
+port is the failure this application exists to avoid. Persistent mode flips that
+for one device, deliberately, and the cost is paid elsewhere — in a record, an
+adoption rule and a visible stop control.
+
+**The unit is the host, not a Session.** Everything in one DSH home lives in one
+Harness process, so one switch makes every Session in that home persistent, and
+there is no per-Session granularity to offer: two Harnesses over one home cannot
+share a Session's write lease, so "one host" and "none" are the only useful
+states.
+
+### Adoption, not takeover
+
+The lease a Session holds is a kernel object with **no expiry** — DSH's own
+`session-persistence-jsonl/src/lease.ts` says a live but wedged holder keeps it
+until its process exits, on purpose, because expropriating a stalled writer tears
+the log. So nothing here steals a Session. Instead:
+
+- a host writes `~/.dsh/dsh-tabs/host.json` (or under `DSH_HOME` when the device
+  names one) with `{version, pid, port, token, started}`;
+- a connect **adopts** a recorded host whose pid is alive, whose command line still
+  says `dsh … web`, and whose port accepts a connection — three facts, because a
+  pid is recycled and a port can belong to something else;
+- adoption prints the URL from the record, so a reconnect needs no log, no new
+  token and no process;
+- one `ensure.lock` directory serialises probe-and-start, so two clients that both
+  see "no host" cannot both start one. The loser adopts the winner's.
+
+The record holds a launch token, which trades for a browser cookie, so it is
+written `0600` on POSIX.
+
+### Starting it
+
+- **POSIX**: `nohup dsh web --no-open --port 0 </dev/null >>log 2>&1 &`. `nohup`
+  execs, so `$!` is the Harness's own pid; `setsid` was rejected because it forks
+  when its caller leads a process group and the pid it leaves behind is then not
+  the Harness's.
+- **Windows**: a generated `start-host.cmd` created by `Invoke-CimMethod
+  Win32_Process Create`. The created process has a `WmiPrvSE.exe` parent rather
+  than sshd's PowerShell, so no part of the ssh session owns it — measured on
+  2026-11-26: the `dsh web` kept serving after its creator exited, with the chain
+  `node → cmd → WmiPrvSE.exe`. The `.cmd` file is not tidiness either: the inline
+  form `cmd /c ""set "X=…" && …""` is parsed wrong and reports
+  `'"set "PROBE_INLINE' is not recognized`.
+
+Readiness is read from `~/.dsh/dsh-tabs/host.log` — a detached process has no
+stdout to watch — and a cold start on a fresh home announced in **6.6 s / 6.9 s**.
+
+### The page, and why the port is fixed
+
+A persistent device gets a **stable local forward port** (41000–41999, derived
+from its id). The origin is what the browser keys everything by: the auth cookie
+is named `dsh-auth-<host:port>` and signed by a secret persisted in the DSH
+credentials, so on a fixed authority a cookie minted by an earlier process is
+still accepted by a later one — measured: a restart of the host on the same port
+answered `200` to the previous process's cookie, with no token. The page's own
+`dsh.sessions.current` lives in the same origin's storage, which is what makes a
+reconnect land back in the same Session without a deep link.
+
+That is also why a persistent tab's guest is **not** destroyed when its tunnel
+drops: `state: 'detached'` keeps the element, the URL and the partition, and the
+page's own transport retries (500 ms → 10 s) heal it when the port comes back.
+The `×` on such a tab means "let go", and its title says so; quitting detaches
+every persistent tab. **Stop host** (`■`, and the banner while detached) runs the
+stop program: kill the recorded pid, remove the record.
+
+### What it deliberately does not do
+
+- **No watchdog.** A host that dies stays dead until the next connect starts one;
+  the Session log is still on disk, so the history is there and the interrupted
+  turn is marked as such.
+- **No stealing.** A host started by hand (`dsh web` typed into a shell) has no
+  record, so it is invisible to this application. POSIX can name the lease holder
+  from `/proc/<pid>/fd`; Windows cannot map a named kernel semaphore back to a pid,
+  so there it can only be reported as occupied.
+- **No second host per home.** If a device and the local tab point at the same
+  machine and home, they will fight for the same leases; the local tab is started
+  by the application at boot and is not adoptable.
+
 ## Terminals
 
 A device can also be opened as an interactive shell: **`+` → the device row →
@@ -720,6 +881,55 @@ once, before the interactive shell starts, and cannot be re-entered.
 POSIX takes the opposite approach on purpose: **no command at all**. ssh then starts
 the account's login shell, which is the literal thing the operator would have got.
 `terminalCommand` has no POSIX branch for that reason.
+
+### This machine, with no ssh at all
+
+The same module also opens programs locally: **`+` → On this machine → Shell / pi /
+opencode**. Nothing about the pty or the emulator changes — a local tab is the same
+`spawnSession` with a different `file` — and every difference is in how the program is
+found and where it starts:
+
+- **Resolution is on `PATH`, when the popover is drawn, and the answer is an absolute
+  path.** That is not tidiness: ConPTY does **not** search `PATH` the way a shell does.
+  Measured while this was written: `pty.spawn('pwsh', …)` throws `File not found:`,
+  while the same call with the absolute `C:\Program Files\PowerShell\7\pwsh.exe`
+  starts. (`ssh` never showed this because `connect.sshExecutable` resolves it first.)
+  The same resolution fills the popover: `listPresets()` answers `available: false`
+  with the reason, so a missing agent is a disabled button rather than a folder chooser
+  that could only end in a failure.
+- **A `.cmd` file is not an executable.** `pi` and `opencode` install as `.cmd` shims
+  on Windows, which `CreateProcess` cannot run; the resolved shim is handed to
+  `cmd.exe /d /s /c`. No quoting is added, because node-pty quotes each argv element
+  itself — the first attempt at quoting around it produced
+  `'\"<root>\pi.cmd\"' is not recognized`, measured, which is why the path is passed
+  bare.
+- **The directory is a property of the spawn, not a `cd`.** ConPTY honours `cwd` and
+  `env` (measured: a child asked for `<root>\project`, with a variable set only in the
+  spawn options, saw both), so `pi` starts in the project the operator picked and its
+  first prompt is already there. **Shell** starts in the home directory; the other two
+  ask for a folder, defaulting to the last one chosen **in this run** — a project from
+  last month is a worse default than home.
+- **A local tab is still a session, not a configured thing.** `⟲` starts a new
+  generation in the same folder, `×` ends the process and removes the tab, and the
+  label carries the folder (`pi — dsh-workspace`) because two agents in two projects
+  are two conversations, not two identical tabs.
+
+The resolution uses the `PATH` this application was started with. A Windows shortcut
+inherits the user's environment and finds npm's and Pi's shims; a macOS or Linux
+desktop launcher can start with a shorter `PATH` than a login shell, and a preset then
+shows up disabled with that reason — start the application from a shell, or fix
+`PATH` in the launcher, to make it available.
+
+A **device** can already run an agent the same way: open its **Terminal** and type
+`pi` there, if the far side has it installed. What a local tab adds is the button, the
+folder chooser, and a `⟲` that reconnects to the same project without retyping
+anything — the tool is the same process either way.
+
+A reconnect is a **new process**, not a resumed conversation: the agent's own session
+store still holds the transcript, so `pi --continue` (or its `/resume`) is how the
+conversation comes back. The tab deliberately does not choose a session for the agent —
+guessing "the most recent in this folder" could hand the operator somebody else's
+conversation, and the agent already has a command for the question.
 
 ### The first thing a failing ssh prints has nowhere to go yet
 
@@ -1403,9 +1613,19 @@ unset without `-Wait`, and `WaitForExit()` and `Refresh()` do not fill it in eit
 npm test                              # every offline suite
 npm run test:live                     # against a real device, no window
 npm run test:live -- <device-id>      # pick one from the book
+npm run test:persistent -- <device-id>  # a real host started, adopted, and stopped
 npm run contract -- --check           # fail if docs/contract.json is stale
 npm run readiness                     # start a real local dsh web, time it, stop it
 ```
+
+**`test:persistent` is the one check the offline suites cannot make**, and the one
+the mode is named for: it starts a real Harness on a real machine through
+`src/connect.js`, lets go of the tunnel, connects again and asserts that the same
+pid, port and token were adopted, then stops it. It uses a scratch DSH home on the
+far side (`/tmp/dsh-tabs-live`; a Windows device needs `--home`), so the device's
+own Sessions are not touched. Measured against a real Linux host on 2026-11-26:
+`HOST started pid=858839` → `HOST adopted pid=858839` on the same local port →
+`HOST stopped pid=858839`.
 
 `npm test` runs five suites, each aimed at a layer that can be exercised without a
 window:
@@ -1414,17 +1634,18 @@ window:
 | --- | --- | --- |
 | `test:smoke` | the source, the builders' output, and this document | drift, platform rules, byte-parity with the plugin, the protocol contract, and the runbook's own claims |
 | `test:connect` | `src/connect.js` | port allocation, the readiness reader, tunnel probing |
-| `test:terminal` | `src/terminal.js` against a fake pty | the ssh argv, the buffer before attach, clamped input and size, and the Windows command's encoding |
-| `test:main` | `src/main.js` against a stubbed Electron | the tab lifecycle and **the `Alt+digit` routing** |
-| `test:renderer` | `src/renderer/app.js` in jsdom | the tab bar, guest reuse, panels, terminal views, and the IPC calls it makes |
+| `test:terminal` | `src/terminal.js` against a fake pty | the ssh argv, the local presets' resolution, the buffer before attach, clamped input and size, and the Windows command's encoding |
+| `test:main` | `src/main.js` against a stubbed Electron | the tab lifecycle, the local tabs' folder and reconnect rules, and **the `Alt+digit` routing** |
+| `test:renderer` | `src/renderer/app.js` in jsdom | the tab bar, guest reuse, panels, terminal views, the local preset buttons, and the IPC calls it makes |
 
 **`test:terminal` is about the parts a real device cannot be asked about offline.**
 The pty is not the risk — `node-pty` has its own suite — and neither is xterm. What is
-ours is the argv that reaches ssh, the environment the far side inherits, and the window
-between "the pty exists" and "the renderer has a screen": a fake pty makes all three
-observable, including the buffer releasing in order and the caps on what a renderer can
-ask a pty to swallow. The real pty is exercised by running the application; the
-`stty size` measurement in [Terminals](#terminals) is what that check looks like.
+ours is the argv that reaches ssh, the program and directory a local preset resolves
+to, the environment the child inherits, and the window between "the pty exists" and
+"the renderer has a screen": a fake pty makes all of them observable, including the
+buffer releasing in order and the caps on what a renderer can ask a pty to swallow. The
+real pty is exercised by running the application; the `stty size` measurement in
+[Terminals](#terminals) is what that check looks like.
 
 **`test:main` drives a connect that has not finished, which is the state the suite
 could not describe before.** The stub used to answer before the code under test

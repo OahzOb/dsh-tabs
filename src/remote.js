@@ -201,7 +201,7 @@ function windowsResolve() {
  * would happen on a Windows remote, where nothing would ever notice a server
  * still holding its port.
  *
- * **Two additions, both paid for by the Android client**, which is why this is
+ * **Three additions, all paid for with a real failure**, which is why this is
  * longer than the launcher it wraps:
  *
  * 1. **The interpreter and the script are resolved and logged.** Finding the shim
@@ -216,6 +216,14 @@ function windowsResolve() {
  *    finishes nor fails. Measured on the Android side: `Start-Process` on a
  *    `dsh.cmd` that could not resolve its profile left no process behind and
  *    printed nothing at all.
+ * 3. **A previous launch is reaped before this one starts.** The stdin contract
+ *    above only fires when the connection ends; a client that goes away without
+ *    ending it leaves a Harness that outlives every later connection and keeps the
+ *    Sessions' write leases, which the next window cannot open
+ *    (`session/writer-held`). Measured on a real Windows remote on 2026-11-25: four
+ *    minutes of exactly that, after the same tablet had already reconnected. A
+ *    launch now records what it started and the next launch kills that record, so
+ *    the leak is repaired by the next connect instead of by hand.
  *
  * The watchdog's message prints an **empty exit code**, which reads like a bug in
  * the message: `Start-Process -PassThru` leaves `$proc.ExitCode` unset unless it is
@@ -269,6 +277,35 @@ function windowsProgram(device) {
 		// launcher is about to run `FALLBACK <script>`, which is a command-not-found
 		// dressed up as a launch. Said out loud, with where it looked.
 		"if ($node -eq 'FALLBACK') { [Console]::Error.WriteLine(\"no node.exe on this Windows host: looked in $shimDir, $env:ProgramFiles\\nodejs and on PATH\"); exit 127 }",
+		// **A launch that outlives its client is only visible at the next launch, so the
+		// next launch is what has to repair it.**
+		//
+		// The stdin contract below is deterministic in the ordinary case (probed on this
+		// machine: EOF arrives, the tree is killed, the supervisor exits), but it only
+		// fires when the *connection* ends. Measured on a real Windows remote on
+		// 2026-11-25: a Harness started by the tablet's earlier connection was still
+		// serving and still held its Sessions' write leases four minutes after the
+		// operator had reconnected from the same device, and DSH gives a Session one
+		// writer, so every attempt to open those Sessions in the new window failed with
+		// `session/writer-held` — the UI's "当前会话已被占用，可能是其他正在运行的 DSH
+		// 导致的…". Two Harnesses over one DSH home can never share those leases, so the
+		// only useful states are "one" and "none".
+		//
+		// So the launch records what it started and the next launch reaps that record
+		// before starting anything: the leak becomes a self-healing state at the next
+		// connect instead of a machine somebody has to fix by hand. The record holds the
+		// **supervisor's** pid as well as the Harness's, because the supervisor is the
+		// ancestor that `taskkill /T` can walk, and a supervisor whose connection never
+		// ended is otherwise left waiting on stdin for ever — today's leak was two of
+		// them.
+		//
+		// A pid on its own is not evidence: each one is killed only while it still
+		// carries the identity this launcher gave it (a `powershell.exe` running
+		// `-EncodedCommand`, or a `node.exe` running this exact argv), so a recycled pid
+		// can never take an unrelated process — or an operator's own `dsh web` — with it.
+		'$mroot = $env:LOCALAPPDATA; if ([string]::IsNullOrEmpty($mroot)) { $mroot = $env:TEMP }',
+		"$marker = Join-Path $mroot 'dsh-tabs\\remote-harness.json'",
+		'if (Test-Path -LiteralPath $marker) { $old = $null; try { $old = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { }; if ($null -ne $old) { $hp = $null; $sp = $null; if ($null -ne $old.pid) { try { $hp = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)" } catch { } }; if ($null -ne $old.sup) { try { $sp = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.sup)" } catch { } }; if ($null -ne $hp -and $hp.Name -eq \'node.exe\' -and $hp.CommandLine -and $hp.CommandLine.Contains(\' web --no-open --port 0\')) { taskkill /PID $hp.ProcessId /T /F 2>&1 | Out-Null; [Console]::Error.WriteLine("launch reaped harness=$($hp.ProcessId)") }; if ($null -ne $sp -and $sp.Name -eq \'powershell.exe\' -and $sp.CommandLine -and $sp.CommandLine.Contains(\'-EncodedCommand\')) { taskkill /PID $sp.ProcessId /T /F 2>&1 | Out-Null; [Console]::Error.WriteLine("launch reaped supervisor=$($sp.ProcessId)") } }; Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }',
 		...(directory === ''
 			? []
 			: [
@@ -298,9 +335,14 @@ function windowsProgram(device) {
 		'[Console]::Error.WriteLine("launch script=$binJs exists=$(Test-Path -LiteralPath $binJs)")',
 		'[Console]::Error.WriteLine("launch cwd=$((Get-Location).Path)")',
 		'$proc = Start-Process -FilePath $node -ArgumentList $argv -NoNewWindow -PassThru',
+		// The record is written as soon as the process exists and before anything else
+		// can fail, because it is what makes the launch findable if the teardown below
+		// never runs. A failure to write it is swallowed: refusing a launch over its
+		// bookkeeping would leak exactly the Harness the bookkeeping exists to catch.
+		'try { New-Item -ItemType Directory -Path (Split-Path -Parent $marker) -Force | Out-Null; @{ sup = $PID; pid = $proc.Id; started = (Get-Date).ToString(\'o\'); node = $node; binJs = $binJs; cwd = (Get-Location).Path } | ConvertTo-Json -Compress | Set-Content -LiteralPath $marker -Encoding UTF8 } catch { }',
 		'$sw = [Diagnostics.Stopwatch]::StartNew()',
 		'while ($sw.Elapsed.TotalSeconds -lt 60) { if ($proc.HasExited) { [Console]::Error.WriteLine("dsh exited with code $($proc.ExitCode) before announcing a URL"); break }; Start-Sleep -Milliseconds 500 }',
-		'try { [Console]::In.ReadToEnd() | Out-Null } finally { if ($null -ne $proc -and -not $proc.HasExited) { taskkill /PID $proc.Id /T /F 2>&1 | Out-Null } }'
+		'try { [Console]::In.ReadToEnd() | Out-Null } finally { if ($null -ne $proc -and -not $proc.HasExited) { taskkill /PID $proc.Id /T /F 2>&1 | Out-Null }; $mine = $null; try { $mine = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { }; if ($null -ne $mine -and $mine.sup -eq $PID) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue } }'
 	]
 	return parts.join('; ')
 }
@@ -495,12 +537,388 @@ function localDshArgv(platform = process.platform, directory) {
 	return ['bash', '-lic', posixProgram(pseudo)]
 }
 
+/**
+ * The persistent-host protocol: what a far side runs so that its Harness
+ * outlives the ssh connection, and how a later connection finds it again.
+ *
+ * **The problem it solves.** Everything above tears a Harness down with the
+ * connection, on purpose: the stdin contract is what stops an orphan holding the
+ * remote port. That is the right ownership when the operator is watching a tab,
+ * and the wrong one when the operator wants a Session to keep working after the
+ * laptop sleeps. A persistent host is the same `dsh web --no-open --port 0`, but
+ * started so that no part of the ssh session owns it, and recorded so the next
+ * connection can adopt it instead of starting a second one.
+ *
+ * **Two processes over one DSH home cannot share Session write leases**, so the
+ * useful states are "one" and "none" (see `teardown.staleLaunch` in
+ * `docs/contract.json`). Adoption is therefore not a convenience: it is what
+ * keeps two clients from producing the `session/writer-held` that a leaked
+ * launch produced on 2026-11-25.
+ *
+ * **What each side is responsible for.**
+ * - The *ensure* program: adopt a live host recorded in this home, or start one
+ *   detached and wait for its readiness line. It prints `HOST adopted …` or
+ *   `HOST started …` and then the readiness line itself, so a client parses the
+ *   same line it always has.
+ * - The *stop* program: kill the recorded host and remove the record. Only ever
+ *   run on an explicit operator action.
+ * - The *client*: parse those two lines, then open the tunnel exactly as before.
+ *
+ * **Why `nohup` and not `setsid` on POSIX.** `setsid` is the textbook detach, but
+ * it forks when its caller is a process-group leader, so the pid it leaves behind
+ * is not reliably the Harness's. `nohup … &` execs the target, so `$!` is the
+ * real pid — and nohup already covers the SIGHUP. This project has also measured
+ * that a POSIX child survives the client being killed (`posixProgram`'s comment),
+ * so the signal was never the load-bearing part.
+ *
+ * **Why WMI on Windows.** A `Start-Process` inside the ssh session is a child of
+ * sshd's PowerShell; whether the session teardown reaches it was never measured.
+ * `Win32_Process.Create` gives the process a parent of `WmiPrvSE.exe` instead, so
+ * there is nothing for the session to reach. Measured on 2026-11-26: the created
+ * `dsh web` served normally after its creator exited.
+ */
+
+/** The directory, inside the far side's DSH home, that holds the host record. */
+const HOST_DIR = 'dsh-tabs'
+
+/** The record one persistent host leaves for the next connection. */
+const HOST_RECORD_FILE = 'host.json'
+
+/** The log the detached Harness writes; the readiness line is read from it. */
+const HOST_LOG_FILE = 'host.log'
+
+/** The generated launcher a Windows host is started through. */
+const HOST_LAUNCHER_FILE = 'start-host.cmd'
+
+/** Serialisation version of the record, so a client can refuse a future one. */
+const HOST_RECORD_VERSION = 1
+
+/**
+ * How long a detached Harness may take to announce its URL.
+ *
+ * Longer than `START_TIMEOUT_MS` on purpose: a first start on a cold machine
+ * writes a profile and a session directory, and the client is no longer
+ * streaming the server's stdout — it is polling a log file, so the cost of a
+ * generous budget is a slower failure, not a stuck pipe.
+ */
+const HOST_START_TIMEOUT_MS = 60_000
+
+/**
+ * How long one connection may wait for another connection's ensure to finish.
+ * Two clients starting the same device at once is rare; two Harnesses over one
+ * home is the failure this lock exists to prevent.
+ */
+const HOST_LOCK_WAIT_MS = 30_000
+
+/** How many 300 ms tries one connection makes for another connection's lock. */
+const HOST_LOCK_TRIES = Math.ceil(HOST_LOCK_WAIT_MS / 300)
+
+/** How many 500 ms reads of the log a first start makes before giving up. */
+const HOST_START_TRIES = Math.ceil(HOST_START_TIMEOUT_MS / 500)
+
+/**
+ * The DSH home a persistent host belongs to, as a POSIX shell expression.
+ *
+ * `DSH_HOME` is the only knob DSH itself documents for this, so a device may
+ * point at a second home on the same machine — which is also what makes a test
+ * run able to leave the operator's live home alone.
+ * @returns one shell assignment statement.
+ */
+function hostHomePosix() {
+	return 'home="${DSH_HOME:-$HOME/.dsh}"'
+}
+
+/**
+ * The five fields the ensure program reads back out of the record.
+ *
+ * The values are numeric, base64url, and an ISO timestamp, so the `sed` below
+ * never has to handle a quote or a comma. Paths are deliberately not in the
+ * record: the record lives inside the home it describes, which is a stronger
+ * statement of the same fact and one fewer thing to escape.
+ * @param recordVar - the shell variable holding the record path.
+ * @returns the shell statements that assign `pid`, `port`, `token`, `started`.
+ */
+function readRecordPosix(recordVar) {
+	const field = (name, pattern) => `${name}=$(sed -n 's/.*"${name}":${pattern}.*/\\1/p' "$${recordVar}" 2>/dev/null | head -n 1)`
+	return [
+		field('pid', '\\([0-9][0-9]*\\)'),
+		field('port', '\\([0-9][0-9]*\\)'),
+		field('token', '"\\([A-Za-z0-9_-]*\\)"'),
+		field('started', '"\\([^"]*\\)"')
+	]
+}
+
+/**
+ * The POSIX program that adopts or starts the persistent host.
+ *
+ * A device may name a DSH home (`device.home`); it is exported before anything
+ * else so that the record, the log, and the Harness itself all live in the same
+ * one. That is also what lets a test run against a second home on a machine whose
+ * default home is serving somebody's live Session.
+ *
+ * @param device - the device whose home is being served.
+ * @returns one shell program.
+ */
+function posixPersistentEnsure(device) {
+	const directory = typeof device.directory === 'string' && device.directory !== '' ? device.directory : undefined
+	const enter = directory === undefined ? '' : `${remoteCd(directory)} || exit 1; `
+	const home = typeof device.home === 'string' && device.home !== '' ? `export DSH_HOME=${shellSingleQuote(device.home)}; ` : ''
+	const statements = [
+		resolvePreamble(),
+		hostHomePosix(),
+		'hd="$home/dsh-tabs"',
+		'mkdir -p "$hd" || exit 1',
+		'rec="$hd/host.json"',
+		'log="$hd/host.log"',
+		'lock="$hd/ensure.lock"',
+		// One ensure at a time. Two connections that both see "no host" would
+		// otherwise both start one, and two Harnesses over one home is exactly the
+		// state that makes a Session unopenable. A lock left by a killed client is
+		// broken only after 120 s, which is longer than any healthy ensure.
+		`i=0
+while ! mkdir "$lock" 2>/dev/null; do
+	sleep 0.3
+	i=$((i+1))
+	if [ "$i" -gt ${String(HOST_LOCK_TRIES)} ]; then
+		if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rm -rf "$lock"; continue; fi
+		echo "HOST error another connection is starting this host and did not finish"
+		exit 1
+	fi
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT`,
+		...readRecordPosix('rec'),
+		// Adopt. The identity is three facts, not one: a pid is recycled, a port can
+		// be taken by something else, and `ps` says whether the pid is still a
+		// Harness. The readiness URL is rebuilt from the record, so adoption needs
+		// no log at all.
+		`if [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q " web " && (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+	echo "HOST adopted pid=$pid port=$port token=$token started=$started"
+	echo "dsh web: http://127.0.0.1:$port/?token=$token"
+	exit 0
+fi`,
+		'rm -f "$rec"',
+		': > "$log"',
+		// `nohup` execs the target, so `$!` is the Harness's own pid; `</dev/null`
+		// keeps it off the ssh session's stdin, and nohup makes SIGHUP irrelevant.
+		'nohup dsh web --no-open --port 0 >>"$log" 2>&1 </dev/null & pid=$!',
+		`line=""
+for i in {1..${String(HOST_START_TRIES)}}; do
+	line=$(sed -n "s/^dsh web: //p" "$log" | tail -n 1)
+	[ -n "$line" ] && break
+	kill -0 "$pid" 2>/dev/null || break
+	sleep 0.5
+done`,
+		`if [ -z "$line" ]; then
+	echo "HOST error the Harness did not announce a URL within 60s"
+	sed -n "1,20p" "$log"
+	exit 1
+fi`,
+		`port=$(printf '%s' "$line" | sed -n 's#.*://[^/]*:\\([0-9][0-9]*\\)/.*#\\1#p')
+token=$(printf '%s' "$line" | sed -n 's#.*[?&]token=\\([A-Za-z0-9_-]*\\).*#\\1#p')
+if [ -z "$port" ] || [ -z "$token" ]; then
+	echo "HOST error the readiness line carried no port or token"
+	exit 1
+fi`,
+		'started=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+		`printf '{"version":${String(HOST_RECORD_VERSION)},"pid":%s,"port":%s,"token":"%s","started":"%s"}\\n' "$pid" "$port" "$token" "$started" > "$rec.tmp" && mv "$rec.tmp" "$rec" && chmod 600 "$rec" 2>/dev/null`,
+		'echo "HOST started pid=$pid port=$port token=$token started=$started"',
+		'echo "dsh web: $line"'
+	]
+	return `${resolvePreamble()}; ${home}${enter}${statements.slice(1).join('; ')}`
+}
+
+/**
+ * The POSIX program that stops the recorded host.
+ *
+ * Only ever run from an explicit operator action: a persistent host is somebody's
+ * running work, and nothing in this application kills one on its own.
+ * @param device - the device whose host is being stopped, for its home.
+ * @returns one shell program.
+ */
+function posixPersistentStop(device = {}) {
+	const home = typeof device.home === 'string' && device.home !== '' ? `export DSH_HOME=${shellSingleQuote(device.home)}; ` : ''
+	return `${home}${[
+		hostHomePosix(),
+		'hd="$home/dsh-tabs"',
+		'rec="$hd/host.json"',
+		'if [ ! -f "$rec" ]; then echo "HOST none"; exit 0; fi',
+		...readRecordPosix('rec'),
+		`if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q " web "; then
+	kill "$pid" 2>/dev/null
+	sleep 1
+	kill -9 "$pid" 2>/dev/null
+	echo "HOST stopped pid=$pid"
+else
+	echo "HOST stale pid is gone or is not a Harness"
+fi`,
+		'rm -f "$rec"'
+	].join('; ')}`
+}
+
+/**
+ * The PowerShell that locates `node` and `bin.js`, for the persistent branch.
+ *
+ * This repeats the walk inside `windowsProgram` instead of sharing it. That
+ * program's bytes are pinned — by the contract, by the Android parity test, and
+ * by `tools/smoke.mjs` — so lifting a block out of it would change a string that
+ * three other things compare, to save one copy here. The copy is the cheaper of
+ * the two costs, and this comment is why the next reader does not merge them.
+ * @returns the statements, one per line.
+ */
+function windowsHostResolve() {
+	return String.raw`$dsh = $null
+$c = Get-Command dsh -CommandType Application -ErrorAction SilentlyContinue
+if ($null -ne $c) { $dsh = @($c)[0].Source }
+if ([string]::IsNullOrEmpty($dsh)) { foreach ($p in @("$env:APPDATA\npm\dsh.cmd", "$env:PNPM_HOME\dsh.cmd", "$env:LOCALAPPDATA\pnpm\bin\dsh.cmd", "$env:ProgramFiles\nodejs\dsh.cmd")) { if (Test-Path -LiteralPath $p) { $dsh = $p; break } } }
+$candidates = @($dsh) + @("$env:APPDATA\npm\dsh.cmd", "$env:PNPM_HOME\dsh.cmd", "$env:LOCALAPPDATA\pnpm\bin\dsh.cmd", "$env:ProgramFiles\nodejs\dsh.cmd")
+$binJs = $null; $shimDir = $null; $dsh = $null
+foreach ($candidate in $candidates) { if ([string]::IsNullOrEmpty($candidate)) { continue }; $dir = Split-Path -Parent $candidate; $bin = Join-Path $dir 'node_modules\@deepseek-ai\dsh\lib\bin.js'; if (Test-Path -LiteralPath $bin) { $dsh = $candidate; $shimDir = $dir; $binJs = $bin; break } }
+if ([string]::IsNullOrEmpty($binJs)) { Write-Output 'HOST error no launchable dsh on this Windows host'; exit 1 }
+$node = $null
+$cand = @((Join-Path $shimDir 'node.exe'), (Join-Path $env:ProgramFiles 'nodejs\node.exe'), 'node')
+foreach ($n in $cand) { if ($null -eq $node) { try { if (Get-Command $n -ErrorAction Stop) { $node = $n } } catch { } } }
+if ($null -eq $node) { Write-Output 'HOST error no node.exe on this Windows host'; exit 1 }`
+}
+
+/**
+ * The Windows program that adopts or starts the persistent host.
+ *
+ * The Harness is started through a generated `.cmd` and created by WMI. Both
+ * halves are measured decisions (2026-11-26):
+ * - a `.cmd` file, because the nested quoting of `cmd /c ""set "X=…" && …""` is
+ *   parsed wrong and reports `'"set "PROBE_INLINE' is not recognized`;
+ * - WMI, because `Win32_Process.Create` gives the process a `WmiPrvSE.exe`
+ *   parent, so no part of the ssh session owns it.
+ * @param device - the device whose home is being served.
+ * @returns one PowerShell program.
+ */
+function windowsPersistentEnsure(device) {
+	const directory = typeof device.directory === 'string' && device.directory !== '' ? device.directory : ''
+	const enter = directory === ''
+		? ''
+		: [
+				`$dir = ${windowsLiteral(directory)}; if ($dir -eq '~') { $dir = $env:USERPROFILE } elseif ($dir.StartsWith('~/') -or $dir.StartsWith('~\\')) { $dir = Join-Path $env:USERPROFILE $dir.Substring(2) }; $null = 0`,
+				'Set-Location -LiteralPath $dir -ErrorAction Stop'
+			].join('; ')
+	return String.raw`$ErrorActionPreference = 'Stop'
+${typeof device.home === 'string' && device.home !== '' ? `$env:DSH_HOME = ${windowsLiteral(device.home)}\n` : ''}${windowsHostResolve()}
+${enter === '' ? '' : enter + '\n'}$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$hd = Join-Path $dshHome 'dsh-tabs'
+New-Item -ItemType Directory -Force -Path $hd | Out-Null
+$rec = Join-Path $hd 'host.json'
+$log = Join-Path $hd 'host.log'
+$lock = Join-Path $hd 'ensure.lock'
+$locked = $false
+$sw = [Diagnostics.Stopwatch]::StartNew()
+while (-not $locked) {
+  try { New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null; $locked = $true; break } catch { }
+  if ((Test-Path -LiteralPath $lock) -and ((Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime).TotalSeconds -gt 120) { Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue; continue }
+  if ($sw.Elapsed.TotalMilliseconds -gt ${String(HOST_LOCK_WAIT_MS)}) { break }
+  Start-Sleep -Milliseconds 300
+}
+if (-not $locked) { Write-Output 'HOST error another connection is starting this host and did not finish'; exit 1 }
+try {
+  $record = $null
+  if (Test-Path -LiteralPath $rec) { try { $record = Get-Content -LiteralPath $rec -Raw | ConvertFrom-Json } catch { $record = $null } }
+  if ($null -ne $record -and $null -ne $record.pid -and $null -ne $record.port) {
+    $live = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$record.pid) -ErrorAction SilentlyContinue
+    $listening = $false
+    if ($null -ne $live) {
+      $tcp = $null
+      try { $tcp = [Net.Sockets.TcpClient]::new(); $listening = $tcp.ConnectAsync('127.0.0.1', [int]$record.port).Wait(2000) } catch { $listening = $false } finally { if ($null -ne $tcp) { $tcp.Dispose() } }
+    }
+    if ($null -ne $live -and $live.Name -eq 'node.exe' -and -not [string]::IsNullOrEmpty($live.CommandLine) -and $live.CommandLine.Contains(' web ') -and $listening) {
+      Write-Output ('HOST adopted pid=' + $record.pid + ' port=' + $record.port + ' token=' + $record.token + ' started=' + $record.started)
+      Write-Output ('dsh web: http://127.0.0.1:' + $record.port + '/?token=' + $record.token)
+      exit 0
+    }
+  }
+  Remove-Item -LiteralPath $rec -Force -ErrorAction SilentlyContinue
+  Set-Content -LiteralPath $log -Value '' -Encoding ASCII
+  $launcher = Join-Path $hd '${HOST_LAUNCHER_FILE}'
+  $lines = @('@echo off', ('set "DSH_HOME=' + $dshHome + '"'), ('"' + $node + '" "' + $binJs + '" web --no-open --port 0 > "' + $log + '" 2>&1'))
+  Set-Content -LiteralPath $launcher -Value $lines -Encoding ASCII
+  $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ('cmd.exe /c "' + $launcher + '"'); CurrentDirectory = (Get-Location).Path }
+  if ($created.ReturnValue -ne 0) { Write-Output ('HOST error WMI create failed rc=' + $created.ReturnValue); exit 1 }
+  $line = $null
+  $wait = [Diagnostics.Stopwatch]::StartNew()
+  while ($wait.Elapsed.TotalMilliseconds -lt ${String(HOST_START_TIMEOUT_MS)}) {
+    if (Test-Path -LiteralPath $log) { $found = Select-String -LiteralPath $log -Pattern '^dsh web: (\S+)$' | Select-Object -Last 1; if ($null -ne $found) { $line = $found.Matches[0].Groups[1].Value; break } }
+    if ($null -eq (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $created.ProcessId) -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 400
+  }
+  if ($null -eq $line) { Write-Output 'HOST error the Harness did not announce a URL within 60s'; if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -TotalCount 20 }; exit 1 }
+  $nodePid = $null
+  for ($i = 0; $i -lt 20 -and $null -eq $nodePid; $i++) { $child = Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $created.ProcessId) -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'node.exe' } | Select-Object -First 1; if ($null -ne $child) { $nodePid = $child.ProcessId } else { Start-Sleep -Milliseconds 200 } }
+  if ($null -eq $nodePid) { Write-Output 'HOST error the launcher produced no node process'; exit 1 }
+  $port = [regex]::Match($line, ':([0-9]+)/').Groups[1].Value
+  $token = [regex]::Match($line, '[?&]token=([A-Za-z0-9_-]+)').Groups[1].Value
+  if (-not $port -or -not $token) { Write-Output 'HOST error the readiness line carried no port or token'; exit 1 }
+  $started = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  $json = '{"version":${String(HOST_RECORD_VERSION)},"pid":' + $nodePid + ',"port":' + $port + ',"token":"' + $token + '","started":"' + $started + '"}'
+  Set-Content -LiteralPath $rec -Value $json -Encoding ASCII
+  Write-Output ('HOST started pid=' + $nodePid + ' port=' + $port + ' token=' + $token + ' started=' + $started)
+  Write-Output ('dsh web: ' + $line)
+} finally {
+  Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
+}`
+}
+
+/**
+ * The Windows program that stops the recorded host.
+ * @param device - the device whose host is being stopped, for its home.
+ * @returns one PowerShell program.
+ */
+function windowsPersistentStop(device = {}) {
+	return String.raw`${typeof device.home === 'string' && device.home !== '' ? `$env:DSH_HOME = ${windowsLiteral(device.home)}\n` : ''}$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$rec = Join-Path (Join-Path $dshHome 'dsh-tabs') 'host.json'
+if (-not (Test-Path -LiteralPath $rec)) { Write-Output 'HOST none'; exit 0 }
+$record = $null
+try { $record = Get-Content -LiteralPath $rec -Raw | ConvertFrom-Json } catch { $record = $null }
+if ($null -eq $record -or $null -eq $record.pid) { Remove-Item -LiteralPath $rec -Force -ErrorAction SilentlyContinue; Write-Output 'HOST stale the record names no pid'; exit 0 }
+$live = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$record.pid) -ErrorAction SilentlyContinue
+if ($null -eq $live -or $live.Name -ne 'node.exe' -or [string]::IsNullOrEmpty($live.CommandLine) -or -not $live.CommandLine.Contains(' web ')) { Remove-Item -LiteralPath $rec -Force -ErrorAction SilentlyContinue; Write-Output 'HOST stale pid is gone or is not a Harness'; exit 0 }
+& taskkill /PID ([int]$record.pid) /T /F 2>&1 | Out-Null
+Start-Sleep -Milliseconds 500
+Remove-Item -LiteralPath $rec -Force -ErrorAction SilentlyContinue
+Write-Output ('HOST stopped pid=' + $record.pid)`
+}
+
+/**
+ * Pick the adopt-or-start program for a shell family.
+ * @param device - the device whose home is being served.
+ * @param platform - which shell family the far side speaks.
+ * @returns the remote command argument.
+ */
+function persistentEnsureProgram(device, platform = 'posix') {
+	return platform === 'windows' ? windowsPersistentEnsure(device) : posixPersistentEnsure(device)
+}
+
+/**
+ * Pick the stop program for a shell family.
+ * @param device - the device whose host is being stopped, for its home.
+ * @param platform - which shell family the far side speaks.
+ * @returns the remote command argument.
+ */
+function persistentStopProgram(device = {}, platform = 'posix') {
+	return platform === 'windows' ? windowsPersistentStop(device) : posixPersistentStop(device)
+}
+
 module.exports = {
 	READY_LINE,
 	START_TIMEOUT_MS,
 	PROBE_TIMEOUT_MS,
 	TUNNEL_TIMEOUT_MS,
 	DEFAULT_SSH_PORT,
+	HOST_DIR,
+	HOST_RECORD_FILE,
+	HOST_LOG_FILE,
+	HOST_LAUNCHER_FILE,
+	HOST_RECORD_VERSION,
+	HOST_START_TIMEOUT_MS,
+	HOST_LOCK_WAIT_MS,
+	persistentEnsureProgram,
+	persistentStopProgram,
 	readyUrl,
 	shellSingleQuote,
 	resolvePreamble,

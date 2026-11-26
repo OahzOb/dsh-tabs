@@ -33,6 +33,9 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	select: (id) => ipcRenderer.invoke('tabs:select', id),
 	disconnect: (id) => ipcRenderer.invoke('tabs:disconnect', id),
 	restart: (id) => ipcRenderer.invoke('tabs:restart', id),
+	// The one control that ends a persistent host. Separate from `disconnect`, which
+	// lets go and leaves it running.
+	reap: (id) => ipcRenderer.invoke('tabs:reap', id),
 	devices: () => ipcRenderer.invoke('devices:list'),
 	open: (id) => ipcRenderer.invoke('devices:open', id),
 	save: (device) => ipcRenderer.invoke('devices:save', device),
@@ -40,6 +43,8 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	transcript: (id) => ipcRenderer.invoke('devices:transcript', id),
 	checkUpdates: () => ipcRenderer.invoke('updates:check'),
 	terminalOpen: (id) => ipcRenderer.invoke('terminal:open', id),
+	terminalPresets: () => ipcRenderer.invoke('terminal:presets'),
+	terminalOpenLocal: (preset) => ipcRenderer.invoke('terminal:openLocal', preset),
 	terminalAttach: (id) => ipcRenderer.invoke('terminal:attach', id),
 	// One-way on purpose: a keystroke is hot, and an `invoke` would wrap every key
 	// in a promise the renderer has no use for. The main process validates both.

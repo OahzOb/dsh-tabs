@@ -168,6 +168,41 @@ await test('Windows: the stdin-EOF teardown contract is kept', () => {
 	assert.match(program, /'web','--no-open','--port','0'/u)
 })
 
+await test('Windows: a previous launch is reaped before this one starts', () => {
+	// **Why this exists.** The stdin contract above only fires when the *connection*
+	// ends. Measured on a real Windows remote on 2026-11-25: a Harness started by the
+	// tablet's earlier connection was still serving four minutes after the same tablet
+	// had reconnected, and DSH gives a Session one writer — so every Session it had
+	// open stayed unopenable in the new window (`session/writer-held`, the UI's
+	// "当前会话已被占用…"). The launch therefore records what it started, and the next
+	// launch kills that record before starting anything.
+	const program = remote.windowsProgram(device)
+	assert.match(program, /remote-harness\.json/u)
+	// The supervisor as well as the Harness: it is the ancestor `taskkill /T` walks,
+	// and a supervisor whose connection never ended otherwise waits on stdin for ever.
+	assert.match(program, /\{ sup = \$PID; pid = \$proc\.Id/u)
+	assert.match(program, /launch reaped harness=/u)
+	assert.match(program, /launch reaped supervisor=/u)
+	// A pid is not evidence on its own. Each one is killed only while it still carries
+	// the identity this launcher gave it, so a recycled pid cannot take an unrelated
+	// process — or an operator's own `dsh web` — with it.
+	assert.match(program, /\$hp\.CommandLine\.Contains\(' web --no-open --port 0'\)/u)
+	assert.match(program, /\$sp\.CommandLine\.Contains\('-EncodedCommand'\)/u)
+	// The record is removed when this launch's own teardown runs, so a clean quit never
+	// leaves the next launch something to kill.
+	assert.match(program, /\$mine\.sup -eq \$PID/u)
+	// **Order is part of the contract.** The reap has to run before the new Harness
+	// exists, or it would be reaping the launch it is part of; the record has to be
+	// written after the process exists but before anything else can fail, or a failed
+	// launch leaves a Harness nothing can name.
+	const reap = program.indexOf('launch reaped harness=')
+	const start = program.indexOf('$proc = Start-Process')
+	const record = program.indexOf('sup = $PID')
+	assert.ok(reap > -1 && reap < start, 'the reap has to run before the new Harness starts')
+	assert.ok(record > start, 'the record has to name the process that now exists')
+	assert.ok(program.indexOf('$mine.sup -eq $PID') > start, 'the record is cleaned by this launch\'s own teardown')
+})
+
 await test('Windows: a shim with no bin.js is refused by name, not launched', () => {
 	// The launcher starts the interpreter on `bin.js`, never the `.cmd` shim, so a
 	// missing `bin.js` has no fallback that works: naming the shim would
@@ -230,6 +265,92 @@ await test('Windows: no statement boundary lands inside the tilde if/elseif chai
 	// And the chain is really there, so the negative check above cannot pass by the
 	// translation having been deleted.
 	assert.match(withDirectory, /if \(\$dir -eq '~'\) \{ \$dir = \$env:USERPROFILE \} elseif \(/u)
+})
+
+console.log('persistent hosts')
+
+await test('POSIX: the host is detached, so the connection no longer owns it', () => {
+	// The ordinary launch's teardown is `cat > /dev/null`: it is the contract that
+	// kills the Harness when the connection ends, and this program must not carry it.
+	// `nohup` execs, so `$!` is the Harness's own pid rather than a wrapper's, and
+	// `</dev/null` keeps the ssh session's pipe out of the Harness's lifetime.
+	const program = remote.persistentEnsureProgram(device, 'posix')
+	assert.match(program, /nohup dsh web --no-open --port 0 >>"\$log" 2>&1 <\/dev\/null & pid=\$!/u)
+	assert.doesNotMatch(program, /cat > \/dev\/null/u, 'the persistent launch still carries the connection-lifetime contract')
+})
+
+await test('POSIX: the record lives inside the DSH home, next to the Sessions it leases', () => {
+	const program = remote.persistentEnsureProgram(device, 'posix')
+	assert.match(program, /home="\$\{DSH_HOME:-\$HOME\/\.dsh\}"/u)
+	assert.match(program, /hd="\$home\/dsh-tabs"/u)
+	assert.match(program, new RegExp(remote.HOST_RECORD_FILE.replaceAll('.', '\\.'), 'u'))
+	assert.match(program, new RegExp(remote.HOST_LOG_FILE.replaceAll('.', '\\.'), 'u'))
+})
+
+await test('POSIX: adopting checks three independent facts and rebuilds the URL', () => {
+	// A pid is recycled and a port can belong to something else, so neither alone is
+	// evidence. The URL comes out of the record, which is why adoption needs no log.
+	const program = remote.persistentEnsureProgram(device, 'posix')
+	assert.match(program, /kill -0 "\$pid"/u)
+	assert.match(program, /ps -p "\$pid" -o command=/u)
+	assert.match(program, /\/dev\/tcp\/127\.0\.0\.1\/"\$port"/u)
+	assert.match(program, /echo "dsh web: http:\/\/127\.0\.0\.1:\$port\/\?token=\$token"/u)
+	// Adoption must never kill what it could not adopt; only the stop program does.
+	assert.doesNotMatch(program, /kill "\$pid"/u)
+})
+
+await test('persistent: one ensure at a time per home, and the loser is told why', () => {
+	// Two connections that both see "no host" would both start one, and two Harnesses
+	// over one home is the `session/writer-held` state this whole branch exists to
+	// avoid.
+	for (const platform of ['posix', 'windows']) {
+		const program = remote.persistentEnsureProgram(device, platform)
+		assert.match(program, /ensure\.lock/u, `${platform} has no lock`)
+		assert.match(program, /another connection is starting this host/u, `${platform} does not say why it gave up`)
+	}
+})
+
+await test('Windows: the host is created outside the ssh session', () => {
+	// The measured decision: a `Start-Process` inside the session is a child of
+	// sshd's PowerShell, and whether the session teardown reaches it was never
+	// measured. `Win32_Process.Create` gives it a `WmiPrvSE.exe` parent instead.
+	const program = remote.persistentEnsureProgram(device, 'windows')
+	assert.match(program, /Invoke-CimMethod -ClassName Win32_Process -MethodName Create/u)
+	assert.match(program, /CurrentDirectory = \(Get-Location\)\.Path/u)
+	assert.doesNotMatch(program, /Start-Process/u)
+})
+
+await test('Windows: the launcher is a file, because the inline command line is parsed wrong', () => {
+	// Measured: `cmd /c ""set "X=…" && …""` reports `'"set "PROBE_INLINE' is not
+	// recognized`. A generated `.cmd` has no nested quoting at all.
+	const program = remote.persistentEnsureProgram(device, 'windows')
+	assert.match(program, new RegExp(remote.HOST_LAUNCHER_FILE.replaceAll('.', '\\.'), 'u'))
+	assert.match(program, /Set-Content -LiteralPath \$launcher -Value \$lines -Encoding ASCII/u)
+	assert.match(program, /cmd\.exe \/c "/u)
+})
+
+await test('both platforms print the readiness line last, in the line an existing reader parses', () => {
+	for (const platform of ['posix', 'windows']) {
+		const program = remote.persistentEnsureProgram(device, platform)
+		const readyAt = program.lastIndexOf('dsh web: ')
+		const hostAt = Math.max(program.indexOf('HOST adopted'), program.indexOf('HOST started'))
+		assert.ok(hostAt > 0, `${platform} never prints a HOST line`)
+		assert.ok(readyAt > hostAt, `${platform} prints readiness before the HOST line`)
+	}
+	// And that printed line is the one the client already parses.
+	const printed = 'dsh web: http://127.0.0.1:1/?token=t'
+	assert.equal(remote.readyUrl(`${printed}\n`), 'http://127.0.0.1:1/?token=t')
+})
+
+await test('stopping checks identity, so a recycled pid is not killed', () => {
+	// A persistent host is somebody's running work: the stop program is the only
+	// thing that kills one, and only after the same identity check adoption uses.
+	const posix = remote.persistentStopProgram({}, 'posix')
+	assert.match(posix, /ps -p "\$pid" -o command=/u)
+	assert.match(posix, /HOST none/u)
+	const windows = remote.persistentStopProgram({}, 'windows')
+	assert.match(windows, /\$live\.CommandLine\.Contains\(' web '\)/u)
+	assert.match(windows, /HOST none/u)
 })
 
 console.log('platform classification')
@@ -656,6 +777,29 @@ await test('the contract agrees with the code it was generated from', () => {
 			)
 		}
 	}
+	// The persistent half is captured the same way, and for the same reason: a second
+	// client ports these strings, so they have to be the ones this code emits.
+	assert.equal(CONTRACT.persistent.record.version, remote.HOST_RECORD_VERSION)
+	assert.equal(CONTRACT.persistent.budgets.startTimeoutMs, remote.HOST_START_TIMEOUT_MS)
+	assert.equal(CONTRACT.persistent.budgets.lockWaitMs, remote.HOST_LOCK_WAIT_MS)
+	for (const platform of ['posix', 'windows']) {
+		const captured = CONTRACT.persistent.ensure[platform]
+		for (const variant of ['withoutDirectory', 'withDirectory']) {
+			const directory = captured[variant].directory
+			const recorded = directory === undefined ? sample : { ...sample, directory }
+			assert.equal(
+				captured[variant].program,
+				remote.persistentEnsureProgram(recorded, platform),
+				`${platform}.${variant} persistent ensure has drifted`
+			)
+			assert.equal(
+				captured[variant].remoteCommand,
+				remote.remoteCommand(remote.persistentEnsureProgram(recorded, platform), platform),
+				`${platform}.${variant} persistent remoteCommand has drifted`
+			)
+		}
+		assert.equal(captured.stop, remote.persistentStopProgram(device, platform), `${platform} persistent stop has drifted`)
+	}
 })
 
 await test('the documented readiness example really parses', () => {
@@ -779,23 +923,47 @@ await test('the embedding window is the only one that needs webviewTag', () => {
 	assert.match(main, /nodeIntegration: false/u)
 })
 
-await test('quitting tears every tab down', () => {
-	// A remote server that is never told to stop keeps holding its port.
+await test('quitting tears every tab down, except a host that is meant to outlive it', () => {
+	// A remote server that is never told to stop keeps holding its port. A persistent
+	// one is the deliberate exception: its record is what makes it findable again, and
+	// killing it on quit would make "the Session keeps working" mean "until you close
+	// the window".
 	const main = readFileSync(join(ROOT, 'src', 'main.js'), 'utf8')
 	assert.match(main, /app\.on\('before-quit'/u)
-	assert.match(main, /for \(const tab of tabs\.values\(\)\) stopTab\(tab\)/u)
-	assert.match(main, /if \(connection !== undefined\) connection\.stop\(\)/u)
+	assert.match(main, /for \(const tab of tabs\.values\(\)\) stopTab\(tab, \{ keepPage: tab\.persistent === true \}\)/u)
+	// And an ordinary tab is still torn down by `connection.stop()`, which is the
+	// stdin contract — not by a detach and not by a terminate.
+	assert.match(main, /else connection\.stop\(\)/u)
 })
 
 await test('the teardown contract is stdin first, then the kill', () => {
 	// Killing the ssh client first would drop the connection without the far side
 	// ever learning it should stop, leaving an orphaned server holding the port.
 	const source = readFileSync(join(ROOT, 'src', 'connect.js'), 'utf8')
-	const stop = source.indexOf('stop() {')
+	const stop = source.indexOf('\t\tstop() {')
 	assert.ok(stop > -1, 'connect() exposes stop()')
 	const body = source.slice(stop, source.indexOf('\n\t\t}', stop))
-	assert.ok(body.indexOf('stdin?.end()') < body.indexOf('tunnel.kill()'), 'stdin must be closed before the tunnel is killed')
-	assert.match(body, /server\.exitCode === null/u)
+	assert.ok(body.indexOf('endHold()') > -1 && body.indexOf('endHold()') < body.indexOf('closeTunnel()'), 'stdin must be closed before the tunnel is closed')
+	// The two halves are shared with detach() and terminate(), so their guards are
+	// read where they are defined rather than inline in stop().
+	const endHold = source.indexOf('const endHold = ()')
+	const closeTunnel = source.indexOf('const closeTunnel = ()')
+	assert.ok(endHold > -1 && closeTunnel > -1, 'the two halves of teardown are not factored out')
+	assert.match(source.slice(endHold, closeTunnel), /hold\.stdin\?\.end\(\)/u)
+	assert.match(source.slice(endHold, closeTunnel), /hold\.exitCode !== null/u)
+	assert.match(source.slice(closeTunnel, closeTunnel + 500), /tunnel\.kill\(\)/u)
+	assert.match(source.slice(closeTunnel, closeTunnel + 500), /tunnel\.exitCode === null/u)
+})
+
+await test('a persistent connection detaches instead of killing its host', () => {
+	// The whole mode in one line: closing the tab means "let go". If `stop()` ended
+	// the hold for a persistent device too, the host would die on every disconnect
+	// and the feature would be an ordinary connect with more code.
+	const source = readFileSync(join(ROOT, 'src', 'connect.js'), 'utf8')
+	const stop = source.indexOf('\t\tstop() {')
+	const body = source.slice(stop, source.indexOf('\n\t\t}', stop))
+	assert.match(body, /if \(!persistent\) endHold\(\)/u, 'a persistent close would end the host')
+	assert.match(body, /closeTunnel\(\)/u)
 })
 
 await test('every web contents gets the window-open rule, guests included', () => {
@@ -1413,6 +1581,33 @@ await test('the connect path has no Electron dependency', () => {
 })
 
 console.log('the device book')
+
+await test('a persistent device gets a stable local port, because the port is the origin', () => {
+	// The browser keys its cookie and the page's own "last Session" by origin, so the
+	// local forward port has to be a property of the record rather than of a run. It is
+	// derived from the id, so two windows that hand-edit the book agree about it.
+	assert.equal(devices.deriveLocalPort('dev-a'), devices.deriveLocalPort('dev-a'))
+	assert.notEqual(devices.deriveLocalPort('dev-a'), devices.deriveLocalPort('dev-b'))
+	const persistent = devices.normalize({ id: 'dev-a', host: 'h', user: 'u', mode: 'persistent' })
+	assert.equal(persistent.mode, 'persistent')
+	assert.equal(persistent.localPort, devices.deriveLocalPort('dev-a'))
+	// A named port wins; turning the mode off drops the field instead of leaving a
+	// stale one in the book; and the mode survives an edit that does not mention it,
+	// like the cached platform does.
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u', mode: 'persistent', localPort: 41234 }).localPort, 41234)
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u', mode: 'session' }).localPort, undefined)
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u' }, persistent).mode, 'persistent')
+	// The default book has no mode at all, so an older build's file stays valid.
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u' }).mode, undefined)
+})
+
+await test('a DSH home is refused when it cannot be passed to a shell', () => {
+	// The same rule, and the same reason, as a launch directory: `%VAR%` and `!VAR!`
+	// expand even inside double quotes, so escaping is not attempted.
+	assert.throws(() => devices.normalize({ id: 'dev-a', host: 'h', user: 'u', mode: 'persistent', home: '/srv/a"b' }), /DSH home/u)
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u', home: '/srv/dsh' }).home, '/srv/dsh')
+	assert.equal(devices.normalize({ id: 'dev-a', host: 'h', user: 'u' }).home, undefined)
+})
 
 await test('the device book is never read-modify-written unserialized', async () => {
 	// `load()` then `save()` is a lost update the moment anything else writes in

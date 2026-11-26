@@ -26,7 +26,8 @@
 const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, session } = require('electron')
 const { randomUUID } = require('node:crypto')
 const { existsSync } = require('node:fs')
-const { join } = require('node:path')
+const { homedir } = require('node:os')
+const { basename, join } = require('node:path')
 
 const devices = require('./devices.js')
 const connect = require('./connect.js')
@@ -196,6 +197,17 @@ const tabs = new Map()
 /** The active tab id, as far as the renderer is concerned. */
 let activeId = LOCAL_ID
 
+/**
+ * Where the folder chooser starts the next time one is opened.
+ *
+ * A preset that runs in a project (`pi`, `opencode`) asks for a directory every time
+ * it is opened, and the first folder an operator picks is almost always the
+ * neighbourhood of the next one. The value is **not persisted**: it is a convenience
+ * for this run, not a setting, and a stale project path from last month is a worse
+ * default than the home directory.
+ */
+let lastDirectory = homedir()
+
 // **One instance, because the local Harness is a per-machine resource and the
 // operator cannot see the second copy.** Without this, every launch — a shortcut
 // pressed twice, a `--version` probe by an older build, a shell that re-runs the
@@ -289,6 +301,8 @@ function startApplication() {
  * @property {string} id
  * @property {'local'|'remote'|'terminal'} kind
  * @property {string} [deviceId] - the device a terminal tab belongs to.
+ * @property {'shell'|'pi'|'opencode'} [preset] - the program a local terminal runs.
+ * @property {string} [cwd] - the directory a local terminal starts in.
  * @property {string} label
  * @property {'idle'|'starting'|'running'|'failed'|'ended'} state
  * @property {string} [url]
@@ -296,6 +310,12 @@ function startApplication() {
  * @property {number} [exitCode] - how a terminal's ssh client ended.
  * @property {number} [generation] - which session a terminal tab is showing.
  * @property {boolean} [attachRequested] - whether the renderer is waiting for the pty.
+ * @property {boolean} [persistent] - whether this tab's host outlives its connection.
+ * @property {boolean} [adopted] - whether the host was already running when this tab connected.
+ * @property {number} [localPort] - the stable forward port a persistent tab holds.
+ * @property {'posix'|'windows'} [platform] - the shell family the far side answered with.
+ * @property {ReturnType<typeof setTimeout>} [reconnectTimer] - a scheduled tunnel retry.
+ * @property {number} [reconnectAttempt] - how many retries this outage has cost.
  * @property {ReturnType<typeof connect.connectLocal>} [connection]
  * @property {ReturnType<typeof terminal.start>} [terminal]
  * @property {Attempt} [attempt]
@@ -339,10 +359,23 @@ function snapshot() {
 			...(tab.kind === 'terminal'
 				? {
 						generation: tab.generation ?? 0,
-						...(tab.deviceId === undefined ? {} : { deviceId: tab.deviceId }),
+						// A terminal is either bound to a device or opened on this
+						// machine, and the renderer does not need to know which of the
+						// two it is looking at to draw it — but its tooltip shows the
+						// whole path, and a label alone cannot carry that back.
+						...(tab.deviceId === undefined
+							? { local: true, preset: tab.preset, cwd: tab.cwd }
+							: { deviceId: tab.deviceId }),
 						...(tab.exitCode === undefined ? {} : { exitCode: tab.exitCode })
 					}
-				: { partition: guestPartition(tab.id) })
+				: {
+						partition: guestPartition(tab.id),
+						// A persistent tab's renderer is told what the tab is, not asked to
+						// infer it from a state name: it decides whether the guest may be
+						// destroyed (it may not, while the host is still there) and what the
+						// banner says.
+						...(tab.persistent === true ? { persistent: true, adopted: tab.adopted === true } : {})
+					})
 		}))
 	}
 }
@@ -413,8 +446,11 @@ function cancelAttempt(tab) {
  * starting", which is the leak this function used to have.
  *
  * @param tab - the tab to stop.
+ * @param {object} [options] - how far to go.
+ * @param {boolean} [options.keepPage] - keep the guest and the URL for a persistent tab.
+ * @param {boolean} [options.terminate] - end the far-side host as well (a restart).
  */
-function stopTab(tab) {
+function stopTab(tab, options = {}) {
 	if (tab.kind === 'terminal') {
 		// A terminal is not a Harness: there is no far-side process to reap with an
 		// EOF, so stopping it is the local ssh client's kill and nothing else. The
@@ -427,12 +463,62 @@ function stopTab(tab) {
 		if (session !== undefined) session.kill()
 		return
 	}
+	cancelReconnect(tab)
 	cancelAttempt(tab)
 	const connection = tab.connection
 	tab.connection = undefined
+	// **Closing the tab of a persistent host means "let go", not "kill it".** The
+	// page and its URL stay, because the host behind them is still the same process
+	// on the same port — and `connect.stop()` only drops the tunnel. This is what a
+	// disconnect, a quit and a lost connection all look like; `terminate` is the one
+	// that ends the host, and only a restart or an explicit "Stop host" asks for it.
+	if (connection?.persistent === true && options.keepPage === true) {
+		tab.state = 'detached'
+		connection.detach?.()
+		return
+	}
 	tab.url = undefined
 	tab.state = 'idle'
-	if (connection !== undefined) connection.stop()
+	if (connection !== undefined) {
+		if (options.terminate === true && typeof connection.terminate === 'function') void connection.terminate()
+		else connection.stop()
+	}
+}
+
+/**
+ * Drop a pending tunnel retry, if there is one.
+ * @param tab - the tab.
+ */
+function cancelReconnect(tab) {
+	if (tab.reconnectTimer !== undefined) {
+		clearTimeout(tab.reconnectTimer)
+		tab.reconnectTimer = undefined
+	}
+}
+
+/**
+ * Come back to a host whose tunnel went away.
+ *
+ * The page is not touched and the URL is not cleared: this is only about
+ * re-opening the forward. `activate` re-runs the whole connect, which is
+ * deliberate — the ensure program adopts the same host, so the re-run costs one
+ * ssh round trip and no new process, and a host that really did die is restarted
+ * by the same command.
+ * @param tab - the tab whose tunnel ended.
+ */
+function scheduleReconnect(tab) {
+	cancelReconnect(tab)
+	const attempt = (tab.reconnectAttempt ?? 0) + 1
+	tab.reconnectAttempt = attempt
+	const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(attempt - 1, 5))
+	note(tab, `reconnect in ${String(Math.round(delay / 1000))}s (attempt ${String(attempt)})`)
+	tab.reconnectTimer = setTimeout(() => {
+		tab.reconnectTimer = undefined
+		void activate(tab.id)
+	}, delay)
+	// Electron would keep the process alive for a timer nobody is waiting on; a quit
+	// must not be delayed by a retry that is 30 s out.
+	tab.reconnectTimer.unref?.()
 }
 
 /**
@@ -521,19 +607,50 @@ function failTerminal(tab, attempt, message) {
 }
 
 /**
- * Start (or restart) one terminal tab's ssh session.
+ * The two callbacks one terminal session reports through.
  *
- * A terminal has no readiness line to wait for: ssh either starts and hands the
- * channel to the remote shell, or prints why it could not and exits. So the tab is
- * `running` as soon as the pty exists, and an ssh that fails appears as output
- * followed by an `ended` tab with its exit code. What *is* awaited is the shell
- * family, because that decides the command to run, and it is cached on the device
- * after the first time.
+ * The session is created with these and only assigned to the tab afterwards, so the
+ * exit handler reads a box the assignment fills. A session that exits before that
+ * assignment is a start that has not settled yet; calling it "ended" would overwrite
+ * the start's own state with a result the operator cannot act on.
+ *
+ * @param tab - the tab the session belongs to.
+ * @param generation - the generation these callbacks belong to.
+ * @param box - holds the session once it exists.
+ * @returns the callbacks.
+ */
+function terminalCallbacks(tab, generation, box) {
+	return {
+		onData: (data) => {
+			// A replaced session's output belongs to the tab generation that owned it.
+			// Delivering it into the replacement would interleave two terminals.
+			if (tab.generation !== generation) return
+			if (mainWindow === undefined || mainWindow.isDestroyed()) return
+			mainWindow.webContents.send('terminal:data', { id: tab.id, data })
+		},
+		onExit: (status) => {
+			if (tab.generation !== generation || tab.terminal !== box.session) return
+			tab.exitCode = status.exitCode
+			tab.state = 'ended'
+			publish()
+		}
+	}
+}
+
+/**
+ * Start (or restart) one terminal tab's session.
+ *
+ * A terminal has no readiness line to wait for: ssh, or a local program, either
+ * starts and hands over the terminal or prints why it could not and exits. So the
+ * tab is `running` as soon as the pty exists, and a process that fails appears as
+ * output followed by an `ended` tab with its exit code. What *is* awaited on the
+ * device path is the shell family, because that decides the command to run, and it
+ * is cached on the device after the first time.
  *
  * @param tab - the terminal tab.
  */
 async function startTerminal(tab) {
-	if (tab.kind !== 'terminal' || tab.deviceId === undefined) return
+	if (tab.kind !== 'terminal') return
 	/** @type {{cancelled: boolean, stop: () => void}} */
 	const attempt = { cancelled: false, stop: () => {} }
 	tab.terminalAttempt = attempt
@@ -550,6 +667,31 @@ async function startTerminal(tab) {
 	const generation = tab.generation
 
 	try {
+		// **A local terminal has no book to read and nothing to probe.** It is one
+		// program in one directory, and the only way it fails is the resolution or the
+		// pty itself — both of which throw the sentence the tab shows.
+		if (tab.deviceId === undefined) {
+			const box = { session: undefined }
+			const session = terminal.startLocal({
+				preset: tab.preset,
+				cwd: tab.cwd,
+				...terminalCallbacks(tab, generation, box)
+			})
+			box.session = session
+			if (attempt.cancelled) {
+				session.kill()
+				return
+			}
+			tab.terminal = session
+			attempt.stop = () => {
+				session.kill()
+			}
+			tab.state = 'running'
+			publish()
+			if (tab.attachRequested === true) session.attach()
+			return
+		}
+
 		const stored = await devices.load()
 		if (attempt.cancelled) return
 		const device = stored.find((entry) => entry.id === tab.deviceId)
@@ -593,24 +735,14 @@ async function startTerminal(tab) {
 			if (attempt.cancelled) return
 		}
 
+		const box = { session: undefined }
 		const session = terminal.start({
 			device,
 			platform,
 			ssh: connect.sshExecutable(),
-			onData: (data) => {
-				// A replaced session's output belongs to the tab generation that owned
-				// it. Delivering it into the replacement would interleave two shells.
-				if (tab.generation !== generation) return
-				if (mainWindow === undefined || mainWindow.isDestroyed()) return
-				mainWindow.webContents.send('terminal:data', { id: tab.id, data })
-			},
-			onExit: (status) => {
-				if (tab.generation !== generation || tab.terminal !== session) return
-				tab.exitCode = status.exitCode
-				tab.state = 'ended'
-				publish()
-			}
+			...terminalCallbacks(tab, generation, box)
 		})
+		box.session = session
 		if (attempt.cancelled) {
 			session.kill()
 			return
@@ -663,6 +795,90 @@ async function openTerminal(deviceId) {
 		console.error(`[terminal] ${error instanceof Error ? error.message : String(error)}`)
 		return
 	}
+	await activateTerminal(tab)
+}
+
+/**
+ * The name a local tab carries.
+ *
+ * The folder is part of the label because two `pi` tabs in two projects are two
+ * different conversations, and a bar full of identical "pi" tabs says nothing.
+ *
+ * @param preset - the program's preset.
+ * @param cwd - its directory.
+ * @returns the label.
+ */
+function localTerminalLabel(preset, cwd) {
+	const name = preset === 'shell' ? 'Shell' : preset
+	const folder = cwd === homedir() ? 'home' : basename(cwd) || cwd
+	return `${name} — ${folder}`
+}
+
+/**
+ * Ask for the directory one local program should start in.
+ *
+ * `lastDirectory` is the default rather than the home directory, because a coding
+ * agent is opened in a project and the next one is usually beside it. A cancelled
+ * dialog is not an error — it is the operator changing their mind — so the answer
+ * is `undefined` rather than an exception.
+ *
+ * @param title - what the dialog is for.
+ * @returns the chosen directory, or undefined.
+ */
+async function chooseDirectory(title) {
+	const options = { title, defaultPath: lastDirectory, properties: ['openDirectory'] }
+	let result
+	try {
+		result =
+			mainWindow === undefined || mainWindow.isDestroyed()
+				? await dialog.showOpenDialog(options)
+				: await dialog.showOpenDialog(mainWindow, options)
+	} catch (error) {
+		console.error(`[terminal] the folder chooser failed: ${error instanceof Error ? error.message : String(error)}`)
+		return undefined
+	}
+	if (result === undefined || result.canceled === true) return undefined
+	if (!Array.isArray(result.filePaths) || result.filePaths.length === 0) return undefined
+	const chosen = result.filePaths[0]
+	if (typeof chosen !== 'string' || chosen === '') return undefined
+	lastDirectory = chosen
+	return chosen
+}
+
+/**
+ * Open one program on this machine in a terminal tab.
+ *
+ * The tab exists before the session does, like every terminal here, so a start that
+ * fails has somewhere to put its reason and a `⟲` to try again. A preset that is not
+ * installed fails in `startLocal` and the tab says which program was missing — which
+ * is also why the popover asks `listPresets` first and disables the button.
+ *
+ * @param preset - the program's preset.
+ */
+async function openLocalTerminal(preset) {
+	if (!terminal.PRESETS.some((entry) => entry.id === preset)) return
+	let cwd = homedir()
+	if (preset !== 'shell') {
+		const chosen = await chooseDirectory(`Where should ${preset} start?`)
+		if (chosen === undefined) return
+		cwd = chosen
+	}
+	let id
+	do {
+		id = `${TERMINAL_PREFIX}local:${randomUUID()}`
+	} while (tabs.has(id))
+	/** @type {Tab} */
+	const tab = {
+		id,
+		kind: 'terminal',
+		preset,
+		cwd,
+		label: localTerminalLabel(preset, cwd),
+		state: 'idle',
+		generation: 0,
+		lines: []
+	}
+	tabs.set(id, tab)
 	await activateTerminal(tab)
 }
 
@@ -721,6 +937,23 @@ const RESTART_SETTLE_MS = 5_000
  * is taking its time.
  */
 const RESTART_POLL_MS = 50
+
+/**
+ * How long a persistent tab waits before re-opening the tunnel it lost.
+ *
+ * A tunnel is the one part of a persistent connection that *is* this
+ * application's: the host behind it is not. So losing it is a state to come back
+ * from, not a failure to report — a laptop lid, a Wi-Fi handover, or a `ssh`
+ * that was killed. The page is kept in the meantime and its own transport retries
+ * at 500 ms → 10 s, so a tunnel that returns inside a minute is invisible.
+ *
+ * Doubling, capped, with no attempt limit: the tab exists until the operator
+ * closes it, and a cap on attempts would mean a tab that quietly stops trying.
+ */
+const RECONNECT_BASE_MS = 1_000
+
+/** The ceiling the doubling stops at, so a long outage costs one ssh a minute. */
+const RECONNECT_MAX_MS = 30_000
 
 /**
  * Wait until the process a tab was serving from has actually gone.
@@ -802,9 +1035,12 @@ async function settled(connection) {
 async function restartTab(id) {
 	const tab = tabs.get(id)
 	if (tab === undefined) return
-	const wasRunning = tab.state === 'running' || tab.state === 'starting'
+	const wasRunning = tab.state === 'running' || tab.state === 'starting' || tab.state === 'detached'
 	const connection = tab.connection
-	stopTab(tab)
+	// A restart is the one thing that *does* end a persistent host's process: the
+	// operator asked for a different one, and adopting the old one would answer the
+	// wrong question. Everything else detaches.
+	stopTab(tab, { terminate: true })
 	publish()
 	if (!wasRunning) {
 		// A tab that was idle or failed has nothing to wait for: the operator asking
@@ -1050,14 +1286,39 @@ async function activate(id) {
 	const signal = controller.signal
 
 	try {
+		/** @type {Record<string, any> | undefined} */
+		let device
+		if (tab.kind !== 'local') {
+			const stored = await devices.load()
+			if (abandoned(tab, attempt)) return
+			device = stored.find((entry) => entry.id === id)
+			if (device === undefined) {
+				tab.state = 'failed'
+				tab.error = 'this device is no longer in the book'
+				tab.lines.push('FAILED: this device is no longer in the book')
+				publish()
+				return
+			}
+		}
+
 		// **The guest's session is emptied before the Harness it will show is
-		// started.** The auth cookie a `dsh web` mints names the authority of *its own*
-		// process (`host:port`), so after a restart every cookie this tab's session
-		// holds belongs to a connection that is already gone. Clearing first is what
-		// keeps the tab's Cookie header at one cookie instead of one per restart — see
+		// started — unless the origin provably did not change.** The auth cookie a
+		// `dsh web` mints names the authority of *its own* process (`host:port`), so
+		// after a restart every cookie this tab's session holds belongs to a
+		// connection that is already gone. Clearing first is what keeps the tab's
+		// Cookie header at one cookie instead of one per restart — see
 		// `clearGuestSession` and `GUEST_PARTITION_PREFIX` for the failure that came of
 		// not doing it.
-		await clearGuestSession(guestPartition(tab.id))
+		//
+		// A persistent device is the one case where the authority is deliberately
+		// stable: the same local port, the same host behind it. There the jar and the
+		// page's own storage are the things that make a reconnect land back in the same
+		// Session, so clearing them is the bug rather than the cure. The condition is
+		// an equality rather than "persistent", because a device that has no fixed port
+		// still gets a new origin every time and must be cleared like any other.
+		const persistent = device?.mode === 'persistent'
+		const sameOrigin = persistent === true && tab.localPort !== undefined && tab.localPort === device?.localPort
+		if (!sameOrigin) await clearGuestSession(guestPartition(tab.id))
 		if (abandoned(tab, attempt)) return
 
 		/** @type {{url?: string, error?: string} & Record<string, unknown>} */
@@ -1074,18 +1335,8 @@ async function activate(id) {
 				})
 			)
 		} else {
-			const stored = await devices.load()
-			if (abandoned(tab, attempt)) return
-			const device = stored.find((entry) => entry.id === id)
-			if (device === undefined) {
-				tab.state = 'failed'
-				tab.error = 'this device is no longer in the book'
-				tab.lines.push('FAILED: this device is no longer in the book')
-				publish()
-				return
-			}
 			result = await runConnect((onChild) =>
-				connect.connectRemote(device, {
+				connect.connectRemote(/** @type {any} */ (device), {
 					signal,
 					onLine: (line) => note(tab, line),
 					onChild
@@ -1121,10 +1372,18 @@ async function activate(id) {
 		tab.connection = /** @type {Tab['connection']} */ (result)
 		tab.url = result.url
 		tab.state = 'running'
+		// What the tab is, for everything that has to decide how far it may go: a
+		// persistent tab keeps its page and its host when the connection ends.
+		tab.persistent = result.persistent === true
+		tab.adopted = result.adopted === true
+		tab.platform = result.platform
+		tab.localPort = result.persistent === true ? result.localPort : undefined
+		tab.reconnectAttempt = 0
 		// What every tab's transcript says about its own URL. The wording used to be
 		// "local URL", which was a lie on a remote tab and sent at least one reader
 		// looking for a remote port that the tunnel does not use.
 		note(tab, `URL: ${result.url}`)
+		if (tab.persistent === true) note(tab, tab.adopted === true ? 'host adopted: the Sessions it holds are the ones you left' : 'host started: it will outlive this connection')
 
 		// A connection that dies later must not leave a `running` claim behind.
 		result.onServerExit?.((code) => {
@@ -1136,7 +1395,20 @@ async function activate(id) {
 			publish()
 		})
 		result.onTunnelExit?.((code) => {
-			if (tab.connection !== result || tab.state !== 'running') return
+			if (tab.connection !== result) return
+			if (tab.persistent === true) {
+				// **The host is not this connection's to lose.** Only the forward ended,
+				// so this is a state to come back from: keep the page, keep the URL, and
+				// come back on the same local port so the page's own transport retry
+				// lands on the same origin and the same Session.
+				tab.connection = undefined
+				tab.state = 'detached'
+				note(tab, `the ssh tunnel ended (code ${String(code)})`)
+				scheduleReconnect(tab)
+				publish()
+				return
+			}
+			if (tab.state !== 'running') return
 			tab.error = `the ssh tunnel ended (code ${String(code)})`
 			note(tab, `FAILED: ${tab.error}`)
 			stopTab(tab)
@@ -1540,7 +1812,10 @@ function installIpc() {
 				closeTerminalTab(tab)
 				return snapshot()
 			}
-			stopTab(tab)
+			// A persistent tab's `×` lets go of the forward and keeps the host: the
+			// page stays, the Session stays, and opening the tab again adopts the same
+			// process. Killing it would make the mode a longer way to do nothing.
+			stopTab(tab, { keepPage: tab.persistent === true })
 			publish()
 		}
 		return snapshot()
@@ -1558,6 +1833,42 @@ function installIpc() {
 			return snapshot()
 		}
 		await restartTab(key)
+		return snapshot()
+	})
+	ipcMain.handle('tabs:reap', async (_event, id) => {
+		// **The one control that ends a persistent host.** Everything else detaches,
+		// because the host may be serving another client — a phone, a second window —
+		// and the work it is doing belongs to somebody else. So this is only ever
+		// reached from an explicit operator action, and it is awaited so the tab can
+		// show what the far side said.
+		const key = String(id)
+		if (key === LOCAL_ID) return snapshot()
+		const tab = tabs.get(key)
+		if (tab === undefined || tab.kind !== 'remote') return snapshot()
+		const platform = tab.platform ?? 'posix'
+		const stored = await devices.load()
+		const device = stored.find((entry) => entry.id === key)
+		const connection = tab.connection
+		tab.connection = undefined
+		cancelReconnect(tab)
+		try {
+			if (connection !== undefined && typeof connection.terminate === 'function') {
+				await connection.terminate()
+			} else if (device !== undefined) {
+				// A detached tab has no connection to terminate, so the record on the far
+				// side is what is stopped — which is also the case that reaches a host
+				// this window adopted rather than started.
+				await connect.stopHost(device, platform, { onLine: (line) => note(tab, line) })
+			}
+		} catch (error) {
+			note(tab, `FAILED: ${error instanceof Error ? error.message : String(error)}`)
+		}
+		tab.url = undefined
+		tab.state = 'idle'
+		tab.persistent = undefined
+		tab.adopted = undefined
+		tab.localPort = undefined
+		publish()
 		return snapshot()
 	})
 	ipcMain.handle('devices:list', async () => {
@@ -1623,7 +1934,9 @@ function installIpc() {
 			// Before the tab leaves the map, which is what makes the connect in flight
 			// findable: `stopTab` tears the attempt down *and* the settled connection,
 			// and `tabs.delete` afterwards leaves the attempt nothing to come back to.
-			stopTab(tab)
+			// Removing the device is an explicit "I am done with this machine", so the
+			// host goes too — the one path besides a restart that ends a process.
+			stopTab(tab, { terminate: true })
 			tabs.delete(key)
 		}
 		const stored = await devices.mutate((current) => current.filter((entry) => entry.id !== key))
@@ -1635,8 +1948,16 @@ function installIpc() {
 		const tab = tabs.get(String(id))
 		return { lines: tab === undefined ? [] : tab.lines }
 	})
+	// The popover asks what can be opened before it draws the buttons: a missing
+	// `pi` becomes a disabled control carrying the reason, not a folder chooser that
+	// ends in a failure.
+	ipcMain.handle('terminal:presets', () => ({ presets: terminal.listPresets() }))
 	// Opening a terminal is a deliberate request, unlike selecting a tab: the
 	// operator pressed a control that says Terminal, so the session starts.
+	ipcMain.handle('terminal:openLocal', async (_event, preset) => {
+		await openLocalTerminal(String(preset))
+		return snapshot()
+	})
 	ipcMain.handle('terminal:open', async (_event, deviceId) => {
 		await openTerminal(String(deviceId))
 		return snapshot()
@@ -1750,6 +2071,6 @@ void app
 		// Every tab, including the ones whose connect has not finished: `stopTab` tears
 		// down an attempt in flight, which is what used to be left running here while
 		// the application exited and the far side kept a server holding its port.
-		for (const tab of tabs.values()) stopTab(tab)
+		for (const tab of tabs.values()) stopTab(tab, { keepPage: tab.persistent === true })
 	})
 }

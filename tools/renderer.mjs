@@ -66,6 +66,18 @@ function harness(options = {}) {
 	const calls = []
 	const terminals = []
 	const transcripts = options.transcripts ?? {}
+	/**
+	 * What the main process says this machine can open.
+	 *
+	 * Three available presets by default, because that is what a development machine
+	 * with both agents installed answers; a test about an unavailable one passes its
+	 * own list.
+	 */
+	const presets = options.presets ?? [
+		{ id: 'shell', label: 'Shell', available: true },
+		{ id: 'pi', label: 'pi', available: true },
+		{ id: 'opencode', label: 'opencode', available: true }
+	]
 	let state = options.state ?? { activeId: 'local', tabs: [] }
 	let devices = options.devices ?? []
 	let problems = options.problems ?? []
@@ -169,6 +181,10 @@ function harness(options = {}) {
 			calls.push(['restart', id])
 			return state
 		},
+		reap: async (id) => {
+			calls.push(['reap', id])
+			return state
+		},
 		devices: async () => {
 			calls.push(['devices'])
 			return { devices, tabs: state, problems }
@@ -193,6 +209,14 @@ function harness(options = {}) {
 		},
 		terminalOpen: async (id) => {
 			calls.push(['terminalOpen', id])
+			return state
+		},
+		terminalPresets: async () => {
+			calls.push(['terminalPresets'])
+			return { presets }
+		},
+		terminalOpenLocal: async (preset) => {
+			calls.push(['terminalOpenLocal', preset])
 			return state
 		},
 		terminalAttach: async (id) => {
@@ -462,6 +486,42 @@ await test('a tab that stops running loses its guest', async () => {
 	assert.equal(h.guests()[0].getAttribute('src'), 'http://127.0.0.1:1000/')
 })
 
+await test('a detached persistent tab keeps its guest, and offers both ways out', async () => {
+	// The page is the Session view the operator left: destroying it would throw away
+	// the scroll position and the half-typed message to redraw the same URL. So the
+	// element survives a detached state, and the banner is what carries the controls.
+	const state = threeTabs()
+	state.activeId = 'dev-a'
+	state.tabs[1] = { ...state.tabs[1], state: 'detached', persistent: true, adopted: true }
+	const h = harness({ state, devices: [] })
+	await h.flush()
+	assert.equal(h.guests().length, 2, 'the detached guest was destroyed')
+	assert.equal(h.panels().length, 0, 'a full panel covered the page being kept')
+	const banner = h.document.querySelector('.detached-banner')
+	assert.ok(banner !== null, 'a detached persistent tab shows no banner')
+	assert.match(banner.textContent, /reconnecting/u)
+	const buttons = [...banner.querySelectorAll('button')]
+	assert.deepEqual(buttons.map((button) => button.textContent), ['Reconnect now', 'Stop host'])
+	buttons[1].dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'reap'), [['reap', 'dev-a']])
+})
+
+await test('a running persistent tab offers Stop host, and its × says it keeps the host', async () => {
+	const state = threeTabs()
+	state.tabs[1] = { ...state.tabs[1], persistent: true, adopted: false }
+	const h = harness({ state, devices: [] })
+	await h.flush()
+	const tab = h.tabs()[1]
+	const reap = tab.querySelector('.tab-reap')
+	assert.ok(reap !== null, 'a persistent tab has no Stop host control')
+	reap.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'reap'), [['reap', 'dev-a']])
+	// The ordinary × must not promise a kill it does not perform.
+	assert.match(tab.querySelector('.tab-close').title, /keeps running/u)
+})
+
 await test('only the active guest is visible', async () => {
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
@@ -645,6 +705,48 @@ await test('the popover offers an update check that asks the main process', asyn
 	assert.deepEqual(h.calls.filter(([name]) => name === 'checkUpdates'), [['checkUpdates']])
 })
 
+await test('the popover offers this machine\u2019s programs and asks for the one clicked', async () => {
+	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const buttons = [...h.popover().querySelectorAll('.local-buttons button')]
+	assert.deepEqual(
+		buttons.map((button) => button.textContent),
+		['Shell', 'pi', 'opencode']
+	)
+	buttons[1].dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'terminalOpenLocal'),
+		[['terminalOpenLocal', 'pi']]
+	)
+})
+
+await test('a program that is not installed is disabled, and says why on hover', async () => {
+	// Hiding it would leave the operator unable to tell "this build has the feature"
+	// from "this machine cannot run it". The tooltip is the whole message.
+	const h = harness({
+		state: { activeId: 'local', tabs: [] },
+		devices: [],
+		presets: [
+			{ id: 'shell', label: 'Shell', available: true },
+			{ id: 'pi', label: 'pi', available: false, reason: 'pi was not found on PATH' },
+			{ id: 'opencode', label: 'opencode', available: false, reason: 'opencode was not found on PATH' }
+		]
+	})
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const buttons = [...h.popover().querySelectorAll('.local-buttons button')]
+	const pi = buttons.find((button) => button.textContent === 'pi')
+	assert.equal(pi.disabled, true)
+	assert.match(pi.title, /pi was not found on PATH/u)
+	assert.equal(buttons[0].disabled, false, 'the shell is always available')
+})
+
 await test('the add form submits the fields it was given', async () => {
 	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
 	await h.flush()
@@ -733,6 +835,42 @@ function terminalTabs(overrides = {}) {
 }
 
 console.log('terminals')
+
+await test('a local terminal tab gets a terminal and no guest', async () => {
+	// A local tab is a terminal with no device, and the distinction that matters in
+	// the renderer is that it must not be given a partition and turned into a
+	// `<webview>`: there is no URL behind it.
+	const h = harness({
+		state: {
+			activeId: 'terminal:local:1',
+			tabs: [
+				{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/' },
+				{
+					id: 'terminal:local:1',
+					kind: 'terminal',
+					local: true,
+					preset: 'pi',
+					cwd: '<root>\\project',
+					label: 'pi — project',
+					state: 'running',
+					generation: 1
+				}
+			]
+		},
+		devices: []
+	})
+	await h.flush()
+	assert.equal(h.terminalHosts().length, 1, 'the local terminal tab drew no terminal')
+	assert.equal(h.guests().length, 1, 'the local tab was turned into a guest as well')
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'terminalAttach'),
+		[['terminalAttach', 'terminal:local:1']],
+		'the local session was never told there is a screen'
+	)
+	// The label shortens to the folder's last segment; the tooltip is where the
+	// directory an operator actually chose survives.
+	assert.match(h.tabs()[1].title, /in <root>\\project/u)
+})
 
 await test('a terminal tab gets one emulator, attaches once and fits to its host', async () => {
 	const h = harness({ state: terminalTabs(), devices: [] })

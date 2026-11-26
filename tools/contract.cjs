@@ -102,11 +102,37 @@ function programs(platform) {
 	}
 }
 
+/**
+ * Capture the persistent-host builders, for both directory variants.
+ *
+ * The ensure program depends on the directory exactly as `remoteProgram` does —
+ * the Harness starts in it — so a second client must reproduce the same variant
+ * split. The stop program never enters a directory and is captured once.
+ * @param platform - the shell family.
+ * @returns the two variants and the stop program.
+ */
+function persistentPrograms(platform) {
+	const withDirectory = platform === 'windows' ? 'C:\\work\\dsh' : '~/work/dsh'
+	const variant = (directory) => {
+		const recorded = directory === undefined ? device() : device(directory)
+		const program = remote.persistentEnsureProgram(recorded, platform)
+		return {
+			...(directory === undefined ? {} : { directory }),
+			program,
+			remoteCommand: remote.remoteCommand(program, platform)
+		}
+	}
+	return {
+		withoutDirectory: variant(undefined),
+		withDirectory: variant(withDirectory),
+		stop: remote.persistentStopProgram(device(), platform)
+	}
+}
+
 const contract = {
 	__generated: `${TOOL} — do not edit by hand; run \`node ${TOOL}\``,
 	contractVersion: CONTRACT_VERSION,
-	protocol: 'dsh web over ssh',
-	source: {
+	protocol: 'dsh web over ssh',	source: {
 		// The plugin is normative. This application carries a copy, and the suite
 		// fails if the copy drifts — so a second client must port from the
 		// protocol, not from either JavaScript file, because both of them move.
@@ -177,7 +203,24 @@ const contract = {
 		stdinMustStayOpenUntilThen: true,
 		posixBlocksOn: 'cat > /dev/null',
 		windowsBlocksOn: '[Console]::In.ReadToEnd()',
-		jschEquivalent: 'channel.getOutputStream().close() → Channel.eof() → SSH_MSG_CHANNEL_EOF'
+		jschEquivalent: 'channel.getOutputStream().close() → Channel.eof() → SSH_MSG_CHANNEL_EOF',
+		// **The contract has a second half: a launch that outlived its own client.**
+		// Closing stdin only fires when the connection *ends*. Measured on a real
+		// Windows remote on 2026-11-25: a Harness started by the tablet's earlier
+		// connection was still serving four minutes after the same tablet had
+		// reconnected, still holding the Sessions' write leases — and DSH gives a
+		// Session one writer, so the new window could not open them at all
+		// (`session/writer-held`, the UI's "当前会话已被占用…"). A client must
+		// therefore be able to name what it started and reap it on the next launch.
+		staleLaunch: {
+			windowsRecord: '%LOCALAPPDATA%\\dsh-tabs\\remote-harness.json',
+			fields: ['sup', 'pid', 'started', 'node', 'binJs', 'cwd'],
+			reapBeforeStart: true,
+			identityCheck: 'a pid is killed only while it is still a powershell.exe running -EncodedCommand, or a node.exe carrying this launcher\'s argv',
+			cleanedBy: 'the launch that wrote it, in its own teardown',
+			posix: 'not recorded: the POSIX branch reads stdin through `cat > /dev/null` and was measured to reap on disconnect, and a Windows-only gap must not change the other branch',
+			why: 'two Harnesses over one DSH home cannot share Session write leases, so "one" and "none" are the only useful states'
+		}
 	},
 
 	platform: {
@@ -226,6 +269,93 @@ const contract = {
 		},
 		posix: programs('posix'),
 		windows: programs('windows')
+	},
+
+	/**
+	 * The persistent-host protocol: the second way a far side may be started.
+	 *
+	 * The whole point is that **no part of the ssh session owns the Harness**. The
+	 * ordinary launch above dies with the connection by design; this one outlives
+	 * it, records itself, and is adopted by the next connection instead of being
+	 * started twice. Two Harnesses over one DSH home cannot share Session write
+	 * leases, so adoption is a correctness requirement, not a convenience.
+	 *
+	 * A second client must implement both programs, not just the launch: without
+	 * `stop` there is no way to give a leased Session back, and without the adopt
+	 * branch two clients produce the `session/writer-held` failure this exists to
+	 * prevent.
+	 */
+	persistent: {
+		record: {
+			// Inside the far side's DSH home, so "one host per home" and the Session
+			// write lease are stated in the same coordinate system.
+			directory: remote.HOST_DIR,
+			file: remote.HOST_RECORD_FILE,
+			log: remote.HOST_LOG_FILE,
+			windowsLauncher: remote.HOST_LAUNCHER_FILE,
+			version: remote.HOST_RECORD_VERSION,
+			home: '`DSH_HOME` when set, otherwise `~/.dsh` (POSIX) / `%USERPROFILE%\\.dsh` (Windows)',
+			fields: ['version', 'pid', 'port', 'token', 'started'],
+			// The record holds a launch token, which is a credential: it trades for a
+			// browser cookie. Treat it as one.
+			permissions: 'POSIX `chmod 600`; Windows inherits the DSH home ACL',
+			// Values are numeric, base64url and ISO, so a reader needs no JSON parser:
+			// the POSIX branch reads them with four `sed` expressions.
+			valuesAreJsonSafe: true
+		},
+
+		// The two lines a client has to parse. The readiness line comes **last**, and
+		// is byte-identical to the ordinary launch's, so an existing reader is reused
+		// rather than a second syntax invented.
+		output: {
+			adopted: 'HOST adopted pid=<n> port=<n> token=<t> started=<iso>',
+			started: 'HOST started pid=<n> port=<n> token=<t> started=<iso>',
+			stopped: 'HOST stopped pid=<n>',
+			none: 'HOST none',
+			stale: 'HOST stale <reason>',
+			error: 'HOST error <text>',
+			readiness: 'dsh web: <url> — the existing readiness line, printed after the HOST line'
+		},
+
+		// Adoption identity is three independent facts, because a pid is recycled and
+		// a port can belong to something else: the pid is alive, `ps`/CIM says it is
+		// still a Harness, and the recorded port accepts a connection.
+		identity: {
+			pid: 'alive (`kill -0` / `Get-CimInstance Win32_Process`)',
+			commandLine: 'contains ` web `',
+			port: 'accepts a loopback connection',
+			not: 'a timestamp is not evidence, and neither is the record alone'
+		},
+
+		// One ensure at a time per home. Two connections that both see "no host"
+		// would otherwise both start one.
+		lock: {
+			path: `${remote.HOST_DIR}/ensure.lock`,
+			acquire: 'POSIX `mkdir`; Windows `New-Item -ItemType Directory`',
+			waitMs: remote.HOST_LOCK_WAIT_MS,
+			staleAfterMs: 120_000,
+			release: 'the ensure program removes it, including on failure (`trap … EXIT` / `finally`)'
+		},
+
+		budgets: {
+			startTimeoutMs: remote.HOST_START_TIMEOUT_MS,
+			lockWaitMs: remote.HOST_LOCK_WAIT_MS
+		},
+
+		// Why the two platforms start the process differently. Both are measured
+		// decisions; neither is a style choice.
+		launch: {
+			posix: '`nohup dsh web --no-open --port 0 </dev/null >>log 2>&1 &` — `nohup` execs, so `$!` is the Harness pid',
+			posixWhy: '`setsid` forks when its caller leads a process group, so the pid it leaves is not reliably the Harness',
+			windows: 'a generated `.cmd` created by `Invoke-CimMethod Win32_Process Create`',
+			windowsWhy: 'the created process has a `WmiPrvSE.exe` parent, so the ssh session has no handle to it; a `Start-Process` inside the session does',
+			windowsQuoting: 'a `.cmd` file, because `cmd /c ""set "X=…" && …""` is parsed wrong and reports `\'"set "PROBE_INLINE\' is not recognized`'
+		},
+
+		ensure: {
+			posix: persistentPrograms('posix'),
+			windows: persistentPrograms('windows')
+		}
 	}
 }
 

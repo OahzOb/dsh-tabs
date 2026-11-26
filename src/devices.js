@@ -50,6 +50,9 @@ const RESERVED_IDS = Object.freeze(['local'])
  * @property {number} sshPort
  * @property {string} [directory]
  * @property {'posix'|'windows'} [platform]
+ * @property {'persistent'} [mode] - present only for a host that outlives the connection.
+ * @property {string} [home] - the far side's DSH home, when not the default.
+ * @property {number} [localPort] - the stable local forward port a persistent device keeps.
  */
 
 /**
@@ -312,6 +315,36 @@ function normalize(incoming, previous) {
 	const host = String(incoming?.host ?? '')
 	const user = String(incoming?.user ?? '')
 	const directory = typeof incoming?.directory === 'string' && incoming.directory !== '' ? incoming.directory : undefined
+	// A persistent device is a **property of the device**, not of a Session: one
+	// switch covers every Session the far side's home holds, because they all live in
+	// the one Harness process the record names. `session` is the absence of the field,
+	// so a book written by an older build stays exactly as it was.
+	const mode = incoming?.mode === 'persistent' || incoming?.mode === 'session'
+		? incoming.mode
+		: previous?.mode
+	// The DSH home the host serves. Same refusal as a directory: a value that reaches
+	// a shell as something other than what the operator wrote is worse than a refusal.
+	const home = typeof incoming?.home === 'string' && incoming.home !== '' ? incoming.home : undefined
+	if (home !== undefined) {
+		const offenders = [...new Set([...home].filter((character) => '"\'%!&|<>^'.includes(character)))]
+		if (offenders.length > 0) {
+			throw new Error(`the DSH home contains ${offenders.map((character) => `\`${character}\``).join(', ')}, which cannot be passed to a shell safely`)
+		}
+	}
+	// The local forward port, which is what keeps the browser's origin — and with it
+	// the signed cookie and the page's own "last Session" — stable across reconnects.
+	//
+	// Derived rather than allocated when the mode is on and the book does not name
+	// one: the book then stays the only state, and two windows that hand-edit the
+	// same file cannot disagree about the number. A collision is caught where it
+	// happens — the tunnel refuses to listen, and the connect says which port — rather
+	// than by a free-port probe that would be stale by the time it was used.
+	const named = incoming?.localPort
+	const localPort = mode !== 'persistent'
+		? undefined
+		: named === undefined || named === null || named === ''
+			? deriveLocalPort(id)
+			: normalizePort(named, 'local forward port')
 	return {
 		id,
 		label: String(incoming?.label ?? host ?? id),
@@ -322,12 +355,34 @@ function normalize(incoming, previous) {
 		// No port field: the remote picks its own, so nothing about a previous
 		// session's port is retained.
 		...(directory === undefined ? {} : { directory }),
-		...(platform === undefined ? {} : { platform })
+		...(platform === undefined ? {} : { platform }),
+		...(mode === 'persistent' ? { mode } : {}),
+		...(home === undefined ? {} : { home }),
+		...(localPort === undefined ? {} : { localPort })
 	}
 }
 
 /**
- * The ssh port, or a refusal.
+ * The stable local forward port a persistent device gets by default.
+ *
+ * Drawn from the device id so that it is a property of the record rather than of a
+ * run: the whole point is that it does not change between launches, because the
+ * browser's origin — and with it the signed cookie and the page's own "last
+ * Session" — is keyed by it. 41000–41999 is clear of the two ports anything else
+ * here uses (ssh 22, and the far side's OS-chosen `--port 0`) and of the ephemeral
+ * range on Windows, which starts at 49152.
+ *
+ * @param id - the device id.
+ * @returns a port in 41000–41999.
+ */
+function deriveLocalPort(id) {
+	let hash = 0
+	for (const character of String(id)) hash = (hash * 31 + character.codePointAt(0)) >>> 0
+	return 41000 + (hash % 1000)
+}
+
+/**
+ * A port from the book, or a refusal.
  *
  * A port is the one numeric field in the book, it is editable by hand, and it
  * ends up as an argv element of `ssh`. Anything that is not a whole number in
@@ -337,15 +392,16 @@ function normalize(incoming, previous) {
  * what the popover and the plugin's own schema both mean by it.
  *
  * @param value - the submitted value, a number or a string.
+ * @param label - which port this is, for the refusal.
  * @returns the port number.
  */
-function normalizePort(value) {
+function normalizePort(value, label = 'ssh port') {
 	if (value === undefined || value === null || value === '' || value === false) return DEFAULT_SSH_PORT
 	const port = typeof value === 'number' ? value : Number(String(value).trim())
 	if (!Number.isInteger(port) || port < 1 || port > 65535) {
-		throw new Error(`the ssh port has to be a whole number between 1 and 65535, and "${String(value)}" is not one`)
+		throw new Error(`the ${label} has to be a whole number between 1 and 65535, and "${String(value)}" is not one`)
 	}
 	return port
 }
 
-module.exports = { STORE_PATH, SEED_PATH, RESERVED_IDS, load, save, mutate, normalize, normalizePort, problems, validateId }
+module.exports = { STORE_PATH, SEED_PATH, RESERVED_IDS, load, save, mutate, normalize, normalizePort, deriveLocalPort, problems, validateId }

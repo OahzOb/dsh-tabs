@@ -149,6 +149,8 @@ function harness(options = {}) {
 	const appListeners = new Map()
 	const sent = []
 	const stops = []
+	/** Every folder chooser this harness was asked to show. */
+	const dialogCalls = []
 	const exits = { server: [], tunnel: [] }
 	/**
 	 * Every guest session the main process asked to empty, and the order of the
@@ -225,6 +227,7 @@ function harness(options = {}) {
 		let serverExit
 		let tunnelExit
 		let stopped = 0
+		let detached = 0
 		return {
 			url: 'http://127.0.0.1:19999/?token=fake',
 			platform: 'posix',
@@ -232,6 +235,17 @@ function harness(options = {}) {
 				stopped += 1
 				stops.push(overrides.url ?? 'http://127.0.0.1:19999/?token=fake')
 			},
+			/**
+			 * Test-only: the persistent half of a teardown.
+			 *
+			 * A real connection's `stop()` *is* `detach()` for a persistent tab, and the
+			 * count is separate so a test can tell "let go" from "torn down" — which is
+			 * the only distinction this mode adds.
+			 */
+			detach() {
+				detached += 1
+			},
+			detachCount: () => detached,
 			/** Test-only: how many times this connection was torn down. A count, not a
 			 * flag, because the defect this suite is watching for is a *second*
 			 * teardown — of a pipe that is already closed, or of a pid that has been
@@ -319,15 +333,6 @@ function harness(options = {}) {
 		return connection
 	}
 
-	/**
-	 * One fake ssh session, in the shape `src/terminal.js` returns.
-	 *
-	 * The native pty is not in this suite's way: what is being checked here is the
-	 * tab's ownership of a session — one start per generation, data routed to the
-	 * right tab, input and resize forwarded, kill on close — and the terminal module's
-	 * own suite exercises the real buffer and argv.
-	 */
-	const terminalSpawns = []
 	/** The family `detectPlatform` answers when the book has not cached one. */
 	const terminalPlatform = 'posix'
 	/** The probe failure a test asked for, if any. */
@@ -355,50 +360,88 @@ function harness(options = {}) {
 		}
 	}
 
-	const terminalStub = {
-		start: (startOptions) => {
-			const session = {
-				pid: 4000 + terminalSpawns.length,
-				attached: false,
-				ended: false,
-				writes: [],
-				resizes: [],
-				killed: 0,
-				held: [],
-				attach() {
-					if (this.attached) return
-					this.attached = true
-					const held = this.held.splice(0, this.held.length)
-					for (const data of held) startOptions.onData?.(data)
-				},
-				write(data) {
-					this.writes.push(data)
-				},
-				resize(cols, rows) {
-					this.resizes.push([cols, rows])
-				},
-				kill() {
-					this.killed += 1
-					this.ended = true
-				},
-				stillRunning() {
-					return !this.ended
-				},
-				/** Test-only: the far side printed something. */
-				emit(data) {
-					if (this.attached) startOptions.onData?.(data)
-					else this.held.push(data)
-				},
-				/** Test-only: the ssh client ended. */
-				exit(code = 0) {
-					this.ended = true
-					startOptions.onExit?.({ exitCode: code, signal: undefined })
-				},
-				startOptions
-			}
-			terminalSpawns.push(session)
-			return session
+	/**
+	 * One fake ssh session, in the shape `src/terminal.js` returns.
+	 *
+	 * The native pty is not in this suite's way: what is being checked here is the
+	 * tab's ownership of a session — one start per generation, data routed to the
+	 * right tab, input and resize forwarded, kill on close — and the terminal module's
+	 * own suite exercises the real buffer and argv.
+	 */
+	const terminalSpawns = []
+
+	/**
+	 * One fake terminal session, in the shape `src/terminal.js` returns.
+	 *
+	 * A local tab and a device tab hand the module different options — `device` and
+	 * `platform` for one, `preset` and `cwd` for the other — but the session the tab
+	 * then owns is the same, and this suite is about the tab's ownership of it.
+	 *
+	 * @param startOptions - what the tab passed in.
+	 * @returns the session.
+	 */
+	function makeTerminalSession(startOptions) {
+		const session = {
+			pid: 4000 + terminalSpawns.length,
+			attached: false,
+			ended: false,
+			writes: [],
+			resizes: [],
+			killed: 0,
+			held: [],
+			attach() {
+				if (this.attached) return
+				this.attached = true
+				const held = this.held.splice(0, this.held.length)
+				for (const data of held) startOptions.onData?.(data)
+			},
+			write(data) {
+				this.writes.push(data)
+			},
+			resize(cols, rows) {
+				this.resizes.push([cols, rows])
+			},
+			kill() {
+				this.killed += 1
+				this.ended = true
+			},
+			stillRunning() {
+				return !this.ended
+			},
+			/** Test-only: the far side printed something. */
+			emit(data) {
+				if (this.attached) startOptions.onData?.(data)
+				else this.held.push(data)
+			},
+			/** Test-only: the process ended. */
+			exit(code = 0) {
+				this.ended = true
+				startOptions.onExit?.({ exitCode: code, signal: undefined })
+			},
+			startOptions
 		}
+		terminalSpawns.push(session)
+		return session
+	}
+
+	const terminalStub = {
+		PRESETS: [
+			{ id: 'shell', label: 'Shell', command: undefined },
+			{ id: 'pi', label: 'pi', command: 'pi' },
+			{ id: 'opencode', label: 'opencode', command: 'opencode' }
+		],
+		start: (startOptions) => makeTerminalSession(startOptions),
+		startLocal: (startOptions) => {
+			// A real resolution failure throws before a pty exists, and the tab has to
+			// show that sentence rather than staying at `starting`.
+			if (options.localError !== undefined) throw new Error(options.localError)
+			return makeTerminalSession(startOptions)
+		},
+		listPresets: () => [
+			{ id: 'shell', label: 'Shell', available: true },
+			{ id: 'pi', label: 'pi', available: true },
+			{ id: 'opencode', label: 'opencode', available: true }
+		]
 	}
 
 	const fakeWindow = {
@@ -466,6 +509,23 @@ function harness(options = {}) {
 			}
 		},
 		clipboard: { readText: () => '', writeText: () => {} },
+		/**
+		 * The folder chooser.
+		 *
+		 * `options.dialog` is either a result or a function of the arguments, so a test
+		 * can answer a specific dialog and inspect the default path it was given. With
+		 * no option the operator cancelled, which is where a test that has no opinion
+		 * about a chooser should land.
+		 */
+		dialog: {
+			async showOpenDialog(...args) {
+				dialogCalls.push(args)
+				const answer = typeof options.dialog === 'function' ? await options.dialog(...args) : options.dialog
+				if (answer === undefined) return { canceled: true, filePaths: [] }
+				if (typeof answer === 'string') return { canceled: false, filePaths: [answer] }
+				return answer
+			}
+		},
 		shell: { openExternal: () => {} },
 		session: {
 			/**
@@ -549,6 +609,7 @@ function harness(options = {}) {
 		ipc,
 		sent,
 		stops,
+		dialogCalls,
 		queue,
 		ok,
 		pending,
@@ -1105,6 +1166,91 @@ await test('quitting tears down every tab that is up', async () => {
 	assert.equal(h.stops.length, 2, `expected two stops, saw ${String(h.stops.length)}`)
 })
 
+console.log('persistent hosts')
+
+/** The one device shape this section needs: a persistent host on a fixed local port. */
+const persistentBook = [{ ...book[0], mode: 'persistent', localPort: 41777 }]
+
+await test('closing a persistent tab lets go of the tunnel and keeps the host', async () => {
+	const h = harness({ devices: persistentBook })
+	await h.boot()
+	await h.call('devices:list')
+	const connection = h.ok({ persistent: true, adopted: true, localPort: 41777 })
+	h.queue.push(connection)
+	await h.call('tabs:activate', 'dev-a')
+	const running = (await h.state()).tabs.find((tab) => tab.id === 'dev-a')
+	assert.equal(running.state, 'running')
+	assert.equal(running.persistent, true)
+	assert.equal(running.url, connection.url)
+	await h.call('tabs:disconnect', 'dev-a')
+	const detached = (await h.state()).tabs.find((tab) => tab.id === 'dev-a')
+	// The whole mode in three assertions: the page and its URL stay, the tab says it
+	// is detached rather than idle, and the far-side process was never torn down.
+	assert.equal(detached.state, 'detached')
+	assert.equal(detached.url, connection.url)
+	assert.equal(detached.persistent, true)
+	assert.equal(connection.stopCount(), 0, 'a plain close tore the host down')
+	assert.equal(connection.detachCount(), 1, 'the tunnel was not let go')
+})
+
+await test('quitting detaches a persistent tab instead of killing its host', async () => {
+	const h = harness({ devices: persistentBook })
+	await h.boot()
+	await h.call('devices:list')
+	const connection = h.ok({ persistent: true, localPort: 41777 })
+	h.queue.push(connection)
+	await h.call('tabs:activate', 'dev-a')
+	h.emitApp('before-quit')
+	assert.equal(connection.detachCount(), 1, 'quitting did not let go of the tunnel')
+	assert.equal(connection.stopCount(), 0, 'quitting killed a host that was meant to outlive it')
+})
+
+await test('a persistent tab survives losing its tunnel and comes back on its own', async () => {
+	const h = harness({ devices: persistentBook })
+	await h.boot()
+	await h.call('devices:list')
+	const first = h.ok({ persistent: true, localPort: 41777 })
+	h.queue.push(first)
+	await h.call('tabs:activate', 'dev-a')
+	first.crashTunnel(255)
+	let tab = (await h.state()).tabs.find((entry) => entry.id === 'dev-a')
+	// A lost tunnel is not a lost host: the tab says so, keeps the page, and does not
+	// claim a failure the operator would have to read as one.
+	assert.equal(tab.state, 'detached')
+	assert.equal(tab.url, first.url)
+	assert.equal(tab.error, undefined)
+	// And the retry is a retry, not the end of the story.
+	const second = h.ok({ persistent: true, localPort: 41777 })
+	h.queue.push(second)
+	await new Promise((resolve) => setTimeout(resolve, 1_400))
+	tab = (await h.state()).tabs.find((entry) => entry.id === 'dev-a')
+	assert.equal(tab.state, 'running', 'the tab never came back')
+	assert.equal(tab.url, second.url)
+})
+
+await test('Stop host ends a persistent host, and only that control does', async () => {
+	const h = harness({ devices: persistentBook })
+	await h.boot()
+	await h.call('devices:list')
+	let terminated = 0
+	const connection = h.ok({
+		persistent: true,
+		localPort: 41777,
+		terminate: async () => {
+			terminated += 1
+			return ['HOST stopped pid=1']
+		}
+	})
+	h.queue.push(connection)
+	await h.call('tabs:activate', 'dev-a')
+	await h.call('tabs:reap', 'dev-a')
+	const tab = (await h.state()).tabs.find((entry) => entry.id === 'dev-a')
+	assert.equal(terminated, 1, 'reap did not end the host')
+	assert.equal(tab.state, 'idle')
+	assert.equal(tab.url, undefined)
+	assert.equal(tab.persistent, undefined)
+})
+
 console.log('restart')
 
 await test('restarting the local tab replaces the Harness instead of closing the application', async () => {
@@ -1543,6 +1689,121 @@ await test('a terminal whose shell family cannot be found fails with the reason'
 	assert.equal(tab.state, 'failed')
 	assert.match(tab.error ?? '', /Connection timed out/u)
 	assert.equal(h.terminalSpawns.length, 0, 'a pty was started without a command to run')
+})
+
+console.log('local terminals')
+
+await test('a shell on this machine opens in the home directory and starts one session', async () => {
+	const h = harness({ devices: [] })
+	await h.boot()
+	const state = await h.call('terminal:openLocal', 'shell')
+	const tab = state.tabs.find((entry) => entry.kind === 'terminal')
+	assert.ok(tab !== undefined, `no local terminal tab: ${JSON.stringify(state.tabs)}`)
+	assert.equal(tab.local, true)
+	assert.equal(tab.preset, 'shell')
+	assert.equal(tab.cwd, homedir())
+	assert.match(tab.label, /^Shell — /u)
+	assert.equal(tab.state, 'running')
+	assert.equal(state.activeId, tab.id)
+	// A local tab is not a Harness tab: the renderer must get no partition, or it
+	// would build a guest for a tab that has no URL.
+	assert.equal(tab.partition, undefined)
+	assert.equal(h.terminalSpawns.length, 1)
+	assert.equal(h.terminalSpawns[0].startOptions.preset, 'shell')
+	assert.equal(h.terminalSpawns[0].startOptions.cwd, homedir())
+	// A shell needs no folder chooser; one that appeared would be a click nobody
+	// asked for.
+	assert.equal(h.dialogCalls.length, 0)
+})
+
+await test('an agent asks for a project first, and the tab carries that directory', async () => {
+	const project = join(HOME, 'project-a')
+	mkdirSync(project, { recursive: true })
+	const h = harness({ devices: [], dialog: { canceled: false, filePaths: [project] } })
+	await h.boot()
+	const state = await h.call('terminal:openLocal', 'pi')
+	const tab = state.tabs.find((entry) => entry.kind === 'terminal')
+	assert.ok(tab !== undefined)
+	assert.equal(tab.preset, 'pi')
+	assert.equal(tab.local, true)
+	assert.equal(tab.cwd, project)
+	assert.equal(tab.label, 'pi — project-a')
+	assert.equal(h.terminalSpawns[0].startOptions.cwd, project)
+
+	// The chooser's default is the last directory, not home: a second agent is one
+	// click away from the first project, not back at the beginning.
+	assert.equal(h.dialogCalls.length, 1)
+	const options = h.dialogCalls[0].at(-1)
+	assert.equal(options.defaultPath, homedir())
+	assert.deepEqual(options.properties, ['openDirectory'])
+	await h.call('terminal:openLocal', 'pi')
+	assert.equal(h.dialogCalls[1].at(-1).defaultPath, project)
+})
+
+await test('cancelling the folder chooser opens no tab', async () => {
+	const h = harness({ devices: [], dialog: { canceled: true, filePaths: [] } })
+	await h.boot()
+	const state = await h.call('terminal:openLocal', 'opencode')
+	assert.equal(state.tabs.filter((entry) => entry.kind === 'terminal').length, 0)
+	assert.equal(h.terminalSpawns.length, 0)
+})
+
+await test('a local tab reconnects in place, in the same directory', async () => {
+	const project = join(HOME, 'project-b')
+	mkdirSync(project, { recursive: true })
+	const h = harness({ devices: [], dialog: { canceled: false, filePaths: [project] } })
+	await h.boot()
+	const opened = await h.call('terminal:openLocal', 'pi')
+	const tab = opened.tabs.find((entry) => entry.kind === 'terminal')
+	const first = h.terminalSpawns[0]
+	first.exit(0)
+	assert.equal((await h.state()).tabs.find((entry) => entry.id === tab.id).state, 'ended')
+
+	const restarted = await h.call('tabs:restart', tab.id)
+	const again = restarted.tabs.find((entry) => entry.id === tab.id)
+	assert.equal(again.state, 'running')
+	assert.equal(again.generation, 2, 'a reconnect reused the generation the renderer keys its screen on')
+	assert.equal(h.terminalSpawns.length, 2)
+	// The directory is part of the tab now; asking again would turn a reconnect into
+	// a new conversation somewhere else.
+	assert.equal(h.dialogCalls.length, 1)
+	assert.equal(h.terminalSpawns[1].startOptions.cwd, project)
+})
+
+await test('a local tab closes like any other terminal', async () => {
+	const h = harness({ devices: [] })
+	await h.boot()
+	const opened = await h.call('terminal:openLocal', 'shell')
+	const tab = opened.tabs.find((entry) => entry.kind === 'terminal')
+	const session = h.terminalSpawns[0]
+	const state = await h.call('tabs:disconnect', tab.id)
+	assert.equal(state.tabs.some((entry) => entry.id === tab.id), false)
+	assert.equal(state.activeId, 'local')
+	assert.equal(session.killed, 1, 'the shell was left running')
+})
+
+await test('a program that is not installed is reported on its tab', async () => {
+	const h = harness({
+		devices: [],
+		dialog: { canceled: false, filePaths: [HOME] },
+		localError: 'pi was not found on PATH; install it, or open a shell and start it there'
+	})
+	await h.boot()
+	const state = await h.call('terminal:openLocal', 'pi')
+	const tab = state.tabs.find((entry) => entry.kind === 'terminal')
+	assert.ok(tab !== undefined, 'a failed start left no tab to explain itself on')
+	assert.equal(tab.state, 'failed')
+	assert.match(tab.error ?? '', /pi was not found on PATH/u)
+	assert.equal(h.terminalSpawns.length, 0, 'a session was created for a program that was not resolved')
+})
+
+await test('the popover is told what this machine can open', async () => {
+	const h = harness({ devices: [] })
+	const answer = await h.call('terminal:presets')
+	assert.deepEqual(
+		answer.presets.map((entry) => entry.id),
+		['shell', 'pi', 'opencode']
+	)
 })
 
 rmSync(HOME, { recursive: true, force: true })

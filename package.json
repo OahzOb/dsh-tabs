@@ -1,6 +1,6 @@
 {
   "name": "dsh-tabs",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Tabbed host for DSH web interfaces: the local one and remote ones over SSH, in a single always-visible tab bar.",
   "author": "OahzOb",
@@ -16,6 +16,7 @@
     "test:main": "node tools/main.mjs",
     "test:renderer": "node tools/renderer.mjs",
     "test:live": "node tools/live-connect.mjs",
+    "test:persistent": "node tools/live-persistent.mjs",
     "contract": "node tools/contract.cjs",
     "readiness": "node tools/readiness.cjs",
     "dist": "electron-builder --win nsis --publish never",

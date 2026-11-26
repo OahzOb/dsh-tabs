@@ -145,7 +145,8 @@ body {
 }
 
 .tab-close,
-.tab-restart {
+.tab-restart,
+.tab-reap {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
@@ -164,13 +165,16 @@ body {
 
 .tab:hover .tab-close,
 .tab:hover .tab-restart,
+.tab:hover .tab-reap,
 .tab[aria-selected='true'] .tab-close,
-.tab[aria-selected='true'] .tab-restart {
+.tab[aria-selected='true'] .tab-restart,
+.tab[aria-selected='true'] .tab-reap {
 	opacity: 0.7;
 }
 
 .tab-close:hover,
-.tab-restart:hover {
+.tab-restart:hover,
+.tab-reap:hover {
 	background: #45454f;
 	opacity: 1;
 }
@@ -346,6 +350,45 @@ body {
 	font-weight: 600;
 }
 
+/* The bar a persistent tab shows while its tunnel is being reopened. Thin and at
+   the top on purpose: the guest underneath is still the page the operator was
+   reading, so a full-screen panel would hide what they are waiting for. */
+.detached-banner {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	z-index: 5;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 12px;
+	background: #1b1c22;
+	border-bottom: 1px solid var(--line);
+	color: var(--dim);
+	font-size: 12px;
+}
+
+.detached-banner span {
+	flex: 1;
+}
+
+.detached-banner button {
+	flex: none;
+	padding: 4px 10px;
+	background: var(--tab);
+	border: 1px solid var(--line);
+	border-radius: 5px;
+	color: var(--fg);
+	cursor: pointer;
+	font: inherit;
+	font-size: 11px;
+}
+
+.detached-banner button:hover {
+	border-color: var(--accent);
+}
+
 .panel {
 	position: absolute;
 	inset: 0;
@@ -417,6 +460,48 @@ body {
 
 #popover[hidden] {
 	display: none;
+}
+
+/* The one part of the popover that needs no device: a shell on this machine, and
+   the agents that render into one. Separated from the device list because the two
+   answer different questions. */
+.local {
+	margin: 2px 0 10px;
+	padding-bottom: 10px;
+	border-bottom: 1px solid var(--line);
+}
+
+.local .hint {
+	margin: 2px 2px 7px;
+}
+
+.local-buttons {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.local-buttons button {
+	flex: 1;
+	padding: 7px 10px;
+	background: var(--tab);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	color: var(--fg);
+	cursor: pointer;
+	font: inherit;
+	font-size: 12px;
+}
+
+.local-buttons button:hover:not(:disabled) {
+	border-color: var(--accent);
+}
+
+/* A program that is not installed is still shown, because its absence is the fact
+   the operator needs; it is only unable to be pressed. */
+.local-buttons button:disabled {
+	opacity: 0.45;
+	cursor: default;
 }
 
 .row {

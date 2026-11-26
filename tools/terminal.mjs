@@ -137,6 +137,123 @@ await test('an unknown shell family is refused by name', async () => {
 	assert.throws(() => terminal.terminalArgv(DEVICE, undefined, 'ssh'), /undefined/u)
 })
 
+console.log('the local presets')
+
+/**
+ * A resolver environment with both platform shapes in it.
+ *
+ * The Windows entries use the `<root>` placeholder rather than a drive letter
+ * because the repository's own guard refuses a path that only exists on the machine
+ * that wrote it, and a fixture has no business naming one. The resolver is asked
+ * about a platform that is not necessarily the one this suite runs on, which is the
+ * point: it must use that platform's separators and `PATHEXT`, not the host's.
+ */
+const LOCAL_ENV = {
+	PATH: '<root>',
+	PATHEXT: '.COM;.EXE;.BAT;.CMD',
+	SystemRoot: '<root>\\Windows',
+	ComSpec: '<root>\\Windows\\System32\\cmd.exe',
+	SHELL: '/bin/zsh'
+}
+
+/**
+ * An `exists` predicate that answers true for the given paths.
+ * @param paths - the paths that exist.
+ * @returns the predicate.
+ */
+function existing(...paths) {
+	return (candidate) => paths.includes(candidate)
+}
+
+await test('a Windows shell prefers pwsh, then powershell, and is rooted in PATH', async () => {
+	const pwsh = terminal.localCommand('shell', {
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\pwsh.exe', '<root>\\powershell.exe')
+	})
+	assert.deepEqual(pwsh, { file: '<root>\\pwsh.exe', args: ['-NoLogo'] })
+
+	const fallback = terminal.localCommand('shell', {
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\powershell.exe')
+	})
+	assert.equal(fallback.file, '<root>\\powershell.exe')
+	// ConPTY does not search PATH, so the answer has to be the full path it was
+	// found at — a bare `powershell` is a tab that fails to spawn.
+	assert.ok(fallback.file.startsWith('<root>\\'), 'the answer was not rooted in the PATH entry')
+})
+
+await test('a POSIX shell is $SHELL, then sh, and never a forced login', async () => {
+	const zsh = terminal.localCommand('shell', {
+		platform: 'linux',
+		env: { ...LOCAL_ENV, PATH: '/usr/local/bin:/usr/bin' },
+		exists: existing('/bin/zsh')
+	})
+	assert.deepEqual(zsh, { file: '/bin/zsh', args: [] })
+
+	// `$SHELL` can name a shell someone uninstalled. The fallback is `sh`, not a tab
+	// that cannot start.
+	const sh = terminal.localCommand('shell', {
+		platform: 'linux',
+		env: { PATH: '/usr/bin', SHELL: '/gone/zsh' },
+		exists: existing('/usr/bin/sh')
+	})
+	assert.deepEqual(sh, { file: '/usr/bin/sh', args: [] })
+})
+
+await test('a Windows agent is started through cmd, because a .cmd is not an executable', async () => {
+	const command = terminal.localCommand('pi', {
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\pi.cmd', '<root>\\Windows\\System32\\cmd.exe')
+	})
+	assert.equal(command.file, '<root>\\Windows\\System32\\cmd.exe')
+	assert.deepEqual(command.args, ['/d', '/s', '/c', '<root>\\pi.cmd'])
+
+	// An .exe needs no interpreter; wrapping it would put cmd between the tab and
+	// the agent for no reason.
+	const exe = terminal.localCommand('opencode', {
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\opencode.exe')
+	})
+	assert.deepEqual(exe, { file: '<root>\\opencode.exe', args: [] })
+})
+
+await test('a POSIX agent is spawned directly, and a missing one is named', async () => {
+	const command = terminal.localCommand('pi', {
+		platform: 'linux',
+		env: { PATH: '/opt/bin' },
+		exists: existing('/opt/bin/pi')
+	})
+	assert.deepEqual(command, { file: '/opt/bin/pi', args: [] })
+
+	assert.throws(
+		() => terminal.localCommand('opencode', { platform: 'linux', env: { PATH: '/opt/bin' }, exists: () => false }),
+		/opencode was not found on PATH/u
+	)
+	assert.throws(() => terminal.localCommand('vim', { platform: 'linux', env: {} }), /unknown local terminal preset "vim"/u)
+})
+
+await test('the preset list marks what cannot be started, with the reason', async () => {
+	const presets = terminal.listPresets({
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\pwsh.exe', '<root>\\Windows\\System32\\cmd.exe')
+	})
+	assert.deepEqual(
+		presets.map((entry) => [entry.id, entry.available]),
+		[
+			['shell', true],
+			['pi', false],
+			['opencode', false]
+		]
+	)
+	// A disabled button is only useful if its tooltip says what to fix.
+	assert.match(presets[1].reason, /pi was not found on PATH/u)
+})
+
 console.log('the session')
 
 /**
@@ -179,6 +296,62 @@ await test('the pty is spawned with the argv, size and a TERM the far side can u
 	// finds. Without this the far side gets no terminal type at all, and `ls` and
 	// `vim` pick their dumb paths.
 	assert.equal(call.options.env.TERM, 'xterm-256color')
+})
+
+await test('a local session is spawned with its preset, directory and size', async () => {
+	const pty = fakePty()
+	const calls = []
+	const received = []
+	const session = terminal.startLocal({
+		preset: 'shell',
+		platform: 'win32',
+		env: LOCAL_ENV,
+		exists: existing('<root>\\pwsh.exe'),
+		cwd: '<root>\\box',
+		cols: 88,
+		rows: 22,
+		spawn: (file, args, options) => {
+			calls.push({ file, args, options })
+			return pty
+		},
+		onData: (data) => received.push(data)
+	})
+	assert.equal(calls.length, 1)
+	const [call] = calls
+	assert.equal(call.file, '<root>\\pwsh.exe')
+	assert.deepEqual(call.args, ['-NoLogo'])
+	// The directory reaches the pty as an option, not as a `cd` typed into a shell:
+	// that is what makes "pi starts in this project" true for the program's whole
+	// lifetime, including its first prompt.
+	assert.equal(call.options.cwd, '<root>\\box')
+	assert.equal(call.options.cols, 88)
+	assert.equal(call.options.rows, 22)
+
+	// The same hold-until-attach rule as a remote terminal: the first thing a failing
+	// program prints is the reason, and it prints it before the renderer has a screen.
+	pty.emit('PS> ')
+	assert.deepEqual(received, [], 'the local session drew before there was a screen')
+	session.attach()
+	assert.deepEqual(received, ['PS> '])
+})
+
+await test('a local preset that is missing fails before any pty is spawned', async () => {
+	let spawned = 0
+	assert.throws(
+		() =>
+			terminal.startLocal({
+				preset: 'pi',
+				platform: 'linux',
+				env: { PATH: '/opt/bin' },
+				exists: () => false,
+				spawn: () => {
+					spawned += 1
+					return fakePty()
+				}
+			}),
+		/pi was not found on PATH/u
+	)
+	assert.equal(spawned, 0, 'a pty was spawned for a preset that could not be resolved')
 })
 
 await test('output is held until attach, then released once and in order', async () => {

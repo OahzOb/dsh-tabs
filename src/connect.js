@@ -443,6 +443,157 @@ function awaitReady(child, onLine, timeoutMs, check = waitForHttpReady) {
 }
 
 /**
+ * Read the persistent-host program's output until it names a URL.
+ *
+ * The program adopts or starts a host, says which (`HOST adopted …` or
+ * `HOST started …`), and then prints the ordinary readiness line. So this asks
+ * the same question `awaitReady` asks, with one extra answer — *was it already
+ * there?* — and it reports the program's own `HOST error …` line instead of an
+ * exit code, because that line is the one written to be read.
+ *
+ * @param child - the one-shot ssh client running the ensure program.
+ * @param onLine - receives each transcript line.
+ * @returns the URL and whether it was adopted, or the reason it failed.
+ */
+function awaitEnsure(child, onLine) {
+	return new Promise((resolve) => {
+		let raw = ''
+		let err = ''
+		let settled = false
+		/**
+		 * Settle once, and stop the client: the ensure program has already done its
+		 * work by then, so a lingering ssh client is only a stray process.
+		 * @param value - the result to resolve with.
+		 * @param stop - whether to kill the client.
+		 */
+		const finish = (value, stop = false) => {
+			if (settled) return
+			settled = true
+			clearTimeout(timer)
+			if (stop) {
+				try {
+					child.kill()
+				} catch {
+					/* already gone */
+				}
+			}
+			resolve(value)
+		}
+		// The program gives up on its own at `HOST_START_TIMEOUT_MS`; this is the
+		// deadline for the *channel*, which is a different thing and can hang on its
+		// own — a wedged ssh client holds no output at all.
+		const timer = setTimeout(() => {
+			finish({ error: `the persistent host did not answer within ${String(Math.round(remote.HOST_START_TIMEOUT_MS / 1000))}s` }, true)
+		}, remote.HOST_START_TIMEOUT_MS + 15_000)
+		const adopted = () => /^HOST adopted /mu.test(raw)
+		child.stdout.setEncoding('utf8')
+		child.stderr.setEncoding('utf8')
+		child.stdout.on('data', (chunk) => {
+			raw += chunk
+			for (const line of String(chunk).split(/\r?\n/u)) {
+				if (line.trim() === '') continue
+				onLine(line)
+				const failed = /^HOST error (.+)$/u.exec(line)
+				if (failed !== null) {
+					finish({ error: failed[1] })
+					return
+				}
+			}
+			if (settled) return
+			const url = remote.readyUrl(raw)
+			// **The client is stopped once the URL is in hand, and that is not tidiness.**
+			// The ensure program has already finished its work by then — the host is
+			// detached — but the ssh *channel* can stay open for a reason that has
+			// nothing to do with the Harness: a login profile on the far side that leaves
+			// a background process holding the session's stdout. Measured on a real Linux
+			// remote where even `ssh host 'echo hi'` never returned. Waiting for an exit
+			// that may never come would hang every persistent connect on such a host.
+			if (url !== null) finish({ url, adopted: adopted() }, true)
+		})
+		child.stderr.on('data', (chunk) => {
+			err += chunk
+			for (const line of String(chunk).split(/\r?\n/u)) {
+				if (line.trim() !== '') onLine(`! ${line}`)
+			}
+		})
+		child.once('exit', () => {
+			if (settled) return
+			// The line may be unterminated when the client closes: the process is known
+			// to have stopped by now, so the partial-line rule applies.
+			const url = remote.readyUrl(raw, true)
+			if (url !== null) {
+				finish({ url, adopted: adopted() })
+				return
+			}
+			const said = raw.trim().split(/\r?\n/u).filter((line) => line.trim() !== '').pop()
+			finish({ error: said ?? (err.trim().split(/\r?\n/u)[0] || 'the persistent host command exited without announcing a URL') })
+		})
+		child.once('error', () => {
+			finish({ error: 'ssh could not be started', stop: true })
+		})
+	})
+}
+
+/**
+ * Stop the host a persistent device is using, and remove its record.
+ *
+ * Run only from an explicit operator action — "Stop host" on the device, or a
+ * reap the operator confirmed — because the host may be serving another client
+ * and the work it is doing belongs to somebody.
+ *
+ * @param device - the device whose host is being stopped.
+ * @param platform - the shell family the far side speaks.
+ * @param ssh - the resolved ssh executable.
+ * @param onLine - receives each transcript line.
+ * @returns the stop program's stdout lines.
+ */
+async function stopPersistentHost(device, platform, ssh, onLine) {
+	const target = `${device.user}@${device.host}`
+	const child = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(remote.persistentStopProgram(device, platform), platform)], {
+		stdio: ['ignore', 'pipe', 'pipe'],
+		windowsHide: true
+	})
+	const lines = []
+	child.stdout?.setEncoding('utf8')
+	child.stderr?.setEncoding('utf8')
+	child.stdout?.on('data', (chunk) => {
+		for (const line of String(chunk).split(/\r?\n/u)) {
+			if (line.trim() === '') continue
+			lines.push(line)
+			onLine(line)
+		}
+	})
+	child.stderr?.on('data', (chunk) => {
+		for (const line of String(chunk).split(/\r?\n/u)) {
+			if (line.trim() !== '') onLine(`! ${line}`)
+		}
+	})
+	// Bounded, for the same reason `awaitEnsure` stops its client: the stop program
+	// exits, but the channel need not. The work is done either way — the record is
+	// gone and the pid is dead — so waiting is only about the transcript.
+	await new Promise((resolve) => {
+		const timer = setTimeout(() => {
+			try {
+				child.kill()
+			} catch {
+				/* already gone */
+			}
+			resolve(undefined)
+		}, 20_000)
+		timer.unref?.()
+		child.once('exit', () => {
+			clearTimeout(timer)
+			resolve(undefined)
+		})
+		child.once('error', () => {
+			clearTimeout(timer)
+			resolve(undefined)
+		})
+	})
+	return lines
+}
+
+/**
  * Which shell family the far side speaks, cached on the device record.
  *
  * `uname -s` is one argv element with no metacharacters, so it survives every
@@ -521,6 +672,15 @@ async function connectRemoteBody(device, options = {}) {
 	const target = `${device.user}@${device.host}`
 	onLine(`connect ${target}:${String(device.sshPort)}`)
 
+	// **A persistent device owns a host that is not this connection's to end.** It is
+	// adopted or started by a one-shot command, the tunnel is the only thing this
+	// connection keeps alive, and closing the tab must mean "detach", not "kill".
+	const persistent = device.mode === 'persistent'
+	// A stable local port is what makes the browser's cookie and the page's own
+	// `dsh.sessions.current` survive a reconnect: both are keyed by origin, and an
+	// ephemeral port changes it on every connect. A device that names one gets it.
+	const fixedPort = persistent && Number.isInteger(device.localPort) && device.localPort > 0 ? device.localPort : undefined
+
 	// Two clients are spawned a long way apart — a platform probe, a readiness line,
 	// a port and a tunnel probe sit between them — so a cancellation is carried as a
 	// local flag rather than as one listener on one process. That flag is what the
@@ -574,30 +734,51 @@ async function connectRemoteBody(device, options = {}) {
 	onLine(`remote platform: ${platform}`)
 	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 
-	//#region phase 1 — start the server, learn the port it chose
-	const program = remote.remoteProgram(device, platform)
-	const server = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(program, platform)], {
-		// stdin MUST stay an open pipe: its closure at teardown is what reaps the
-		// remote server. Never written to.
-		stdio: ['pipe', 'pipe', 'pipe'],
-		windowsHide: true
-	})
-	if (!keep(server)) return { error: 'the connect was stopped before it finished' }
-	// The announced URL is on the far side of a tunnel this call has not opened yet, so
-	// there is nothing here for the real check to reach. Phase 2 asks it instead, against
-	// the local address it builds — see `servesAnywhere`.
-	const ready = await awaitReady(server, onLine, remote.START_TIMEOUT_MS, servesAnywhere)
-	if (ready.error !== undefined) {
-		stopChild(server, true)
-		live.clear()
-		return { error: ready.error }
+	//#region phase 1 — start (or adopt) the far side, learn the port it chose
+	let hold = null
+	let adopted = false
+	let announced
+	if (persistent) {
+		// One-shot: adopt the recorded host or start one that outlives this channel.
+		// `stdio` is deliberately `ignore` on stdin — nothing here holds the far side
+		// open, because the host's lifetime is its record, not this pipe.
+		const ensure = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(remote.persistentEnsureProgram(device, platform), platform)], {
+			stdio: ['ignore', 'pipe', 'pipe'],
+			windowsHide: true
+		})
+		if (!keep(ensure)) return { error: 'the connect was stopped before it finished' }
+		const ensured = await awaitEnsure(ensure, onLine)
+		live.delete(ensure)
+		if (ensured.error !== undefined) return { error: ensured.error }
+		adopted = ensured.adopted === true
+		announced = ensured.url
+		onLine(adopted ? 'reusing the host this home already had' : 'started a host that will outlive this connection')
+	} else {
+		const program = remote.remoteProgram(device, platform)
+		hold = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(program, platform)], {
+			// stdin MUST stay an open pipe: its closure at teardown is what reaps the
+			// remote server. Never written to.
+			stdio: ['pipe', 'pipe', 'pipe'],
+			windowsHide: true
+		})
+		if (!keep(hold)) return { error: 'the connect was stopped before it finished' }
+		// The announced URL is on the far side of a tunnel this call has not opened yet,
+		// so there is nothing here for the real check to reach. Phase 2 asks it instead,
+		// against the local address it builds — see `servesAnywhere`.
+		const ready = await awaitReady(hold, onLine, remote.START_TIMEOUT_MS, servesAnywhere)
+		if (ready.error !== undefined) {
+			stopChild(hold, true)
+			live.clear()
+			return { error: ready.error }
+		}
+		announced = ready.url
 	}
 	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	//#endregion
 
 	//#region phase 2 — forward a local port to the port the remote announced
-	const { port: remotePort, token } = remote.parseReadyUrl(ready.url)
-	const localPort = await freePort()
+	const { port: remotePort, token } = remote.parseReadyUrl(announced)
+	const localPort = fixedPort ?? await freePort()
 	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	onLine(`tunnel 127.0.0.1:${String(localPort)} -> 127.0.0.1:${String(remotePort)}`)
 	const tunnel = spawn(ssh, [...remote.sshOptions(device), '-N', '-L', `${String(localPort)}:127.0.0.1:${String(remotePort)}`, target], {
@@ -612,10 +793,14 @@ async function connectRemoteBody(device, options = {}) {
 		}
 	})
 	if (!(await waitForLocalPort(localPort, remote.TUNNEL_TIMEOUT_MS))) {
-		stopChild(server, true)
+		if (hold !== null) stopChild(hold, true)
 		stopChild(tunnel, true)
 		live.clear()
-		return { error: 'the ssh tunnel never began accepting connections' }
+		return {
+			error: fixedPort === undefined
+				? 'the ssh tunnel never began accepting connections'
+				: `the local port ${String(localPort)} is already in use, so the tunnel could not listen on it`
+		}
 	}
 	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 
@@ -630,7 +815,7 @@ async function connectRemoteBody(device, options = {}) {
 	const serves = await waitForHttpReady(url, HTTP_READY_TIMEOUT_MS)
 	if (!serves.ok) {
 		onLine(`! ${url.replace(/token=[^&]*/u, 'token=<hidden>')} answered ${serves.reason}`)
-		stopChild(server, true)
+		if (hold !== null) stopChild(hold, true)
 		stopChild(tunnel, true)
 		live.clear()
 		return { error: `the Harness announced a URL the tunnel could not serve: it answered ${serves.reason}` }
@@ -642,39 +827,79 @@ async function connectRemoteBody(device, options = {}) {
 	// no reason to spend a remover on it — but the set it walks is emptied.
 	handOver()
 
+	/** End the ephemeral exec channel: its stdin EOF is what reaps the far side. */
+	const endHold = () => {
+		if (hold === null || hold.exitCode !== null) return
+		try {
+			hold.stdin?.end()
+		} catch {
+			/* the pipe may already be gone */
+		}
+	}
+	/** Drop the forward. A host behind it is not this connection's to end. */
+	const closeTunnel = () => {
+		if (tunnel.exitCode === null) {
+			try {
+				tunnel.kill()
+			} catch {
+				/* already gone */
+			}
+		}
+	}
+
 	return {
 		platform,
 		localPort,
 		remotePort,
 		token,
 		url,
+		/** Whether this connection adopted or started a host that outlives it. */
+		persistent,
+		/** Whether the host already existed when this connection arrived. */
+		adopted,
 		/**
 		 * Honor the teardown contract.
 		 *
-		 * Order matters. Ending the server connection's stdin reaches EOF on the
-		 * far side, which is what makes the remote `dsh web` exit; killing the ssh
-		 * client first would drop the connection without the far side ever
-		 * learning it should stop, leaving an orphaned server holding the port.
+		 * Order matters on the ephemeral path. Ending the server connection's stdin
+		 * reaches EOF on the far side, which is what makes the remote `dsh web` exit;
+		 * killing the ssh client first would drop the connection without the far side
+		 * ever learning it should stop, leaving an orphaned server holding the port.
+		 *
+		 * **A persistent connection has no such obligation, and must not pretend it
+		 * does.** Closing the tab means "let go": this closes the tunnel and leaves
+		 * the host running, which is the entire point of the mode. `terminate()` is
+		 * the one that ends a host, and only an explicit operator action calls it.
 		 */
 		stop() {
-			if (server.exitCode === null) {
-				try {
-					server.stdin?.end()
-				} catch {
-					/* the pipe may already be gone */
-				}
-			}
-			if (tunnel.exitCode === null) {
-				try {
-					tunnel.kill()
-				} catch {
-					/* already gone */
-				}
-			}
+			if (!persistent) endHold()
+			closeTunnel()
 		},
-		/** Fires when the server connection ends on its own. */
+		/** Let go of the forward and leave the host exactly as it was. */
+		detach() {
+			closeTunnel()
+		},
+		/**
+		 * End the host as well as the forward.
+		 * @returns the stop program's output, for the transcript.
+		 */
+		terminate() {
+			closeTunnel()
+			if (!persistent) {
+				endHold()
+				return Promise.resolve([])
+			}
+			return stopPersistentHost(device, platform, ssh, onLine)
+		},
+		/**
+		 * Fires when the server connection ends on its own.
+		 *
+		 * A persistent connection has no server connection to watch: its host is
+		 * somebody else's process, and the tunnel is the only thing that can end
+		 * under it. Callers that reconnect use `onTunnelExit`.
+		 */
 		onServerExit(listener) {
-			server.once('exit', (code) => {
+			if (hold === null) return
+			hold.once('exit', (code) => {
 				listener(code)
 			})
 		},
@@ -685,17 +910,17 @@ async function connectRemoteBody(device, options = {}) {
 			})
 		},
 		/**
-		 * Whether either half of this connection is still a live process.
+		 * Whether a process this connection owns is still a live process.
 		 *
-		 * Asked by a restart, which has to know that the far-side server is really
-		 * gone before it starts a replacement. `exitCode` is Node's own record of an
+		 * Asked by a restart, which has to know that what it owns is really gone
+		 * before it starts a replacement. `exitCode` is Node's own record of an
 		 * ended child, so this cannot disagree with the `exit` events above about
 		 * whether something is still there.
 		 *
-		 * @returns true while a process this connection owns has not ended.
+		 * @returns true while the tunnel — or, ephemeral, the hold — has not ended.
 		 */
 		stillRunning() {
-			return server.exitCode === null || tunnel.exitCode === null
+			return (hold !== null && hold.exitCode === null) || tunnel.exitCode === null
 		}
 	}
 }
@@ -912,4 +1137,21 @@ async function connectLocal(options = {}) {
 	return guarded(options, (wrapped) => connectLocalBody(wrapped))
 }
 
-module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, connectRemote, connectLocal, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }
+/**
+ * Stop the host one persistent device is using, without a tab that owns it.
+ *
+ * The tab has usually let go already — closing a persistent tab drops the tunnel
+ * and leaves the host — so "Stop host" has no connection object to ask. This is
+ * the same program `terminate()` runs, reached from a device record instead.
+ *
+ * @param device - the device whose host is being stopped.
+ * @param platform - the shell family the far side speaks.
+ * @param options - `onLine` for the transcript.
+ * @returns the stop program's output lines.
+ */
+async function stopHost(device, platform = 'posix', options = {}) {
+	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
+	return stopPersistentHost(device, platform, sshExecutable(), onLine)
+}
+
+module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, connectRemote, connectLocal, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }

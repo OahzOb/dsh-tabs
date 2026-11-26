@@ -1,5 +1,8 @@
 'use strict'
 
+const { existsSync } = require('node:fs')
+const { posix, win32 } = require('node:path')
+
 const remote = require('./remote.js')
 
 /**
@@ -127,6 +130,173 @@ function terminalArgv(device, platform, ssh = 'ssh') {
 }
 
 /**
+ * The programs a terminal tab can be opened on **on this machine**.
+ *
+ * A preset is a program name, not a path: an installation is found through the
+ * operator's `PATH`, which is the only thing that knows where it is today. `shell`
+ * has no command because the answer is the account's own shell — `$SHELL` on POSIX,
+ * PowerShell on Windows — and `localCommand` is where that is decided.
+ *
+ * The other two are coding agents that render a full-screen TUI. They are here for
+ * the same reason any other terminal program is: the tab is a real terminal and the
+ * agent is the process inside it, so nothing here has to understand their protocols,
+ * and nothing breaks when they change their interface.
+ */
+const PRESETS = Object.freeze([
+	{ id: 'shell', label: 'Shell', command: undefined },
+	{ id: 'pi', label: 'pi', command: 'pi' },
+	{ id: 'opencode', label: 'opencode', command: 'opencode' }
+])
+
+/**
+ * The suffixes a bare program name may acquire on one platform.
+ *
+ * `PATHEXT` rather than a hardcoded `.EXE;.CMD`: an operator can add an extension
+ * there, and a resolver that ignored it would disagree with the shell the operator
+ * types into. The value is used in order, because that is the precedence Windows
+ * itself gives the listed extensions.
+ *
+ * @param platform - the platform.
+ * @param env - the environment carrying `PATHEXT`.
+ * @returns the suffixes, in the order they are tried.
+ */
+function executableSuffixes(platform, env) {
+	if (platform !== 'win32') return ['']
+	const value = typeof env.PATHEXT === 'string' && env.PATHEXT.trim() !== '' ? env.PATHEXT : '.COM;.EXE;.BAT;.CMD'
+	// Lowercased because Windows resolves the suffix case-insensitively but the path
+	// this returns is on screen in a tab's title; one spelling is easier to read, and
+	// the filesystem does not care.
+	return value
+		.split(';')
+		.map((suffix) => suffix.trim().toLowerCase())
+		.filter((suffix) => suffix !== '')
+}
+
+/**
+ * Find one program on `PATH`, and answer its **absolute** path.
+ *
+ * The absoluteness is not tidiness. `node-pty` on Windows hands the name to ConPTY,
+ * and the native side does **not** search `PATH` the way a shell does — measured:
+ * `pty.spawn('pwsh', …)` throws `File not found:` while the same call with
+ * `C:\Program Files\PowerShell\7\pwsh.exe` starts. (`ssh` has always worked for the
+ * same reason: `connect.sshExecutable` resolves it to an absolute path before the
+ * pty ever sees it.) So the resolution happens here, once, and the pty is only ever
+ * given a path that exists.
+ *
+ * @param name - the bare program name.
+ * @param options - `platform`, `env`, and an `exists` predicate for a test.
+ * @returns the absolute path, or undefined when no directory on PATH has it.
+ */
+function findExecutable(name, options = {}) {
+	const platform = options.platform ?? process.platform
+	const env = options.env ?? process.env
+	const exists = options.exists ?? existsSync
+	const pathApi = platform === 'win32' ? win32 : posix
+	const separator = platform === 'win32' ? ';' : ':'
+	const value = env.PATH ?? env.Path ?? ''
+	if (typeof value !== 'string' || value === '') return undefined
+	const suffixes = executableSuffixes(platform, env)
+	for (const entry of value.split(separator)) {
+		// A quoted PATH entry is unusual and legal, and the quotes are not part of the
+		// directory name.
+		const directory = entry.trim().replace(/^"(.*)"$/u, '$1')
+		if (directory === '') continue
+		for (const suffix of suffixes) {
+			const candidate = pathApi.join(directory, `${name}${suffix}`)
+			if (exists(candidate)) return candidate
+		}
+	}
+	return undefined
+}
+
+/**
+ * The program and argv that open one local preset.
+ *
+ * The three branches differ for reasons that are not cosmetic:
+ *
+ * - **Windows shell.** `pwsh` is preferred and `powershell` is the fallback, because
+ *   PowerShell 7 is not installed everywhere and the one that is installed is the one
+ *   the operator calls their shell. `-NoLogo` only: the profile is part of the shell,
+ *   and `exit` has to end the session rather than leave a wrapper prompt.
+ * - **POSIX shell.** `$SHELL`, then `sh`. No `-l`: an interactive shell already reads
+ *   its interactive profile, and forcing a login would run the login profile in a
+ *   session the operator did not ask to be a login.
+ * - **A `.cmd` shim.** `pi` and `opencode` install as `.cmd` files on Windows, and
+ *   `CreateProcess` cannot execute one — it needs `cmd.exe` to read it. The shim goes
+ *   in as the command text, which is the form `cmd /s /c` expects; no quotes are
+ *   added here because node-pty quotes each argv element itself.
+ *
+ * @param preset - `shell`, `pi` or `opencode`.
+ * @param options - `platform`, `env`, and an `exists` predicate for a test.
+ * @returns `{ file, args }` for the pty.
+ */
+function localCommand(preset, options = {}) {
+	const platform = options.platform ?? process.platform
+	const env = options.env ?? process.env
+	const exists = options.exists ?? existsSync
+	const spec = PRESETS.find((entry) => entry.id === preset)
+	if (spec === undefined) throw new Error(`unknown local terminal preset "${String(preset)}"`)
+
+	if (spec.id === 'shell') {
+		if (platform === 'win32') {
+			const pwsh = findExecutable('pwsh', { platform, env, exists })
+			if (pwsh !== undefined) return { file: pwsh, args: ['-NoLogo'] }
+			const powershell = findExecutable('powershell', { platform, env, exists })
+			if (powershell !== undefined) return { file: powershell, args: ['-NoLogo'] }
+			const fallback = win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+			if (exists(fallback)) return { file: fallback, args: ['-NoLogo'] }
+			throw new Error('no PowerShell was found on PATH, so there is no shell to open')
+		}
+		const named = typeof env.SHELL === 'string' && env.SHELL !== '' ? env.SHELL : undefined
+		if (named !== undefined && posix.isAbsolute(named) && exists(named)) return { file: named, args: [] }
+		const sh = findExecutable('sh', { platform, env, exists })
+		if (sh !== undefined) return { file: sh, args: [] }
+		if (exists('/bin/sh')) return { file: '/bin/sh', args: [] }
+		throw new Error('no shell was found: $SHELL is unset and /bin/sh does not exist')
+	}
+
+	const found = findExecutable(spec.command, { platform, env, exists })
+	if (found === undefined) {
+		throw new Error(`${spec.command} was not found on PATH; install it, or open a shell and start it there`)
+	}
+	if (platform === 'win32' && !/\.exe$/iu.test(found)) {
+		const comspec =
+			typeof env.ComSpec === 'string' && exists(env.ComSpec)
+				? env.ComSpec
+				: win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe')
+		if (!exists(comspec)) throw new Error(`cmd.exe was not found, and ${spec.command} is a script that needs it`)
+		return { file: comspec, args: ['/d', '/s', '/c', found] }
+	}
+	return { file: found, args: [] }
+}
+
+/**
+ * Every local preset, with whether it can be started right now.
+ *
+ * The renderer draws a disabled button carrying the reason rather than a button
+ * that asks for a folder and only then fails: a missing install is found here,
+ * before anything is asked of the operator.
+ *
+ * @param options - `platform`, `env`, and an `exists` predicate.
+ * @returns the presets, each `{ id, label, available, reason? }`.
+ */
+function listPresets(options = {}) {
+	return PRESETS.map((preset) => {
+		try {
+			localCommand(preset.id, options)
+			return { id: preset.id, label: preset.label, available: true }
+		} catch (error) {
+			return {
+				id: preset.id,
+				label: preset.label,
+				available: false,
+				reason: error instanceof Error ? error.message : String(error)
+			}
+		}
+	})
+}
+
+/**
  * Clamp a requested column count to something a pty can be asked for.
  * @param value - the requested columns.
  * @returns a whole number in range.
@@ -172,34 +342,41 @@ function spawnPty(file, args, options) {
 }
 
 /**
- * Start one interactive session.
+ * Start one process on a pseudo-terminal, and wrap it in a session.
  *
- * The returned session buffers the far side's first words until the renderer has
+ * The returned session buffers the process's first words until the renderer has
  * attached an xterm to it. That is not an optimisation: the tab becomes `running`
  * in the same turn the process is spawned, but the renderer still has to receive
- * the state push, create the terminal and send `attach` back — and a failed ssh
- * prints everything it has to say well inside that window.
+ * the state push, create the terminal and send `attach` back — and a failing
+ * program prints everything it has to say well inside that window.
  *
- * @param options - `device`, `platform`, `ssh`, `cols`, `rows`, `env`, `cwd`,
- *   `onData`, `onExit`, and `spawn` for a test harness.
+ * `env` and `cwd` reach the child through node-pty, and on Windows ConPTY honours
+ * both (measured: a child asked for `<root>\project` and a variable set only in these
+ * options saw both). That is what makes "pi starts in this folder" a property of the
+ * spawn rather than a `cd` typed into a shell afterwards.
+ *
+ * @param file - the executable; absolute on Windows, where ConPTY does not search
+ *   `PATH`.
+ * @param args - its argv.
+ * @param options - `cols`, `rows`, `env`, `cwd`, `onData`, `onExit`, and `spawn`
+ *   for a test harness.
  * @returns the session.
  */
-function start(options = {}) {
-	if (options.device === undefined) throw new Error('terminal.start needs a device')
-	const argv = terminalArgv(options.device, options.platform, options.ssh ?? 'ssh')
+function spawnSession(file, args, options = {}) {
 	const cols = clampCols(options.cols ?? DEFAULT_COLS)
 	const rows = clampRows(options.rows ?? DEFAULT_ROWS)
 	const onData = typeof options.onData === 'function' ? options.onData : () => {}
 	const onExit = typeof options.onExit === 'function' ? options.onExit : () => {}
 	const spawn = typeof options.spawn === 'function' ? options.spawn : spawnPty
-	const pty = spawn(argv[0], argv.slice(1), {
+	const pty = spawn(file, args, {
 		name: 'xterm-256color',
 		cols,
 		rows,
-		// The local environment is what ssh reads to decide what to send the far
-		// side, and a GUI-launched process has no TERM at all. Naming the terminal
-		// here is what makes a POSIX remote's `ls --color`, `vim` and prompt pick
-		// their xterm paths instead of their dumb-terminal ones.
+		// The local environment is what a terminal program reads to decide what it
+		// can draw, and a GUI-launched process has no TERM at all. Naming the
+		// terminal here is what makes `ls --color`, `vim` and a TUI pick their
+		// xterm paths instead of their dumb-terminal ones. The same TERM reaches a
+		// far side over ssh, which is why this is not local-only.
 		env: { ...process.env, ...(options.env ?? {}), TERM: 'xterm-256color' },
 		cwd: options.cwd ?? process.cwd()
 	})
@@ -280,7 +457,7 @@ function start(options = {}) {
 				/* a pty that is already gone */
 			}
 		},
-		/** End the session and the ssh client with it. */
+		/** End the session and the process with it. */
 		kill() {
 			if (ended || killed) return
 			killed = true
@@ -290,7 +467,7 @@ function start(options = {}) {
 				/* already gone */
 			}
 		},
-		/** Whether the ssh client is still alive. */
+		/** Whether the process is still alive. */
 		stillRunning() {
 			return !ended
 		},
@@ -305,16 +482,51 @@ function start(options = {}) {
 	}
 }
 
+/**
+ * Start one interactive ssh session.
+ *
+ * @param options - `device`, `platform`, `ssh`, and everything `spawnSession`
+ *   takes.
+ * @returns the session.
+ */
+function start(options = {}) {
+	if (options.device === undefined) throw new Error('terminal.start needs a device')
+	const argv = terminalArgv(options.device, options.platform, options.ssh ?? 'ssh')
+	return spawnSession(argv[0], argv.slice(1), options)
+}
+
+/**
+ * Start one program on **this machine** in a terminal.
+ *
+ * The preset decides the program and the caller decides the directory. The
+ * resolution throws with the sentence the tab will show: a missing `pi` becomes a
+ * failed tab that says so, rather than a tab that quietly started a shell instead
+ * and left the operator to work out which program they were talking to.
+ *
+ * @param options - `preset`, `cwd`, and everything `spawnSession` takes.
+ * @returns the session.
+ */
+function startLocal(options = {}) {
+	const command = localCommand(options.preset, options)
+	return spawnSession(command.file, command.args, options)
+}
+
 module.exports = {
 	DEFAULT_COLS,
 	DEFAULT_ROWS,
 	MAX_COLS,
 	MAX_ROWS,
 	MAX_PENDING,
+	PRESETS,
 	windowsShellScript,
+	executableSuffixes,
+	findExecutable,
+	localCommand,
+	listPresets,
 	terminalCommand,
 	terminalArgv,
 	clampCols,
 	clampRows,
-	start
+	start,
+	startLocal
 }

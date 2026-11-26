@@ -33,6 +33,16 @@ let state = { tabs: [], activeId: 'local' }
 let devices = []
 
 /**
+ * The programs this machine can open in a terminal tab, as the main process
+ * resolved them.
+ *
+ * A preset that is not installed arrives with `available: false` and the reason its
+ * resolver gave, so the popover can draw a disabled button instead of a control that
+ * asks for a folder and only then reports that there was nothing to run.
+ */
+let presets = []
+
+/**
  * Tell CSS which platform this is.
  *
  * The tab bar doubles as the window chrome, so on Windows and Linux the OS draws
@@ -60,7 +70,14 @@ function renderTabs() {
 		button.className = 'tab'
 		button.setAttribute('role', 'tab')
 		button.setAttribute('aria-selected', tab.id === state.activeId ? 'true' : 'false')
-		button.title = index < 9 ? `${tab.label} — Alt+${String(index + 1)}` : tab.label
+		const shortcut = index < 9 ? ` — Alt+${String(index + 1)}` : ''
+		// A local tab's label carries the folder's last segment, which is not enough
+		// to tell two projects apart when they share one. The tooltip is where the
+		// whole path fits.
+		button.title =
+			tab.kind === 'terminal' && tab.local === true && typeof tab.cwd === 'string'
+				? `${tab.preset === 'shell' ? 'Shell' : String(tab.preset)} in ${tab.cwd}${shortcut}`
+				: `${tab.label}${shortcut}`
 
 		const dot = document.createElement('span')
 		dot.className = 'dot'
@@ -121,12 +138,31 @@ function renderTabs() {
 			stop.type = 'button'
 			stop.className = 'tab-close'
 			stop.textContent = '×'
-			stop.title = tab.kind === 'terminal' ? 'Close terminal' : 'Disconnect'
+			// A persistent tab's `×` is "let go", not "kill": the host outlives the
+			// window by design, so the title has to say so rather than promise a stop
+			// it does not perform.
+			stop.title = tab.kind === 'terminal' ? 'Close terminal' : tab.persistent === true ? 'Disconnect (the host keeps running)' : 'Disconnect'
 			stop.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void api.disconnect(tab.id).then(apply)
 			})
 			controls.appendChild(stop)
+		}
+
+		// The one control that ends a persistent host, and it is only drawn for a
+		// persistent tab: discoverable where it applies, absent where it would be the
+		// ordinary `×` under a second name.
+		if (tab.persistent === true && (tab.state === 'running' || tab.state === 'detached')) {
+			const reap = document.createElement('button')
+			reap.type = 'button'
+			reap.className = 'tab-reap'
+			reap.textContent = '■'
+			reap.title = 'Stop the host on the far side. Anything it is running stops.'
+			reap.addEventListener('click', (event) => {
+				event.stopPropagation()
+				void api.reap(tab.id).then(apply)
+			})
+			controls.appendChild(reap)
 		}
 
 		button.appendChild(controls)
@@ -487,7 +523,12 @@ function renderContent() {
 			}
 			continue
 		}
-		if (tab.state !== 'running' || tab.url === undefined) continue
+		// **A detached persistent tab keeps its guest, and that is the feature.** The
+		// document is still the page the operator was reading: its transport retries on
+		// its own, and it holds the Session view, the scroll position and the half-typed
+		// message. Destroying the element would throw all of that away to redraw the same
+		// URL a few seconds later.
+		if ((tab.state !== 'running' && tab.state !== 'detached') || tab.url === undefined) continue
 		wanted.add(tab.id)
 		const existing = views.get(tab.id)
 		if (existing !== undefined && existing.url === tab.url) continue
@@ -544,11 +585,48 @@ function renderContent() {
 			terminal.term.focus()
 		}
 	}
-	const panels = contentEl.querySelectorAll('.panel')
+	const panels = contentEl.querySelectorAll('.panel, .detached-banner')
 	for (const panel of panels) panel.remove()
-	if (active !== undefined && active.kind !== 'terminal' && (active.state !== 'running' || active.url === undefined)) {
-		contentEl.appendChild(panelFor(active))
+	if (active !== undefined && active.kind !== 'terminal') {
+		const needsPanel = (active.state !== 'running' && active.state !== 'detached') || active.url === undefined
+		if (needsPanel) contentEl.appendChild(panelFor(active))
+		else if (active.state === 'detached' && active.persistent === true) contentEl.appendChild(detachedBanner(active))
 	}
+}
+
+/**
+ * The bar a persistent tab shows while its tunnel is being reopened.
+ *
+ * Deliberately thin and at the top: the guest underneath is still the page, and a
+ * full-screen panel would hide the thing the operator is waiting for. Both controls
+ * are explicit — "Reconnect now" stops waiting for the backoff, and "Stop host" is
+ * the only thing in the interface that ends the far-side process.
+ * @param tab - the detached tab.
+ * @returns the banner element.
+ */
+function detachedBanner(tab) {
+	const bar = document.createElement('div')
+	bar.className = 'detached-banner'
+	const text = document.createElement('span')
+	text.textContent = `${tab.label}: the tunnel is down, the host is still running — reconnecting…`
+	bar.appendChild(text)
+	const again = document.createElement('button')
+	again.type = 'button'
+	again.textContent = 'Reconnect now'
+	again.title = 'Stop waiting for the backoff and try the tunnel again'
+	again.addEventListener('click', () => {
+		void api.restart(tab.id).then(apply)
+	})
+	bar.appendChild(again)
+	const stop = document.createElement('button')
+	stop.type = 'button'
+	stop.textContent = 'Stop host'
+	stop.title = 'End the Harness on the far side. Anything it is running stops.'
+	stop.addEventListener('click', () => {
+		void api.reap(tab.id).then(apply)
+	})
+	bar.appendChild(stop)
+	return bar
 }
 
 /**
@@ -631,6 +709,40 @@ function renderPopover() {
 		complaint.textContent = problem
 		popoverEl.appendChild(complaint)
 	}
+	// **This machine's own programs come first**, because they are the ones that need
+	// no device and no network: a shell, and the coding agents that render into one.
+	// Every button is offered and the unavailable ones say why — hiding a missing
+	// `pi` would leave the operator wondering whether this build has the feature at
+	// all, and "the program is not on PATH" is the sentence they need.
+	if (presets.length > 0) {
+		const local = document.createElement('div')
+		local.className = 'local'
+		const heading = document.createElement('div')
+		heading.className = 'hint'
+		heading.textContent = 'On this machine'
+		const buttons = document.createElement('div')
+		buttons.className = 'local-buttons'
+		for (const preset of presets) {
+			const button = document.createElement('button')
+			button.type = 'button'
+			button.textContent = preset.label
+			button.disabled = preset.available !== true
+			button.title =
+				preset.available === true
+					? preset.id === 'shell'
+						? 'Open a shell on this machine'
+						: `Open ${preset.label} on this machine`
+					: (preset.reason ?? `${preset.label} was not found`)
+			button.addEventListener('click', () => {
+				popoverEl.hidden = true
+				void api.terminalOpenLocal(preset.id).then(apply)
+			})
+			buttons.appendChild(button)
+		}
+		local.append(heading, buttons)
+		popoverEl.appendChild(local)
+	}
+
 	// "Open" has to mean *running*, not *present in the bar*: every device in the
 	// book has a tab by design, so a set of tab ids would mark all of them and say
 	// nothing. The state is what tells the operator whether clicking will connect
@@ -639,6 +751,7 @@ function renderPopover() {
 	const suffixFor = (id) => {
 		const tabState = states.get(id)
 		if (tabState === 'running') return ' — open'
+		if (tabState === 'detached') return ' — reconnecting'
 		if (tabState === 'starting') return ' — starting'
 		if (tabState === 'failed') return ' — failed'
 		return ''
@@ -676,6 +789,30 @@ function renderPopover() {
 			void api.terminalOpen(device.id).then(apply)
 		})
 		row.appendChild(openTerminal)
+
+		// The per-device switch for the persistent mode. It sits on the device row rather
+		// than in the add form because it is a property of a machine that is already in
+		// the book — and because turning it on changes what closing the tab means, which
+		// is the kind of thing that should be one click away from the tab it affects.
+		const persistent = document.createElement('button')
+		persistent.type = 'button'
+		persistent.className = 'persistent-toggle'
+		persistent.textContent = device.mode === 'persistent' ? 'Persistent ✓' : 'Persistent'
+		persistent.title = device.mode === 'persistent'
+			? 'Turn off: closing a tab stops meaning "keep the host running"'
+			: 'Keep this machine’s Harness running across disconnects, and adopt it on the next connection'
+		persistent.addEventListener('click', () => {
+			void api
+				.save({ ...device, mode: device.mode === 'persistent' ? 'session' : 'persistent' })
+				.then(() => refreshDevices())
+				.catch((error) => {
+					const hint = document.createElement('div')
+					hint.className = 'hint'
+					hint.textContent = String(error?.message ?? error)
+					popoverEl.appendChild(hint)
+				})
+		})
+		row.appendChild(persistent)
 
 		const remove = document.createElement('button')
 		remove.type = 'button'
@@ -759,9 +896,13 @@ function renderPopover() {
 	popoverEl.appendChild(updates)
 }
 
-/** Reload the device list and redraw the popover. */
+/** Reload the device list and the local presets, then redraw the popover. */
 async function refreshDevices() {
-	const result = await api.devices()
+	// The two questions are independent, so they are asked together: a slow device
+	// book must not delay the local buttons, and a preset resolver that throws must
+	// not take the device list down with it.
+	const [result, available] = await Promise.all([api.devices(), api.terminalPresets().catch(() => ({ presets: [] }))])
+	presets = Array.isArray(available?.presets) ? available.presets : []
 	devices = result.devices
 	// The problems travel *with* the tabs rather than beside them, because `apply`
 	// merges into the state the panel reads: a version that dropped them here meant
