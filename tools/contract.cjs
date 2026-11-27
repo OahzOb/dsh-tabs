@@ -36,6 +36,7 @@ const { mkdirSync, readFileSync, writeFileSync } = require('node:fs')
 const { basename, dirname, join } = require('node:path')
 
 const remote = require('../src/remote.js')
+const askpass = require('../src/askpass.js')
 
 const ROOT = join(__dirname, '..')
 const TARGET = join(ROOT, 'docs', 'contract.json')
@@ -45,7 +46,7 @@ const TARGET = join(ROOT, 'docs', 'contract.json')
 const TOOL = `tools/${basename(__filename)}`
 
 /** The schema version of this document itself, not of the protocol. */
-const CONTRACT_VERSION = 1
+const CONTRACT_VERSION = 2
 
 /**
  * A readiness line in the exact shape `dsh web --no-open --port 0` prints, captured
@@ -172,6 +173,42 @@ const contract = {
 	},
 
 	sshOptions: remote.sshOptions(device()),
+
+	// **How the account authenticates, which is a property of the device record.**
+	// `key` is the default and the only behaviour an older book can mean; `password`
+	// is a per-device choice, and a second client that reads this book has to honour
+	// both or its devices will not connect where this client's do.
+	sshAuth: {
+		key: {
+			options: remote.sshOptions(device()),
+			mechanism: 'the operator\'s own ssh: the agent, `~/.ssh/config` and the default identities',
+			prompt: 'none — `BatchMode=yes` makes a key-less account fail loudly instead of hanging a GUI'
+		},
+		password: {
+			options: remote.sshPasswordOptions(device()),
+			mechanism: 'OpenSSH `SSH_ASKPASS`, forced; the helper prints the password it reads from its environment',
+			askpass: {
+				variable: askpass.PASSWORD_VARIABLE,
+				requireVariable: askpass.REQUIRE_VARIABLE,
+				requireValue: 'force',
+				program: 'prints the variable to stdout as UTF-8, exactly one line',
+				neverInArgv: true,
+				// Measured on OpenSSH_for_Windows_9.5p2: the helper is run with `force`
+				// even when a console exists, `DISPLAY` is not required, and the helper
+				// may be a `.cmd` file whose path contains a space.
+				windowsNote: 'the Windows client runs a `.cmd` helper; a spaced path was measured working'
+			},
+			stored: false,
+			forgottenWhen: 'the far side answers `Permission denied` or `Auth fail`',
+			// The Android client cannot use these argv options — it speaks SSH through
+			// JSch — but the requirement underneath them travels. Its first version set
+			// a password and listed `keyboard-interactive`, and still failed with
+			// `USERAUTH fail` on a PAM-only host, because JSch's keyboard-interactive
+			// method reads its answers from `UserInfo` and `setPassword` feeds only the
+			// `password` method. A library client has to answer both.
+			libraryRequirement: 'a client without ssh must answer keyboard-interactive as well as password; setting a password covers only one of the two'
+		}
+	},
 
 	// The security half of the same options. `sshOptions` above is the literal
 	// argv, and `StrictHostKeyChecking=accept-new` in it is easy to read as "no

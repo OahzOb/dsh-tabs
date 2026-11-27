@@ -1,6 +1,6 @@
 {
   "__generated": "tools/contract.cjs — do not edit by hand; run `node tools/contract.cjs`",
-  "contractVersion": 1,
+  "contractVersion": 2,
   "protocol": "dsh web over ssh",
   "source": {
     "normative": "dsh-remote-devices plugin (plugins/dsh-remote-devices/index.js)",
@@ -33,6 +33,52 @@
     "-p",
     "22"
   ],
+  "sshAuth": {
+    "key": {
+      "options": [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=20",
+        "-p",
+        "22"
+      ],
+      "mechanism": "the operator's own ssh: the agent, `~/.ssh/config` and the default identities",
+      "prompt": "none — `BatchMode=yes` makes a key-less account fail loudly instead of hanging a GUI"
+    },
+    "password": {
+      "options": [
+        "-o",
+        "BatchMode=no",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=20",
+        "-o",
+        "PreferredAuthentications=password,keyboard-interactive",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-p",
+        "22"
+      ],
+      "mechanism": "OpenSSH `SSH_ASKPASS`, forced; the helper prints the password it reads from its environment",
+      "askpass": {
+        "variable": "DSH_SSH_PASSWORD",
+        "requireVariable": "SSH_ASKPASS_REQUIRE",
+        "requireValue": "force",
+        "program": "prints the variable to stdout as UTF-8, exactly one line",
+        "neverInArgv": true,
+        "windowsNote": "the Windows client runs a `.cmd` helper; a spaced path was measured working"
+      },
+      "stored": false,
+      "forgottenWhen": "the far side answers `Permission denied` or `Auth fail`",
+      "libraryRequirement": "a client without ssh must answer keyboard-interactive as well as password; setting a password covers only one of the two"
+    }
+  },
   "hostKeys": {
     "policy": "StrictHostKeyChecking=accept-new",
     "unknownHost": "trusted on first use, and remembered in the operator's own known_hosts",

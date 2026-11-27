@@ -4,6 +4,7 @@ const { existsSync } = require('node:fs')
 const { posix, win32 } = require('node:path')
 
 const remote = require('./remote.js')
+const askpass = require('./askpass.js')
 
 /**
  * Interactive ssh terminals, for the shell a device's operator would get by
@@ -118,6 +119,13 @@ function terminalCommand(platform) {
  * discipline — without it, a command-carrying session (the Windows one) gets no
  * remote pty, and powershell decides it is not talking to a terminal.
  *
+ * The option block comes from `remote.sshOptionsFor`, so a password device's
+ * terminal is spawned with `BatchMode=no` rather than the key block's `BatchMode=yes`.
+ * The password itself reaches ssh through the askpass helper `start` installs, not
+ * through the pty — an operator should not have to type a password a second time
+ * for the same run, and a prompt echoed into a terminal that is also recorded is a
+ * secret in a transcript.
+ *
  * @param device - the device record.
  * @param platform - `posix` or `windows`.
  * @param ssh - the ssh executable.
@@ -126,7 +134,7 @@ function terminalCommand(platform) {
 function terminalArgv(device, platform, ssh = 'ssh') {
 	const target = `${device.user}@${device.host}`
 	const command = terminalCommand(platform)
-	return [ssh, '-tt', ...remote.sshOptions(device), target, ...(command === undefined ? [] : [command])]
+	return [ssh, '-tt', ...remote.sshOptionsFor(device), target, ...(command === undefined ? [] : [command])]
 }
 
 /**
@@ -485,14 +493,22 @@ function spawnSession(file, args, options = {}) {
 /**
  * Start one interactive ssh session.
  *
- * @param options - `device`, `platform`, `ssh`, and everything `spawnSession`
- *   takes.
+ * A password device's secret is turned into the askpass environment here, once,
+ * so the pty is spawned with everything ssh needs and the password never becomes
+ * part of the argv or of anything the terminal draws.
+ *
+ * @param options - `device`, `platform`, `ssh`, `password`/`askpassDir` for a
+ *   password device, and everything `spawnSession` takes.
  * @returns the session.
  */
 function start(options = {}) {
 	if (options.device === undefined) throw new Error('terminal.start needs a device')
 	const argv = terminalArgv(options.device, options.platform, options.ssh ?? 'ssh')
-	return spawnSession(argv[0], argv.slice(1), options)
+	const env =
+		options.device.auth === 'password'
+			? { ...(options.env ?? {}), ...askpass.envFor(options.password, options.askpassDir) }
+			: options.env
+	return spawnSession(argv[0], argv.slice(1), { ...options, env })
 }
 
 /**

@@ -90,6 +90,9 @@ function scratchHome() {
 
 const HOME = scratchHome()
 process.env.DSH_HOME = HOME
+// The askpass helper is a real file with an executable bit; a suite must write it
+// into its own scratch directory rather than the operator's profile.
+process.env.DSH_TABS_ASKPASS_DIR = join(HOME, 'askpass')
 console.log(`scratch device book: ${HOME}`)
 
 let passes = 0
@@ -338,12 +341,27 @@ function harness(options = {}) {
 	/** The probe failure a test asked for, if any. */
 	const detectError = options.detectError
 
+	/**
+	 * Every `connectRemote` call this harness saw, with the options it was handed.
+	 *
+	 * The password a device needs is passed *to the connect*, and it is the one thing
+	 * about it that cannot be read back out of the tab state — deliberately, because
+	 * the renderer must never be given it again. This is where a test looks instead.
+	 *
+	 * @type {{device: Record<string, unknown>, options: Record<string, unknown>}[]}
+	 */
+	const connectCalls = []
+
 	const connectStub = {
 		sshExecutable: () => 'ssh',
 		async connectLocal(callOptions = {}) {
 			return pending(callOptions)
 		},
-		async connectRemote(_device, callOptions = {}) {
+		async connectRemote(device, callOptions = {}) {
+			// What the connect path was handed, including the credential — the one
+			// property a password device adds, and the one a test has to see without
+			// asking the real `connect.js` to spawn anything.
+			connectCalls.push({ device, options: callOptions })
 			return pending(callOptions)
 		},
 		/**
@@ -617,6 +635,7 @@ function harness(options = {}) {
 		events,
 		legacyCookies,
 		removedCookies,
+		connectCalls,
 		/**
 		 * Arm the next connect so it does not settle until the test says so.
 		 *
@@ -1164,6 +1183,84 @@ await test('quitting tears down every tab that is up', async () => {
 	h.emitApp('before-quit')
 	// local plus dev-a.
 	assert.equal(h.stops.length, 2, `expected two stops, saw ${String(h.stops.length)}`)
+})
+
+console.log('password auth')
+
+/** A device whose account authenticates by password, which the record now says. */
+const passwordBook = [{ ...book[0], id: 'dev-p', label: 'box-p', auth: 'password' }]
+
+await test('a password device asks before it connects, and starts nothing', async () => {
+	const h = harness({ devices: passwordBook })
+	await h.boot()
+	// A device tab exists only once the popover has asked for the book, which is what
+	// the renderer does at boot; without the tab there is nothing to activate.
+	await h.call('devices:list')
+	const result = await h.call('tabs:activate', 'dev-p')
+	assert.equal(result.needsPassword.id, 'dev-p')
+	assert.equal(result.needsPassword.user, 'deploy')
+	assert.equal(result.needsPassword.error, undefined)
+	// The tab has not been left `starting`: there is no connect to wait for, so the
+	// only honest state is the one that offers the button again.
+	assert.equal(result.tabs.find((entry) => entry.id === 'dev-p').state, 'idle')
+	assert.equal(h.connectCalls.length, 0, 'a connect was attempted with no password')
+})
+
+await test('the typed password reaches the connect and is never pushed back to the page', async () => {
+	const h = harness({ devices: passwordBook })
+	await h.boot()
+	await h.call('devices:list')
+	const result = await h.call('tabs:activate', 'dev-p', 'correct horse')
+	assert.equal(result.needsPassword, undefined)
+	assert.equal(h.connectCalls.length, 1)
+	assert.equal(h.connectCalls[0].options.password, 'correct horse')
+	assert.equal(typeof h.connectCalls[0].options.askpassDir, 'string')
+	assert.equal(JSON.stringify(result).includes('correct horse'), false, 'the password was pushed back to the renderer')
+	// A restart this run reuses it rather than asking a second time.
+	h.queue.push(h.ok())
+	await h.call('tabs:restart', 'dev-p')
+	assert.equal(h.connectCalls.length, 2)
+	assert.equal(h.connectCalls[1].options.password, 'correct horse')
+	assert.equal((await h.state()).tabs.find((entry) => entry.id === 'dev-p').state, 'running')
+})
+
+await test('a refused password is forgotten, and the next attempt asks instead of replaying it', async () => {
+	const h = harness({ devices: passwordBook })
+	await h.boot()
+	await h.call('devices:list')
+	h.queue.push({ error: 'deploy@10.0.0.2: Permission denied (password).' })
+	const refused = await h.call('tabs:activate', 'dev-p', 'wrong')
+	assert.equal(refused.needsPassword.id, 'dev-p')
+	assert.match(refused.needsPassword.error, /Permission denied/u)
+	assert.equal(refused.tabs.find((entry) => entry.id === 'dev-p').state, 'failed')
+	const next = await h.call('tabs:activate', 'dev-p')
+	assert.equal(next.needsPassword.id, 'dev-p')
+	assert.equal(h.connectCalls.length, 1, 'the refused password was replayed')
+})
+
+await test('a network failure does not throw a good password away', async () => {
+	const h = harness({ devices: passwordBook })
+	await h.boot()
+	await h.call('devices:list')
+	h.queue.push({ error: 'ssh: connect to host 10.0.0.2 port 22: Connection timed out' })
+	const failed = await h.call('tabs:activate', 'dev-p', 'secret')
+	assert.equal(failed.needsPassword, undefined, 'a timeout was treated as a refused password')
+	h.queue.push(h.ok())
+	const retried = await h.call('tabs:activate', 'dev-p')
+	assert.equal(retried.needsPassword, undefined)
+	assert.equal(h.connectCalls.length, 2)
+	assert.equal(h.connectCalls[1].options.password, 'secret')
+})
+
+await test('a terminal on a password device asks for the same password', async () => {
+	const h = harness({ devices: passwordBook })
+	await h.boot()
+	const asked = await h.call('terminal:open', 'dev-p')
+	assert.equal(asked.needsPassword.id, 'dev-p')
+	const started = await h.call('terminal:open', 'dev-p', 'secret')
+	assert.equal(started.needsPassword, undefined)
+	assert.equal(h.terminalSpawns.length, 1)
+	assert.equal(h.terminalSpawns[0].startOptions.password, 'secret')
 })
 
 console.log('persistent hosts')

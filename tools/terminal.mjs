@@ -16,9 +16,11 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -296,6 +298,27 @@ await test('the pty is spawned with the argv, size and a TERM the far side can u
 	// finds. Without this the far side gets no terminal type at all, and `ls` and
 	// `vim` pick their dumb paths.
 	assert.equal(call.options.env.TERM, 'xterm-256color')
+})
+
+await test('a password device authenticates through the askpass environment, not the argv', () => {
+	const dir = mkdtempSync(join(tmpdir(), 'dsh-tabs-terminal-askpass-'))
+	try {
+		const device = { ...DEVICE, auth: 'password' }
+		const { calls } = started({ device, password: 'p@ss word', askpassDir: dir })
+		const [call] = calls
+		// The key block's `BatchMode=yes` would forbid the prompt the helper answers.
+		assert.equal(call.args.includes('BatchMode=yes'), false, 'the password block still forbids the prompt')
+		assert.ok(call.args.includes('PreferredAuthentications=password,keyboard-interactive'))
+		assert.equal(call.options.env.DSH_SSH_PASSWORD, 'p@ss word')
+		assert.equal(call.options.env.SSH_ASKPASS_REQUIRE, 'force')
+		// The password is in the environment, never in the process command line.
+		assert.equal(call.args.join(' ').includes('p@ss word'), false, 'the password reached ssh argv')
+		// The askpass variables are merged into the environment, not substituted for
+		// it: TERM is what makes the far side draw a terminal.
+		assert.equal(call.options.env.TERM, 'xterm-256color')
+	} finally {
+		rmSync(dir, { recursive: true, force: true })
+	}
 })
 
 await test('a local session is spawned with its preset, directory and size', async () => {

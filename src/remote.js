@@ -429,6 +429,61 @@ function sshOptions(device) {
 }
 
 /**
+ * The same block for a device whose account has a password and no usable key.
+ *
+ * Four differences, and each one is load-bearing:
+ *
+ * - **`BatchMode=no`.** `BatchMode=yes` is what forbids the prompt a GUI cannot
+ *   answer; it also tells ssh never to consult `SSH_ASKPASS`, so keeping it would
+ *   make the password path impossible rather than merely quiet.
+ * - **`PreferredAuthentications=password,keyboard-interactive`.** The second name
+ *   is not optional in the real world: a Debian or Ubuntu host with
+ *   `KbdInteractiveAuthentication yes` offers only `keyboard-interactive`, and a
+ *   client that lists only `password` is refused while the password is perfectly
+ *   good. OpenSSH answers both through the same askpass program.
+ * - **`PubkeyAuthentication=no`.** The requirement this branch exists for is "a
+ *   password, not a key". Offering a key first would spend an authentication
+ *   attempt on a credential the device was configured not to use, and would leave
+ *   a host that rejects keys looking like a wrong password.
+ * - **`NumberOfPasswordPrompts=1`.** The helper answers every prompt with the same
+ *   string, so a second and third attempt are the same wrong password again — and
+ *   on a host with a lockout policy they are three failures instead of one.
+ *
+ * `StrictHostKeyChecking=accept-new` and the port are copied from the key block
+ * on purpose: the host-key policy is a property of the application, not of how
+ * the account authenticates. `tools/smoke.mjs` asserts both blocks carry it.
+ *
+ * @param device - the device being reached.
+ * @returns the option arguments.
+ */
+function sshPasswordOptions(device) {
+	return [
+		'-o', 'BatchMode=no',
+		'-o', 'StrictHostKeyChecking=accept-new',
+		'-o', `ConnectTimeout=${String(Math.ceil(PROBE_TIMEOUT_MS / 1000))}`,
+		'-o', 'PreferredAuthentications=password,keyboard-interactive',
+		'-o', 'PubkeyAuthentication=no',
+		'-o', 'NumberOfPasswordPrompts=1',
+		'-p', String(Number(device.sshPort) || DEFAULT_SSH_PORT)
+	]
+}
+
+/**
+ * Pick the option block a device's record asks for.
+ *
+ * `auth` is absent on every book written before this existed, so the key block
+ * stays the default and an old book keeps its exact behaviour. The choice is a
+ * property of the record rather than of a connect so that a reconnect and a
+ * terminal use the same one without being told.
+ *
+ * @param device - the device being reached.
+ * @returns the option arguments.
+ */
+function sshOptionsFor(device) {
+	return device.auth === 'password' ? sshPasswordOptions(device) : sshOptions(device)
+}
+
+/**
  * Decide a host's shell family from a `uname -s` probe.
  *
  * `uname -s` is one argv element with no metacharacters, so it survives every
@@ -932,6 +987,8 @@ module.exports = {
 	remoteProgram,
 	remoteDsh,
 	sshOptions,
+	sshPasswordOptions,
+	sshOptionsFor,
 	classifyPlatform,
 	parseReadyUrl,
 	directoryProblem,

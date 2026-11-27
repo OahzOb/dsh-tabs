@@ -19,6 +19,7 @@ const net = require('node:net')
 
 const remote = require('./remote.js')
 const localdsh = require('./localdsh.js')
+const askpass = require('./askpass.js')
 
 /** Exit code ssh uses for its own failures, as opposed to the remote command's. */
 const SSH_FAILURE = 255
@@ -86,6 +87,53 @@ function sshExecutable() {
 		if (existsSync(candidate)) return candidate
 	}
 	return 'ssh'
+}
+
+/**
+ * Spawn one ssh client with the options and environment its device asks for.
+ *
+ * Every ssh invocation in this module goes through here, which is what makes "a
+ * password device never gets `BatchMode=yes`" and "a password device always gets
+ * its askpass helper" properties of one function rather than of five call sites
+ * remembering. The environment is only replaced when there is something to add:
+ * `spawn` already inherits `process.env`, and copying it for a key device would
+ * make every future variable change a thing to remember here.
+ *
+ * @param ssh - the ssh executable.
+ * @param device - the device being reached.
+ * @param authEnv - the askpass variables, or undefined for a key device.
+ * @param args - everything after the option block.
+ * @param options - the spawn options.
+ * @returns the child process.
+ */
+function spawnSsh(ssh, device, authEnv, args, options) {
+	return spawn(ssh, [...remote.sshOptionsFor(device), ...args], {
+		...options,
+		...(authEnv === undefined ? {} : { env: { ...process.env, ...authEnv } })
+	})
+}
+
+/**
+ * The askpass environment for one connect, when the device needs one.
+ *
+ * A missing password is refused here rather than left to ssh: with `BatchMode=no`
+ * and no helper, a GUI-launched ssh can do nothing but print `Permission denied`,
+ * which names the wrong problem. The refusal names the right one, and the caller
+ * has already asked the operator by the time this runs.
+ *
+ * @param device - the device being reached.
+ * @param options - `password` and `askpassDir`.
+ * @returns the variables, or undefined for a key device.
+ */
+function authEnvFor(device, options) {
+	if (device.auth !== 'password') return undefined
+	if (typeof options.password !== 'string' || options.password === '') {
+		throw new Error('this device authenticates with a password, and none was supplied')
+	}
+	if (typeof options.askpassDir !== 'string' || options.askpassDir === '') {
+		throw new Error('a password-authenticated connection needs a directory for its askpass helper')
+	}
+	return askpass.envFor(options.password, options.askpassDir)
 }
 
 /**
@@ -545,11 +593,12 @@ function awaitEnsure(child, onLine) {
  * @param platform - the shell family the far side speaks.
  * @param ssh - the resolved ssh executable.
  * @param onLine - receives each transcript line.
+ * @param authEnv - the askpass variables for a password device, or undefined.
  * @returns the stop program's stdout lines.
  */
-async function stopPersistentHost(device, platform, ssh, onLine) {
+async function stopPersistentHost(device, platform, ssh, onLine, authEnv) {
 	const target = `${device.user}@${device.host}`
-	const child = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(remote.persistentStopProgram(device, platform), platform)], {
+	const child = spawnSsh(ssh, device, authEnv, [target, remote.remoteCommand(remote.persistentStopProgram(device, platform), platform)], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 		windowsHide: true
 	})
@@ -605,12 +654,14 @@ async function stopPersistentHost(device, platform, ssh, onLine) {
  * @param device - the device to classify.
  * @param ssh - the resolved ssh executable.
  * @param onLine - receives each transcript line.
+ * @param register - tells the caller about the probe so it can be stopped.
+ * @param authEnv - the askpass variables for a password device, or undefined.
  * @returns the platform, or the error.
  */
-async function detectPlatform(device, ssh, onLine, register = () => true) {
+async function detectPlatform(device, ssh, onLine, register = () => true, authEnv) {
 	if (device.platform === 'posix' || device.platform === 'windows') return { platform: device.platform }
 	const target = `${device.user}@${device.host}`
-	const probe = spawn(ssh, [...remote.sshOptions(device), target, 'uname -s'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+	const probe = spawnSsh(ssh, device, authEnv, [target, 'uname -s'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
 	// The probe is a child like any other: a caller that has given up may stop it,
 	// and a throw after this point has to be able to stop it too. Before this
 	// registration, a cancel during the probe could only set a flag the probe never
@@ -660,7 +711,8 @@ async function detectPlatform(device, ssh, onLine, register = () => true) {
  *
  * @param device - the device record.
  * @param options - `onLine` for the transcript, `onChild` for teardown in flight,
- *   `signal` to be told the caller has given up.
+ *   `signal` to be told the caller has given up, and `password`/`askpassDir` for a
+ *   device whose account authenticates by password.
  * @returns the URL, the platform, and a `stop` that honours the teardown contract.
  */
 async function connectRemoteBody(device, options = {}) {
@@ -670,6 +722,7 @@ async function connectRemoteBody(device, options = {}) {
 	const signal = options.signal
 	const ssh = sshExecutable()
 	const target = `${device.user}@${device.host}`
+	const authEnv = authEnvFor(device, options)
 	onLine(`connect ${target}:${String(device.sshPort)}`)
 
 	// **A persistent device owns a host that is not this connection's to end.** It is
@@ -728,7 +781,7 @@ async function connectRemoteBody(device, options = {}) {
 		live.clear()
 	}
 
-	const detected = await detectPlatform(device, ssh, onLine, keep)
+	const detected = await detectPlatform(device, ssh, onLine, keep, authEnv)
 	if (detected.error !== undefined) return { error: detected.error }
 	const platform = detected.platform
 	onLine(`remote platform: ${platform}`)
@@ -742,7 +795,7 @@ async function connectRemoteBody(device, options = {}) {
 		// One-shot: adopt the recorded host or start one that outlives this channel.
 		// `stdio` is deliberately `ignore` on stdin — nothing here holds the far side
 		// open, because the host's lifetime is its record, not this pipe.
-		const ensure = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(remote.persistentEnsureProgram(device, platform), platform)], {
+		const ensure = spawnSsh(ssh, device, authEnv, [target, remote.remoteCommand(remote.persistentEnsureProgram(device, platform), platform)], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true
 		})
@@ -755,7 +808,7 @@ async function connectRemoteBody(device, options = {}) {
 		onLine(adopted ? 'reusing the host this home already had' : 'started a host that will outlive this connection')
 	} else {
 		const program = remote.remoteProgram(device, platform)
-		hold = spawn(ssh, [...remote.sshOptions(device), target, remote.remoteCommand(program, platform)], {
+		hold = spawnSsh(ssh, device, authEnv, [target, remote.remoteCommand(program, platform)], {
 			// stdin MUST stay an open pipe: its closure at teardown is what reaps the
 			// remote server. Never written to.
 			stdio: ['pipe', 'pipe', 'pipe'],
@@ -781,7 +834,7 @@ async function connectRemoteBody(device, options = {}) {
 	const localPort = fixedPort ?? await freePort()
 	if (cancelled()) return { error: 'the connect was stopped before it finished' }
 	onLine(`tunnel 127.0.0.1:${String(localPort)} -> 127.0.0.1:${String(remotePort)}`)
-	const tunnel = spawn(ssh, [...remote.sshOptions(device), '-N', '-L', `${String(localPort)}:127.0.0.1:${String(remotePort)}`, target], {
+	const tunnel = spawnSsh(ssh, device, authEnv, ['-N', '-L', `${String(localPort)}:127.0.0.1:${String(remotePort)}`, target], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 		windowsHide: true
 	})
@@ -888,7 +941,7 @@ async function connectRemoteBody(device, options = {}) {
 				endHold()
 				return Promise.resolve([])
 			}
-			return stopPersistentHost(device, platform, ssh, onLine)
+			return stopPersistentHost(device, platform, ssh, onLine, authEnv)
 		},
 		/**
 		 * Fires when the server connection ends on its own.
@@ -1146,12 +1199,13 @@ async function connectLocal(options = {}) {
  *
  * @param device - the device whose host is being stopped.
  * @param platform - the shell family the far side speaks.
- * @param options - `onLine` for the transcript.
+ * @param options - `onLine` for the transcript, and `password`/`askpassDir` when the
+ *   device authenticates by password.
  * @returns the stop program's output lines.
  */
 async function stopHost(device, platform = 'posix', options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
-	return stopPersistentHost(device, platform, sshExecutable(), onLine)
+	return stopPersistentHost(device, platform, sshExecutable(), onLine, authEnvFor(device, options))
 }
 
 module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, connectRemote, connectLocal, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }

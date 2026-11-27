@@ -120,7 +120,7 @@ function renderTabs() {
 				tab.kind === 'local' ? 'Restart the local Harness' : tab.kind === 'terminal' ? 'Reconnect the terminal' : 'Reconnect'
 			restart.addEventListener('click', (event) => {
 				event.stopPropagation()
-				void api.restart(tab.id).then(apply)
+				void answerPasswordRequests((secret) => api.restart(tab.id, secret)).then(apply)
 			})
 			controls.appendChild(restart)
 		}
@@ -196,7 +196,7 @@ function panelFor(tab) {
 		connect.type = 'button'
 		connect.textContent = 'Connect'
 		connect.addEventListener('click', () => {
-			void api.activate(tab.id).then(apply)
+			void answerPasswordRequests((secret) => api.activate(tab.id, secret)).then(apply)
 		})
 		panel.appendChild(connect)
 		return panel
@@ -211,7 +211,7 @@ function panelFor(tab) {
 		retry.type = 'button'
 		retry.textContent = 'Try again'
 		retry.addEventListener('click', () => {
-			void api.activate(tab.id).then(apply)
+			void answerPasswordRequests((secret) => api.activate(tab.id, secret)).then(apply)
 		})
 		panel.appendChild(retry)
 		void api.transcript(tab.id).then((result) => {
@@ -346,7 +346,7 @@ function renderTerminalBanner(view, tab) {
 		again.type = 'button'
 		again.textContent = tab.state === 'failed' ? 'Try again' : 'Reconnect'
 		again.addEventListener('click', () => {
-			void api.restart(tab.id).then(apply)
+			void answerPasswordRequests((secret) => api.restart(tab.id, secret)).then(apply)
 		})
 		view.banner.appendChild(again)
 	}
@@ -615,7 +615,7 @@ function detachedBanner(tab) {
 	again.textContent = 'Reconnect now'
 	again.title = 'Stop waiting for the backoff and try the tunnel again'
 	again.addEventListener('click', () => {
-		void api.restart(tab.id).then(apply)
+		void answerPasswordRequests((secret) => api.restart(tab.id, secret)).then(apply)
 	})
 	bar.appendChild(again)
 	const stop = document.createElement('button')
@@ -691,9 +691,133 @@ function wireGuest(view, id) {
  * @param next - the state from the main process.
  */
 function apply(next) {
-	if (next !== undefined && next !== null) state = { ...state, ...next }
+	if (next !== undefined && next !== null) {
+		state = { ...state, ...next }
+		// A password request is a request, not state: the caller that opened the dialog
+		// has consumed it, and a later push that carries none must not leave the old
+		// machine's name and the old ssh error in the state the panels read.
+		if (next.needsPassword === undefined) delete state.needsPassword
+	}
 	renderTabs()
 	renderContent()
+}
+
+/**
+ * Ask for one machine's password, and hand it back to the caller.
+ *
+ * The main process asks for this by answering a request with `needsPassword`
+ * instead of a state — the connection has not started, so there is nothing to
+ * show on a tab yet, and a tab that says "could not start" would be a lie about a
+ * question nobody has answered. The dialog is the answer, and **the password never
+ * goes into `state`**: it is returned here, passed straight back to the main
+ * process, and the only copy for the rest of the run lives there.
+ *
+ * `error` is present when a password was already tried and refused, so the dialog
+ * opens saying what the far side said rather than looking like the first ask.
+ *
+ * @param prompt - the main process's `needsPassword` payload.
+ * @returns the typed password, or null when the operator cancelled.
+ */
+function askPassword(prompt) {
+	return new Promise((resolve) => {
+		const backdrop = document.createElement('div')
+		backdrop.className = 'password-backdrop'
+
+		const dialog = document.createElement('form')
+		dialog.className = 'password-dialog'
+
+		const heading = document.createElement('h2')
+		heading.textContent = `Password for ${String(prompt.user)}@${String(prompt.host)}`
+
+		const hint = document.createElement('div')
+		hint.className = 'hint'
+		hint.textContent =
+			typeof prompt.error === 'string' && prompt.error !== ''
+				? `That password was refused: ${prompt.error}`
+				: 'Used for this run only. It is not written to the device book.'
+
+		const input = document.createElement('input')
+		input.type = 'password'
+		input.name = 'password'
+		input.autocomplete = 'off'
+		input.required = true
+		input.setAttribute('aria-label', `password for ${String(prompt.user)}@${String(prompt.host)}`)
+
+		const actions = document.createElement('div')
+		actions.className = 'password-actions'
+		const cancel = document.createElement('button')
+		cancel.type = 'button'
+		cancel.textContent = 'Cancel'
+		const submit = document.createElement('button')
+		submit.type = 'submit'
+		submit.textContent = 'Connect'
+		actions.append(cancel, submit)
+		dialog.append(heading, hint, input, actions)
+		backdrop.appendChild(dialog)
+		document.body.appendChild(backdrop)
+
+		/**
+		 * Close the dialog once, with one answer.
+		 * @param value - the password, or null for a cancel.
+		 */
+		const finish = (value) => {
+			backdrop.remove()
+			dialog.removeEventListener('keydown', onKey)
+			resolve(value)
+		}
+		/** Escape means no, like every other dialog on the machine. It is scoped to
+		 * the dialog on purpose: the application has no other key handling in the
+		 * page, and a document-level listener here would be a second claim on the
+		 * keys `before-input-event` already routes. */
+		const onKey = (event) => {
+			if (event.key !== 'Escape') return
+			event.preventDefault()
+			finish(null)
+		}
+		dialog.addEventListener('keydown', onKey)
+		cancel.addEventListener('click', () => {
+			finish(null)
+		})
+		backdrop.addEventListener('click', (event) => {
+			if (event.target === backdrop) finish(null)
+		})
+		dialog.addEventListener('submit', (event) => {
+			event.preventDefault()
+			const value = input.value
+			// An empty password is not an answer: a device configured for password auth
+			// with an empty one is a hand-edited book, and letting it through would
+			// spend an authentication attempt on a string nobody typed.
+			if (value === '') {
+				input.focus()
+				return
+			}
+			finish(value)
+		})
+		input.focus()
+	})
+}
+
+/**
+ * Run one main-process action, answering its password requests until it stops asking.
+ *
+ * `invoke` takes the password as its only argument, and is called once without one
+ * — the main process answers either with state or with a request. A refusal after
+ * a submitted password produces another request, which is why this is a loop and
+ * not a single retry: the operator gets to see what the far side said and try
+ * again, and cancelling is always one Escape away.
+ *
+ * @param invoke - the request, given a password or undefined.
+ * @returns the last result from the main process.
+ */
+async function answerPasswordRequests(invoke) {
+	let result = await invoke(undefined)
+	for (;;) {
+		const prompt = result?.needsPassword
+		if (prompt === undefined) return result
+		const secret = await askPassword(prompt)
+		if (secret === null) return result
+		result = await invoke(secret)
+	}
 }
 
 /** Build the device popover. */
@@ -768,7 +892,7 @@ function renderPopover() {
 		label.textContent = `${device.label}${suffixFor(device.id)}`
 		const sub = document.createElement('div')
 		sub.className = 'row-sub'
-		sub.textContent = `${device.user}@${device.host}:${String(device.sshPort)}${device.platform === undefined ? '' : ` · ${device.platform}`}`
+		sub.textContent = `${device.user}@${device.host}:${String(device.sshPort)}${device.platform === undefined ? '' : ` · ${device.platform}`}${device.auth === 'password' ? ' · password' : ''}`
 		main.append(label, sub)
 		main.addEventListener('click', () => {
 			popoverEl.hidden = true
@@ -786,7 +910,7 @@ function renderPopover() {
 		openTerminal.title = 'Open an ssh terminal on that machine'
 		openTerminal.addEventListener('click', () => {
 			popoverEl.hidden = true
-			void api.terminalOpen(device.id).then(apply)
+			void answerPasswordRequests((secret) => api.terminalOpen(device.id, secret)).then(apply)
 		})
 		row.appendChild(openTerminal)
 
@@ -849,6 +973,23 @@ function renderPopover() {
 		inputs[field.name] = input
 		form.appendChild(input)
 	}
+	// **The authentication choice is per device, and it has to be visible at the
+	// moment the device is added.** A machine that only offers a password is not a
+	// broken device: without this field the connect would fail with
+	// `Permission denied` and nothing in the window would say that a password was
+	// what it wanted. The default is the key, because that is what every book
+	// written before this field existed means.
+	const auth = document.createElement('select')
+	auth.name = 'auth'
+	const authKey = document.createElement('option')
+	authKey.value = 'key'
+	authKey.textContent = 'SSH key (agent or ~/.ssh)'
+	const authPassword = document.createElement('option')
+	authPassword.value = 'password'
+	authPassword.textContent = 'Password'
+	auth.append(authKey, authPassword)
+	inputs.auth = auth
+	form.appendChild(auth)
 	const submit = document.createElement('button')
 	submit.type = 'submit'
 	submit.textContent = 'Add device'
@@ -861,10 +1002,11 @@ function renderPopover() {
 				host: inputs.host.value.trim(),
 				user: inputs.user.value.trim(),
 				sshPort: inputs.sshPort.value.trim(),
-				directory: inputs.directory.value.trim()
+				directory: inputs.directory.value.trim(),
+				auth: inputs.auth.value
 			})
 			.then(() => {
-				for (const input of Object.values(inputs)) input.value = ''
+				for (const [name, input] of Object.entries(inputs)) input.value = name === 'auth' ? 'key' : ''
 				return refreshDevices()
 			})
 			.catch((error) => {

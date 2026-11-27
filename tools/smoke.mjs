@@ -11,7 +11,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { createRequire } from 'node:module'
@@ -79,6 +80,7 @@ useScratchHome()
 const require = createRequire(import.meta.url)
 const remote = require(join(ROOT, 'src', 'remote.js'))
 const devices = require(join(ROOT, 'src', 'devices.js'))
+const askpass = require(join(ROOT, 'src', 'askpass.js'))
 
 let failed = 0
 let passed = 0
@@ -393,6 +395,90 @@ await test('the ssh port is carried, and defaults to 22', () => {
 	assert.ok(remote.sshOptions(device).includes('22'))
 	assert.ok(remote.sshOptions({ ...device, sshPort: 2222 }).includes('2222'))
 	assert.ok(remote.sshOptions({ ...device, sshPort: undefined }).includes('22'))
+})
+
+console.log('password auth')
+
+await test('a password device gets an option block that can actually authenticate', () => {
+	const options = remote.sshPasswordOptions(device)
+	// The whole reason the key block exists. Keeping it here would forbid the very
+	// prompt the askpass helper answers.
+	assert.equal(options.includes('BatchMode=yes'), false, 'BatchMode=yes still forbids the password prompt')
+	const at = options.indexOf('BatchMode=no')
+	assert.equal(options[at - 1], '-o')
+	// A PAM-only host offers nothing but keyboard-interactive, and a client that lists
+	// only `password` is refused with a perfectly good password.
+	assert.ok(options.includes('PreferredAuthentications=password,keyboard-interactive'), 'keyboard-interactive is missing')
+	assert.ok(options.includes('PubkeyAuthentication=no'), 'a key would still be offered first')
+	assert.ok(options.includes('NumberOfPasswordPrompts=1'), 'a refused password would be replayed')
+	// The host-key policy belongs to the application, not to the account: both blocks
+	// must carry the strict form.
+	assert.ok(options.includes('StrictHostKeyChecking=accept-new'), 'the password block lost the host-key policy')
+	assert.equal(remote.sshPasswordOptions({ ...device, sshPort: 2222 }).includes('2222'), true)
+})
+
+await test('the device record picks the block, and the key block stands still', () => {
+	assert.deepEqual(remote.sshOptionsFor(device), remote.sshOptions(device))
+	assert.deepEqual(remote.sshOptionsFor({ ...device, auth: 'password' }), remote.sshPasswordOptions(device))
+	// Every book written before the field existed has no `auth`, and keeps the exact
+	// argv it had. This is the check that the default did not move.
+	assert.equal(remote.sshOptionsFor({ ...device, auth: undefined }).includes('BatchMode=yes'), true)
+})
+
+await test('the askpass helper hands back the password byte for byte', () => {
+	const dir = mkdtempSync(join(tmpdir(), 'dsh-tabs-askpass-'))
+	try {
+		// Deliberately nasty: cmd metacharacters and non-ASCII, both of which
+		// `echo %VAR%` and a console-encoded PowerShell write would corrupt.
+		const password = 'p@ss&word|with<special>^chars-密码'
+		const env = askpass.envFor(password, dir)
+		assert.equal(env.SSH_ASKPASS_REQUIRE, 'force')
+		assert.equal(env[askpass.PASSWORD_VARIABLE], password)
+		// The argv has no room for it, which is the difference from `sshpass -p`.
+		assert.equal(remote.sshPasswordOptions(device).join(' ').includes(password), false)
+		const run =
+			process.platform === 'win32'
+				? spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', `"${env.SSH_ASKPASS}"`], {
+						env: { ...process.env, ...env },
+						encoding: 'utf8',
+						// cmd receives the quoted path exactly as written; without this Node
+						// escapes the quotes and cmd tries to run a file whose name starts
+						// with a backslash-quote.
+						windowsVerbatimArguments: true
+					})
+				: spawnSync(env.SSH_ASKPASS, [], { env: { ...process.env, ...env }, encoding: 'utf8' })
+		assert.equal(run.status, 0, `the helper failed: ${String(run.stderr)}`)
+		assert.equal(run.stdout, `${password}\n`, 'the helper did not reproduce the password')
+	} finally {
+		rmSync(dir, { recursive: true, force: true })
+	}
+})
+
+await test('a password is required, and only a refused login forgets it', () => {
+	assert.throws(() => askpass.envFor('', tmpdir()), /non-empty/u)
+	assert.equal(askpass.isAuthFailure('Permission denied (password).'), true)
+	assert.equal(askpass.isAuthFailure('Permission denied (keyboard-interactive).'), true)
+	assert.equal(askpass.isAuthFailure("Auth fail for methods 'publickey,password'"), true)
+	// A network failure or a changed host key must leave the password in memory.
+	assert.equal(askpass.isAuthFailure('Host key verification failed.'), false)
+	assert.equal(askpass.isAuthFailure('ssh: connect to host x port 22: Connection timed out'), false)
+})
+
+await test('a password connect without a password is refused before anything is spawned', async () => {
+	const connect = require(join(ROOT, 'src', 'connect.js'))
+	const pass = { id: 'p', label: 'p', transport: 'ssh', host: 'h', user: 'u', sshPort: 22, auth: 'password' }
+	await assert.rejects(connect.connectRemote(pass, {}), /authenticates with a password/u)
+	await assert.rejects(connect.stopHost(pass, 'posix', {}), /authenticates with a password/u)
+})
+
+await test('every ssh client in the connect path carries the environment its device asks for', () => {
+	const source = readFileSync(join(ROOT, 'src', 'connect.js'), 'utf8')
+	// One spawn of ssh, inside `spawnSsh`. A second call site is a second place that
+	// can forget the askpass environment, which is a password device failing with
+	// `Permission denied` for a password that was fine.
+	const spawns = source.match(/spawn\(ssh,/gu) ?? []
+	assert.equal(spawns.length, 1, `ssh is spawned in ${String(spawns.length)} places; only spawnSsh may`)
+	assert.match(source, /spawnSsh\(/u)
 })
 
 console.log('local tab')
@@ -746,6 +832,17 @@ await test('the contract agrees with the code it was generated from', () => {
 	assert.equal(CONTRACT.budgets.defaultSshPort, remote.DEFAULT_SSH_PORT)
 	const sample = { host: 'build-01.example.net', user: 'deploy', sshPort: 22 }
 	assert.deepEqual(CONTRACT.sshOptions, remote.sshOptions(sample), 'the ssh options in the contract are not the ones the code sends')
+	// Both authentication branches are part of the protocol a second client has to
+	// speak: a device book now says which one its record means.
+	assert.deepEqual(CONTRACT.sshAuth.key.options, remote.sshOptions(sample), 'the key branch in the contract has drifted')
+	assert.deepEqual(
+		CONTRACT.sshAuth.password.options,
+		remote.sshPasswordOptions(sample),
+		'the password branch in the contract is not the one the code sends'
+	)
+	assert.equal(CONTRACT.sshAuth.password.askpass.variable, askpass.PASSWORD_VARIABLE)
+	assert.equal(CONTRACT.sshAuth.password.askpass.requireValue, 'force')
+	assert.equal(CONTRACT.sshAuth.password.stored, false, 'the contract now promises a stored password')
 	// The host-key policy is the security half of the same options, and the string
 	// alone does not say which way it leans: `accept-new` reads like "no checking",
 	// and the JVM library a port would use spells the permissive case almost
@@ -894,7 +991,16 @@ await test('shortcuts are handled in the main process, not the page', () => {
 	assert.match(main, /before-input-event/u)
 	assert.match(main, /input\.alt/u)
 	const renderer = readFileSync(join(ROOT, 'src', 'renderer', 'app.js'), 'utf8')
-	assert.doesNotMatch(renderer, /addEventListener\('keydown'/u)
+	// **The rule is about global key handling, not about every keydown.** The password
+	// dialog owns Escape while it is open, and that is a key the main process cannot
+	// route usefully — it does not know which request is waiting. What must not exist
+	// is a `document`- or `window`-level handler, which would compete with
+	// `before-input-event` for the keys that cross that boundary.
+	assert.doesNotMatch(renderer, /(?:document|window)\.addEventListener\('keydown'/u)
+	assert.doesNotMatch(renderer, /(?:document|window)\.onkeydown/u)
+	// The guard above would also pass a file with no key handling at all, so the
+	// element-scoped listener the password dialog owns is named as the one exception.
+	assert.match(renderer, /[A-Za-z_$][\w$]*\.addEventListener\('keydown'/u)
 })
 
 await test('guests are wired through both hooks, and only once', () => {
@@ -1067,7 +1173,7 @@ await test('every environment variable the README names is one the code reads', 
 	// operator sets it, sees the same behaviour, and concludes the failure is
 	// something else. This is the check that would have caught the README calling
 	// the scratch-directory variable by a name no file contained.
-	const sources = ['src/main.js', 'src/connect.js', 'src/devices.js', 'src/remote.js', 'src/localdsh.js', 'src/preload.js', 'tools/smoke.mjs', 'tools/main.mjs', 'tools/renderer.mjs', 'tools/live-connect.mjs', 'tools/connect.mjs', 'tools/readiness.cjs', 'tools/contract.cjs']
+	const sources = ['src/main.js', 'src/connect.js', 'src/devices.js', 'src/remote.js', 'src/localdsh.js', 'src/preload.js', 'src/askpass.js', 'tools/smoke.mjs', 'tools/main.mjs', 'tools/renderer.mjs', 'tools/live-connect.mjs', 'tools/connect.mjs', 'tools/readiness.cjs', 'tools/contract.cjs']
 	const code = sources.map((file) => readFileSync(join(ROOT, file), 'utf8')).join('\n')
 	const documented = new Set([...README.matchAll(/`(DSH_[A-Z0-9_]+)`/gu)].map((match) => match[1]))
 	assert.ok(documented.size > 0, 'the README documents no DSH_ environment variable')

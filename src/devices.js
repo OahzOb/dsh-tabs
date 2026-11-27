@@ -50,6 +50,7 @@ const RESERVED_IDS = Object.freeze(['local'])
  * @property {number} sshPort
  * @property {string} [directory]
  * @property {'posix'|'windows'} [platform]
+ * @property {'password'} [auth] - present only for an account that authenticates by password.
  * @property {'persistent'} [mode] - present only for a host that outlives the connection.
  * @property {string} [home] - the far side's DSH home, when not the default.
  * @property {number} [localPort] - the stable local forward port a persistent device keeps.
@@ -315,6 +316,19 @@ function normalize(incoming, previous) {
 	const host = String(incoming?.host ?? '')
 	const user = String(incoming?.user ?? '')
 	const directory = typeof incoming?.directory === 'string' && incoming.directory !== '' ? incoming.directory : undefined
+	// **The authentication choice is a property of the device, not of a connect.**
+	// A book written before this existed has no field and keeps the key behaviour;
+	// the popover always sends one (`key` or `password`), so switching back to a key
+	// has to be able to clear the field — which is why `key` maps to `undefined`
+	// rather than being stored as a second spelling of the default.
+	const incomingAuth = incoming?.auth
+	const auth = incomingAuth === 'password'
+		? 'password'
+		: incomingAuth === 'key'
+			? undefined
+			: previous?.auth === 'password'
+				? 'password'
+				: undefined
 	// A persistent device is a **property of the device**, not of a Session: one
 	// switch covers every Session the far side's home holds, because they all live in
 	// the one Harness process the record names. `session` is the absence of the field,
@@ -356,6 +370,7 @@ function normalize(incoming, previous) {
 		// session's port is retained.
 		...(directory === undefined ? {} : { directory }),
 		...(platform === undefined ? {} : { platform }),
+		...(auth === undefined ? {} : { auth }),
 		...(mode === 'persistent' ? { mode } : {}),
 		...(home === undefined ? {} : { home }),
 		...(localPort === undefined ? {} : { localPort })

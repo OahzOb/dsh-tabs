@@ -29,10 +29,13 @@ function subscribe(channel, listener) {
 contextBridge.exposeInMainWorld('dshTabs', {
 	platform: process.platform,
 	state: () => ipcRenderer.invoke('tabs:get'),
-	activate: (id) => ipcRenderer.invoke('tabs:activate', id),
+	// The second argument is a password for a device that asks for one, and undefined
+	// for every other device. The main process answers a request it cannot satisfy
+	// with `needsPassword` rather than starting a connection with no credential.
+	activate: (id, password) => ipcRenderer.invoke('tabs:activate', id, password),
 	select: (id) => ipcRenderer.invoke('tabs:select', id),
 	disconnect: (id) => ipcRenderer.invoke('tabs:disconnect', id),
-	restart: (id) => ipcRenderer.invoke('tabs:restart', id),
+	restart: (id, password) => ipcRenderer.invoke('tabs:restart', id, password),
 	// The one control that ends a persistent host. Separate from `disconnect`, which
 	// lets go and leaves it running.
 	reap: (id) => ipcRenderer.invoke('tabs:reap', id),
@@ -42,7 +45,7 @@ contextBridge.exposeInMainWorld('dshTabs', {
 	remove: (id) => ipcRenderer.invoke('devices:remove', id),
 	transcript: (id) => ipcRenderer.invoke('devices:transcript', id),
 	checkUpdates: () => ipcRenderer.invoke('updates:check'),
-	terminalOpen: (id) => ipcRenderer.invoke('terminal:open', id),
+	terminalOpen: (id, password) => ipcRenderer.invoke('terminal:open', id, password),
 	terminalPresets: () => ipcRenderer.invoke('terminal:presets'),
 	terminalOpenLocal: (preset) => ipcRenderer.invoke('terminal:openLocal', preset),
 	terminalAttach: (id) => ipcRenderer.invoke('terminal:attach', id),

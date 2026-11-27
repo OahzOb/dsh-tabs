@@ -61,6 +61,7 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **The local Harness as a peer** | The same tab semantics for the local Harness and for every remote one, in one window. |
 | **Nothing installed on the far side** | An SSH server and a Node-installed `dsh` are the whole requirement; the remote's own OS picks the port, so a connect cannot collide with a server someone started by hand. |
 | **A device book in the plugin's schema** | `$DSH_HOME/dsh-tabs.json` — a file of its own, seeded from the Desktop plugin's `remote-devices.json` on first run, never written by two processes at once. |
+| **A key or a password, per device** | The default is the operator's own ssh — agent, `~/.ssh/config`, the usual identities — with `BatchMode=yes` so a key-less machine fails instead of hanging. A device marked **Password** is asked for one on first connect and reuses it for the rest of the run; it is never written to the book, and the helper that answers ssh reads it from the environment, not from the command line. |
 | **A readable failure** | A connect that fails quotes the far side's own words, including the CLIXML error stream PowerShell produces on a Windows host. |
 | **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
 | **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
@@ -73,6 +74,9 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 ## Requirements
 
 **The machine you connect to:** an SSH server, and `dsh` on `PATH` installed with Node.
+The account can be answered with a key (the default) or a password; a password-only
+account is a device marked **Password**, and needs `PasswordAuthentication yes` (or
+keyboard-interactive) on that server.
 A Windows host additionally needs `sshd` enabled, which Windows does not do by default
 — see [What the remote needs](#what-the-remote-needs).
 
@@ -131,7 +135,11 @@ installed by hand; only the versions that contain the updater can update themsel
   local tab has `⟲` and no `×`, because nothing recreates a tab that was stopped.
 - **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
   inside a remote interface.
-- **`+`** lists the devices, adds one, and removes one.
+- **`+`** lists the devices, adds one, and removes one. The form's **SSH key**
+  (the default) and **Password** choices are the two ways an account can be answered:
+  a password device asks for its password the first time it is connected, keeps it in
+  memory for the rest of the run — reconnects and terminals reuse it — and forgets it
+  when the far side refuses it. Nothing about the password is written to disk.
 - **Terminal** in a device's row opens an interactive ssh shell in a tab of its own.
   `×` closes it and ends the session, `⟲` reconnects it in place, and `exit` leaves
   the transcript on screen with a **Reconnect** button. `Ctrl+Shift+C` and
@@ -225,6 +233,7 @@ each section is a decision that cost something to learn.
 | **本地 Harness 是对等的** | 本地和每一台远端在同一个窗口里共用同一套标签语义。 |
 | **对端不装任何东西** | 只需要一个 SSH 服务和对端 `PATH` 上用 Node 安装的 `dsh`；端口由**远端**系统自己挑，绝不会和谁手动起的服务撞端口。 |
 | **设备簿沿用插件 schema** | `$DSH_HOME/dsh-tabs.json`，独立一个文件，首次运行时从桌面插件的 `remote-devices.json` 播种，绝不会有两个进程同时写它。 |
+| **每台设备可以选 key 或密码** | 默认走操作者自己的 ssh（agent、`~/.ssh/config`、默认私钥），带 `BatchMode=yes`，没 key 的机器立刻失败而不是挂住。把设备标成 **Password** 后，首次连接会问一次密码并在本次运行期间复用（重连、终端都用它）；密码不写入设备簿，回答 ssh 的 helper 从环境变量读它，而不是从命令行。 |
 | **失败能读懂** | 连接失败会引用对端自己的原话，包括 Windows 主机上 PowerShell 产生的 CLIXML 错误流。 |
 | **版本下限会自己说话** | 本地标签页启动前，`src/localdsh.js` 先查 `dsh --version`；CLI 太旧会直接报名，而不是 45 秒后变成一个凭据错误。 |
 | **每台设备一个终端** | `+` → 设备行 → **Terminal**，用同一条 SSH 打开交互式 shell：POSIX 用登录 shell，Windows 优先 PowerShell 7、退回 Windows PowerShell。窗口缩放会改变远端终端尺寸，`Ctrl+C`、`vim` 和全屏程序都正常。 |
@@ -268,11 +277,14 @@ release CDN 不可达时设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `m
 - **标签页** 是本地 Harness 和设备簿里的每一台机器。标签页是*配置好的东西*，不是临时视图：
   点击只是选中它，面板里的 **Connect** 才启动；`×` 是**断开**、不是删除。删设备在 `+` 面板里。
 - **`Alt+1…9`** 切标签，在任何位置都有效，包括你正在远程界面里打字的时候。
-- **`+`** 列出设备、添加设备、删除设备。
+- **`+`** 列出设备、添加设备、删除设备。表单里的 **SSH key**（默认）和 **Password**
+  是账号认证的两种方式：密码设备第一次连接时问一次，密码只在内存里留到本次运行结束 ——
+  重连和终端会复用它，被对端拒绝就清掉重问。密码不会写到磁盘上。
 - **Terminal** 在设备行里，点开是一个独立的终端标签页。`×` 关闭并结束会话，`⟲` 原地重连，
   在远端输入 `exit` 则保留输出并给出 **Reconnect**。`Ctrl+Shift+C/V` 复制粘贴；右键在有
-  选中内容时复制、没有时粘贴。终端和 Harness 标签一样只支持密钥登录，从登录 shell 的家目录
-  开始，不吃设备的 `directory` 字段。
+  选中内容时复制、没有时粘贴。终端和 Harness 标签用同一套认证：密码设备复用本次运行已经
+  问过的那个密码（平台探测也是 ssh 客户端，没有终端可以提示，所以不能等到 pty 里再问）。
+  终端从登录 shell 的家目录开始，不吃设备的 `directory` 字段。
 - **On this machine** 在 `+` 面板顶部：**Shell** 从家目录开一个本地终端；**pi** / **opencode**
   会先让你选项目目录，再从那个目录启动。它们就是普通终端标签页：`×` 结束会话，`⟲` 在同一个
   目录重连，`Alt+数字` 照样能切过去。重连是**新进程**，不是续接对话 —— 会话记录在 agent
@@ -409,13 +421,16 @@ npm run install-electron
 ## Devices
 
 The book lives at `$DSH_HOME/dsh-tabs.json` and uses the same schema as the
-plugin's. It is a **separate file on purpose**: two processes writing one JSON
-file would clobber each other, and this app must not corrupt a book the Desktop
-plugin is still using. On first run the plugin's `remote-devices.json` is copied
-over, so devices configured there are waiting here.
+plugin's, plus one field the plugin has no notion of — `auth`, which records that a
+device is answered with a password instead of a key. It is a **separate file on
+purpose**: two processes writing one JSON file would clobber each other, and this app
+must not corrupt a book the Desktop plugin is still using. On first run the plugin's
+`remote-devices.json` is copied over, so devices configured there are waiting here.
 
-Each device is `{label, host, user, sshPort, directory?}`. A Windows host needs
-nothing extra — the shell family is detected.
+Each device is `{label, host, user, sshPort, directory?, auth?}`. A Windows host needs
+nothing extra — the shell family is detected. `auth: "password"` says the account is
+answered with a password instead of the operator's key; its absence is the key, so a
+book written before the field existed keeps its exact behaviour.
 
 ### Every write goes through one door
 
@@ -538,6 +553,97 @@ Authorize the key. A **non-administrator** account reads
 `%USERPROFILE%\.ssh\authorized_keys`; an **administrator** account reads
 `%ProgramData%\ssh\administrators_authorized_keys` instead, and that file's ACL
 must be restricted to SYSTEM and Administrators or sshd ignores it.
+
+A key is not the only way: mark the device **Password** and the window asks for the
+account's password instead. Windows' `sshd_config` ships `PasswordAuthentication no`,
+so a password-only Windows host has to say `PasswordAuthentication yes` (and restart
+the service) before it will accept one.
+
+## Passwords: the half a GUI cannot type
+
+`ssh` has no option that takes a password. What it has is `SSH_ASKPASS`: when ssh
+needs a secret and has no terminal to read one from, it runs that program and reads
+the first line of its stdout. That is the door this application uses, and it is a
+deliberately narrow one — the secret is never an argv element, so it never appears in
+a process list, a transcript, or an error message the renderer could echo.
+
+**The Windows client was the open question, so it was measured** against a real
+`sshd` on this machine (OpenSSH_for_Windows_9.5p2, with a temporary local account):
+
+| asked | measured |
+| --- | --- |
+| Does the Windows port honour `SSH_ASKPASS` at all? | Yes: `debug1: read_passphrase: requested to askpass`, then `Authenticated to 127.0.0.1 … using "password"`. |
+| Does it need `DISPLAY`? | No, not with `SSH_ASKPASS_REQUIRE=force`. The helper ran with the variable unset. |
+| Will it run a `.cmd` helper? | Yes — a generated `askpass.cmd` was executed and returned the password. |
+| Does a path with a space in it work? | Yes; tried with the helper under `…\askpass probe\`. |
+| What happens with the wrong password? | `Permission denied (password).` — the helper was asked, and the answer was refused. |
+
+So the password path needs **no extra binary**: not `sshpass` (which has no Windows
+build), not `plink` (whose `-pw` puts the secret in the command line), and not an
+in-process SSH library (which would replace the operator's own ssh config, agent and
+`known_hosts` semantics for every device).
+
+**How a password device differs.** `remote.sshPasswordOptions` replaces the key
+block with:
+
+```
+-o BatchMode=no -o StrictHostKeyChecking=accept-new -o ConnectTimeout=… \
+-o PreferredAuthentications=password,keyboard-interactive \
+-o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -p <port>
+```
+
+Each line is load-bearing. `BatchMode=no` is the opposite of what the key block
+wants: the key block's `BatchMode=yes` exists so a key-less GUI fails instead of
+hanging, and it also forbids the askpass call. `keyboard-interactive` is not
+decoration — a PAM-configured host often offers *only* that method, and a client
+that names only `password` is refused with a perfectly good password.
+`PubkeyAuthentication=no` is the requirement itself: the device was configured not
+to depend on a key, and offering one first would spend an authentication attempt on
+it. `NumberOfPasswordPrompts=1` matters because the helper answers every prompt with
+the same string, so a second prompt is the same wrong password again — three
+failures against a host with a lockout policy. `StrictHostKeyChecking=accept-new` and
+the port are copied unchanged: the host-key policy belongs to the application, not
+to how the account authenticates.
+
+**Where the secret lives, and where it does not.** It is typed into a dialog the
+renderer draws and is passed straight back to the main process, which keeps it in one
+in-memory map keyed by device id for the run. It is written to
+`SSH_ASKPASS`'s child environment as `DSH_SSH_PASSWORD`; the helper reads it there
+and prints its UTF-8 bytes. The book is never written, the state pushed to the page
+never contains it, and a terminal's transcript never shows it. The environment of a
+live ssh child is readable by the same user's other processes — that is the same
+threat model as `sshpass -e`, and no better or worse than the password being in the
+application's memory — which is why there is no "remember" option rather than a
+promise about one.
+
+**The Windows helper is not `echo %DSH_SSH_PASSWORD%`.** That breaks on `&`, `|`,
+`<`, `>` and `^`, and a PowerShell write through `[Console]::Out` transcodes non-ASCII
+passwords through the OEM code page. The generated file therefore hands the whole
+job to PowerShell by absolute path, and writes `[Text.Encoding]::UTF8` bytes to the
+raw stdout handle; the smoke suite runs it with a password containing every one of
+those characters and a Chinese word, and compares the bytes.
+
+**A refused password is the only thing that forgets one.** `askpass.isAuthFailure`
+matches `Permission denied` and `Auth fail` and nothing else, so a timeout or a
+changed host key leaves the password in memory. A refusal clears it and the dialog
+reopens with ssh's own sentence, which is what "asked again rather than retried"
+means on the Android side too.
+
+**A terminal asks for the same password, once.** Its platform probe is an ssh client
+that runs before the pty exists, so the password has to arrive through askpass there
+as well; typing it into the pty instead would ask for it twice. The probe and the
+interactive session share the run's cached secret, and an ssh session that ends with
+`255` on a password device clears it so the next `⟲` asks instead of replaying it.
+
+**What a second client has to reproduce** is in `docs/contract.json` under
+`sshAuth`: both option blocks, the helper variable and the `force` requirement, and
+`stored: false`. The same section carries a `libraryRequirement` for a client that
+speaks SSH through a library rather than the `ssh` binary: setting a password covers
+only the `password` method, and a PAM-only host that offers `keyboard-interactive`
+refuses a correct password unless the client answers that method too. That is not
+theory — it is the bug the Android client had until it grew a `UserInfo`. The key
+block's bytes did not change when this was added, which is what keeps an old book,
+the plugin's pinned copy and the Android parity test untouched.
 
 ## How a connect works
 
@@ -950,11 +1056,14 @@ carries a `generation`; a new one is what tells the renderer to clear the screen
 attach to the new session, because a state push alone cannot distinguish "this session
 printed more" from "this is a different session".
 
-The ssh options are the Harness tabs' — `BatchMode=yes`,
-`StrictHostKeyChecking=accept-new`, the device's port — so a terminal is key-only like
-everything else here: a device whose ssh needs a password cannot be opened this way.
-The shell starts in the account's home directory; the device's `directory` field
-belongs to the Harness tab and is not applied to a terminal.
+The ssh options are the Harness tabs' — `remote.sshOptionsFor`, which is
+`BatchMode=yes` for a key device and the askpass block for a password one — plus
+`StrictHostKeyChecking=accept-new` and the device's port. A password device's terminal
+uses the password the Harness tab already asked for, once per run: the platform probe
+that runs before the pty exists is a second ssh client with no terminal to prompt on,
+so letting the pty ask would mean typing the same password twice. The shell starts in
+the account's home directory; the device's `directory` field belongs to the Harness
+tab and is not applied to a terminal.
 
 `Ctrl+Shift+C` and `Ctrl+Shift+V` copy and paste, right-click copies a selection or
 pastes when there is none, and `Alt+1…9` still selects tabs from inside the terminal —
@@ -986,6 +1095,7 @@ things make it survive packaging:
 src/main.js        the window, the tabs, the tunnels, the shortcuts
 src/preload.js     the renderer's entire view of the main process
 src/remote.js      what to run on the far side — a copy, see below
+src/askpass.js     the password half of an ssh login: the helper ssh asks, and the environment that makes it ask
 src/devices.js     the device book
 src/terminal.js    a device's terminal: the ssh argv, the pty, and its buffer
 src/renderer/      the tab bar, the guest host and the terminal host

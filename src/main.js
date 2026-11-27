@@ -34,6 +34,7 @@ const connect = require('./connect.js')
 const remote = require('./remote.js')
 const localdsh = require('./localdsh.js')
 const terminal = require('./terminal.js')
+const askpass = require('./askpass.js')
 
 /** This application's own version, read from the manifest beside the source. */
 const PACKAGE = require('../package.json')
@@ -193,6 +194,87 @@ let mainWindow
 
 /** @type {Map<string, Tab>} */
 const tabs = new Map()
+
+/**
+ * Passwords typed this run, by device id.
+ *
+ * **This map is the whole store.** A password is written here when the operator
+ * types it, read back for a reconnect or a terminal within the same run, and
+ * deleted when the far side refuses it — never written to the device book, never
+ * handed to the renderer a second time, never present in a transcript. A new
+ * launch starts empty and asks again, which is the behaviour the Android client
+ * chose for the same reason: a password on disk is a password a backup, a
+ * screenshot or a shared profile can carry off the machine, and the cost of not
+ * having one is typing it once per run.
+ *
+ * @type {Map<string, string>}
+ */
+const passwords = new Map()
+
+/**
+ * Where the askpass helper lives.
+ *
+ * The application's own user-data directory, because it is per-user, already
+ * private to the account, and removed with the profile. `DSH_TABS_ASKPASS_DIR`
+ * exists for the suites: they must not leave a helper in the operator's profile,
+ * and a test that writes to a real `%APPDATA%` is a test that eventually deletes
+ * something it did not create.
+ *
+ * @returns a directory path.
+ */
+function askpassDirectory() {
+	const override = process.env.DSH_TABS_ASKPASS_DIR
+	if (typeof override === 'string' && override !== '') return override
+	try {
+		return join(app.getPath('userData'), 'askpass')
+	} catch {
+		// A stubbed Electron in the suites has no `getPath`, and a launch that
+		// somehow reaches this before `app` is ready still has a private-enough
+		// place to put one file.
+		return join(homedir(), '.dsh', 'dsh-tabs', 'askpass')
+	}
+}
+
+/**
+ * The password one device should use for this attempt, remembered if it was given.
+ *
+ * Exactly one rule: a supplied password wins over the remembered one, and a device
+ * that is not configured for password auth has none at all. The distinction
+ * between "not supplied" and "not configured" is what lets the caller decide
+ * whether to prompt or to proceed.
+ *
+ * @param device - the device record.
+ * @param supplied - the password the operator just typed, if any.
+ * @returns the password, or undefined when there is none to use.
+ */
+function passwordFor(device, supplied) {
+	if (device === undefined || device.auth !== 'password') return undefined
+	const secret = typeof supplied === 'string' && supplied !== '' ? supplied : passwords.get(device.id)
+	if (secret === undefined || secret === '') return undefined
+	passwords.set(device.id, secret)
+	return secret
+}
+
+/**
+ * The renderer's request for a password, and why it is being asked again.
+ *
+ * `label`, `user` and `host` are there so the dialog can name the machine without
+ * the renderer looking it up in a book it does not otherwise read; `error` is the
+ * far side's refusal, present only when a password was already tried.
+ *
+ * @param device - the device the password is for.
+ * @param error - what the previous attempt said, if it said anything.
+ * @returns the payload the renderer's dialog needs.
+ */
+function passwordPrompt(device, error) {
+	return {
+		id: device.id,
+		label: device.label,
+		user: device.user,
+		host: device.host,
+		...(error === undefined ? {} : { error })
+	}
+}
 
 /** The active tab id, as far as the renderer is concerned. */
 let activeId = LOCAL_ID
@@ -632,6 +714,12 @@ function terminalCallbacks(tab, generation, box) {
 			if (tab.generation !== generation || tab.terminal !== box.session) return
 			tab.exitCode = status.exitCode
 			tab.state = 'ended'
+			// **ssh's 255 on a password terminal is usually the password.** The pty
+			// carries ssh's own sentence, so the tab still says what happened, but the
+			// string in memory must not be replayed by the next ⟲: it was refused, and a
+			// host with a lockout policy counts every replay. 255 also covers an
+			// unreachable host, where asking again costs one dialog and nothing else.
+			if (tab.passwordAuth === true && status.exitCode === 255) passwords.delete(tab.deviceId)
 			publish()
 		}
 	}
@@ -647,9 +735,16 @@ function terminalCallbacks(tab, generation, box) {
  * device path is the shell family, because that decides the command to run, and it
  * is cached on the device after the first time.
  *
+ * A password device's terminal asks for the same password its Harness tab asked
+ * for, once per run. The pty cannot be where it is typed: the platform probe is a
+ * second ssh client that runs before the terminal exists and has no pty at all, so
+ * the password has to arrive through the askpass helper either way.
+ *
  * @param tab - the terminal tab.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when one is missing or was refused, otherwise undefined.
  */
-async function startTerminal(tab) {
+async function startTerminal(tab, password) {
 	if (tab.kind !== 'terminal') return
 	/** @type {{cancelled: boolean, stop: () => void}} */
 	const attempt = { cancelled: false, stop: () => {} }
@@ -701,6 +796,18 @@ async function startTerminal(tab) {
 		}
 		tab.label = `${device.label} — terminal`
 
+		// Settled before the probe, for the same reason `activate` settles it before
+		// the first spawn: a probe with no credential is a `Permission denied` for a
+		// password nobody has typed yet.
+		const secret = passwordFor(device, password)
+		if (device.auth === 'password' && secret === undefined) {
+			tab.state = 'idle'
+			publish()
+			return passwordPrompt(device)
+		}
+		tab.passwordAuth = device.auth === 'password'
+		const authEnv = secret === undefined ? undefined : askpass.envFor(secret, askpassDirectory())
+
 		let platform = device.platform
 		if (platform === undefined) {
 			const ssh = connect.sshExecutable()
@@ -721,10 +828,14 @@ async function startTerminal(tab) {
 					}
 				}
 				return true
-			})
+			}, authEnv)
 			if (attempt.cancelled) return
 			if (detected.error !== undefined) {
 				failTerminal(tab, attempt, detected.error)
+				if (device.auth === 'password' && askpass.isAuthFailure(detected.error)) {
+					passwords.delete(device.id)
+					return passwordPrompt(device, detected.error)
+				}
 				return
 			}
 			platform = detected.platform
@@ -740,6 +851,7 @@ async function startTerminal(tab) {
 			device,
 			platform,
 			ssh: connect.sshExecutable(),
+			...(secret === undefined ? {} : { password: secret, askpassDir: askpassDirectory() }),
 			...terminalCallbacks(tab, generation, box)
 		})
 		box.session = session
@@ -767,21 +879,25 @@ async function startTerminal(tab) {
 /**
  * Show a terminal tab, starting its session when there is nothing to show.
  * @param tab - the terminal tab.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when the session cannot start without one.
  */
-async function activateTerminal(tab) {
+async function activateTerminal(tab, password) {
 	activeId = tab.id
 	if (tab.state === 'running' || tab.state === 'starting') {
 		publish()
 		return
 	}
-	await startTerminal(tab)
+	return await startTerminal(tab, password)
 }
 
 /**
  * Open (or focus) one device's terminal from the popover.
  * @param deviceId - the device id.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when the session cannot start without one.
  */
-async function openTerminal(deviceId) {
+async function openTerminal(deviceId, password) {
 	const stored = await devices.load()
 	const device = stored.find((entry) => entry.id === String(deviceId))
 	if (device === undefined) return
@@ -795,7 +911,7 @@ async function openTerminal(deviceId) {
 		console.error(`[terminal] ${error instanceof Error ? error.message : String(error)}`)
 		return
 	}
-	await activateTerminal(tab)
+	return await activateTerminal(tab, password)
 }
 
 /**
@@ -885,15 +1001,17 @@ async function openLocalTerminal(preset) {
 /**
  * Reconnect a terminal in place, keeping its tab.
  * @param tab - the terminal tab.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when the session cannot start without one.
  */
-async function restartTerminal(tab) {
+async function restartTerminal(tab, password) {
 	cancelTerminal(tab)
 	const session = tab.terminal
 	tab.terminal = undefined
 	tab.state = 'idle'
 	if (session !== undefined) session.kill()
 	publish()
-	await startTerminal(tab)
+	return await startTerminal(tab, password)
 }
 
 /**
@@ -1030,9 +1148,10 @@ async function settled(connection) {
  * there first is the only connect.
  *
  * @param id - the tab to restart.
- * @returns the tab's state after the attempt.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when the connect cannot start without one.
  */
-async function restartTab(id) {
+async function restartTab(id, password) {
 	const tab = tabs.get(id)
 	if (tab === undefined) return
 	const wasRunning = tab.state === 'running' || tab.state === 'starting' || tab.state === 'detached'
@@ -1045,12 +1164,11 @@ async function restartTab(id) {
 	if (!wasRunning) {
 		// A tab that was idle or failed has nothing to wait for: the operator asking
 		// to restart a tab that is down is asking to start it.
-		await activate(id)
-		return
+		return await activate(id, password)
 	}
 	const gone = await settled(connection)
 	if (tabs.get(id) !== tab) return
-	await activate(id)
+	const prompt = await activate(id, password)
 	// Only when the tab is genuinely up: a connect that failed already put its own
 	// reason in the transcript, and a line about the teardown underneath it would be
 	// the wrong last word.
@@ -1058,6 +1176,7 @@ async function restartTab(id) {
 		note(tab, `the previous process was still alive after ${String(RESTART_SETTLE_MS / 1000)}s; started anyway`)
 		publish()
 	}
+	return prompt
 }
 
 /**
@@ -1194,17 +1313,17 @@ function select(id) {
  * went to whichever caller happened to be awaiting and nothing recorded it.
  *
  * @param id - the tab id.
- * @returns the tab's state after the attempt.
+ * @param password - the password the operator just typed, if any.
+ * @returns a password request when the device needs one, otherwise undefined.
  */
-async function activate(id) {
+async function activate(id, password) {
 	const tab = tabs.get(id)
 	if (tab === undefined) return
 	// A terminal's "activate" is its start: the tab exists because the operator
 	// asked for a session, and re-entering it from the panel or Alt+digit is the
 	// same request. Its state machine has no connect result to wait on.
 	if (tab.kind === 'terminal') {
-		await activateTerminal(tab)
-		return
+		return await activateTerminal(tab, password)
 	}
 	activeId = id
 	publish()
@@ -1301,6 +1420,22 @@ async function activate(id) {
 			}
 		}
 
+		// **The password is settled before anything is spawned.** A device that
+		// authenticates by password and has none for this run is not a connect that
+		// fails — it is a question that has not been answered yet. Returning here,
+		// with the attempt cancelled and the tab back to idle, is what lets the
+		// renderer open its dialog and call again with the answer; spawning ssh
+		// first would print `Permission denied` for a password nobody has typed.
+		const secret = passwordFor(device, password)
+		if (device !== undefined && device.auth === 'password' && secret === undefined) {
+			cancelAttempt(tab)
+			tab.activation = undefined
+			tab.state = 'idle'
+			tab.error = undefined
+			publish()
+			return passwordPrompt(device)
+		}
+
 		// **The guest's session is emptied before the Harness it will show is
 		// started — unless the origin provably did not change.** The auth cookie a
 		// `dsh web` mints names the authority of *its own* process (`host:port`), so
@@ -1339,7 +1474,8 @@ async function activate(id) {
 				connect.connectRemote(/** @type {any} */ (device), {
 					signal,
 					onLine: (line) => note(tab, line),
-					onChild
+					onChild,
+					...(secret === undefined ? {} : { password: secret, askpassDir: askpassDirectory() })
 				})
 			)
 			if (result.platform !== undefined && device.platform !== result.platform) {
@@ -1366,6 +1502,14 @@ async function activate(id) {
 			tab.error = result.error
 			note(tab, `FAILED: ${result.error}`)
 			publish()
+			// **A refused password is forgotten and asked for again; nothing else is.**
+			// `isAuthFailure` is deliberately narrow — a timeout or a changed host key
+			// must not throw away a password that was fine — and a refusal is the one
+			// answer that means the string in memory is wrong rather than stale.
+			if (device !== undefined && device.auth === 'password' && askpass.isAuthFailure(result.error)) {
+				passwords.delete(device.id)
+				return passwordPrompt(device, result.error)
+			}
 			return
 		}
 
@@ -1781,9 +1925,9 @@ async function checkForUpdates(automatic) {
 /** Wire the renderer's requests. */
 function installIpc() {
 	ipcMain.handle('tabs:get', () => snapshot())
-	ipcMain.handle('tabs:activate', async (_event, id) => {
-		await activate(String(id))
-		return snapshot()
+	ipcMain.handle('tabs:activate', async (_event, id, password) => {
+		const prompt = await activate(String(id), typeof password === 'string' ? password : undefined)
+		return { ...snapshot(), ...(prompt === undefined ? {} : { needsPassword: prompt }) }
 	})
 	// The selection half, which a click and Alt+digit use: show the tab, start
 	// nothing. Keeping the two apart is what makes "show me that tab" and "start
@@ -1820,7 +1964,7 @@ function installIpc() {
 		}
 		return snapshot()
 	})
-	ipcMain.handle('tabs:restart', async (_event, id) => {
+	ipcMain.handle('tabs:restart', async (_event, id, password) => {
 		// The operation this application used to make the operator quit for. Awaited
 		// rather than fired and forgotten: the whole point is that the tab comes back,
 		// and the renderer draws whatever state it is in when this resolves — so a
@@ -1828,12 +1972,13 @@ function installIpc() {
 		// looks like it is still coming up.
 		const key = String(id)
 		const tab = tabs.get(key)
+		let prompt
 		if (tab !== undefined && tab.kind === 'terminal') {
-			await restartTerminal(tab)
-			return snapshot()
+			prompt = await restartTerminal(tab, typeof password === 'string' ? password : undefined)
+		} else {
+			prompt = await restartTab(key, typeof password === 'string' ? password : undefined)
 		}
-		await restartTab(key)
-		return snapshot()
+		return { ...snapshot(), ...(prompt === undefined ? {} : { needsPassword: prompt }) }
 	})
 	ipcMain.handle('tabs:reap', async (_event, id) => {
 		// **The one control that ends a persistent host.** Everything else detaches,
@@ -1849,6 +1994,15 @@ function installIpc() {
 		const stored = await devices.load()
 		const device = stored.find((entry) => entry.id === key)
 		const connection = tab.connection
+		// A password device whose password this run has not been told cannot run the
+		// stop program: the only ssh connection available to it would be refused. Say
+		// so instead of letting the spawn fail with `Permission denied`, which reads
+		// like the far side is broken rather than the window's memory empty.
+		if (device !== undefined && device.auth === 'password' && passwords.get(key) === undefined) {
+			note(tab, 'FAILED: stopping the host needs this machine\'s password; connect with it once first')
+			publish()
+			return snapshot()
+		}
 		tab.connection = undefined
 		cancelReconnect(tab)
 		try {
@@ -1858,7 +2012,10 @@ function installIpc() {
 				// A detached tab has no connection to terminate, so the record on the far
 				// side is what is stopped — which is also the case that reaches a host
 				// this window adopted rather than started.
-				await connect.stopHost(device, platform, { onLine: (line) => note(tab, line) })
+				await connect.stopHost(device, platform, {
+					onLine: (line) => note(tab, line),
+					...(device.auth === 'password' ? { password: passwords.get(key), askpassDir: askpassDirectory() } : {})
+				})
 			}
 		} catch (error) {
 			note(tab, `FAILED: ${error instanceof Error ? error.message : String(error)}`)
@@ -1913,6 +2070,9 @@ function installIpc() {
 		// A tab exists per device, so the one just saved needs one too — including
 		// when it is a new device, which has never appeared in the bar before.
 		if (saved !== undefined) tabFor(saved)
+		// Switching a device back to its key makes the remembered password dead
+		// weight and, worse, a secret in memory for a machine that no longer uses one.
+		if (saved !== undefined && saved.auth !== 'password') passwords.delete(saved.id)
 		publish()
 		return { devices: stored }
 	})
@@ -1941,6 +2101,10 @@ function installIpc() {
 		}
 		const stored = await devices.mutate((current) => current.filter((entry) => entry.id !== key))
 		if (activeId === key) activeId = LOCAL_ID
+		// The password is the one thing about a device this run holds outside the
+		// book; removing the device has to remove it too, or it would sit in memory
+		// until a quit for a machine the operator has deleted.
+		passwords.delete(key)
 		publish()
 		return { devices: stored }
 	})
@@ -1958,9 +2122,9 @@ function installIpc() {
 		await openLocalTerminal(String(preset))
 		return snapshot()
 	})
-	ipcMain.handle('terminal:open', async (_event, deviceId) => {
-		await openTerminal(String(deviceId))
-		return snapshot()
+	ipcMain.handle('terminal:open', async (_event, deviceId, password) => {
+		const prompt = await openTerminal(String(deviceId), typeof password === 'string' ? password : undefined)
+		return { ...snapshot(), ...(prompt === undefined ? {} : { needsPassword: prompt }) }
 	})
 	// The renderer has an xterm for this tab and is ready to draw. Until this
 	// arrives the session holds its output, because the first thing a failing ssh

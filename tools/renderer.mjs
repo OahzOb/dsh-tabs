@@ -85,6 +85,28 @@ function harness(options = {}) {
 	let onShortcut = () => {}
 	let onTerminalData = () => {}
 	let failSave
+	/**
+	 * The password request the next call should answer with, if any.
+	 *
+	 * The real main process answers a request it cannot satisfy with `needsPassword`
+	 * beside the state and starts nothing. The fake does the same, once, and only when
+	 * no password was supplied — which is exactly the shape `answerPasswordRequests`
+	 * has to handle.
+	 */
+	let nextPasswordPrompt
+
+	/**
+	 * Answer a request with the armed password prompt, once.
+	 * @param base - the state the fake would otherwise return.
+	 * @param password - what the page sent; a prompt is only owed on the first ask.
+	 * @returns the state, with the request beside it when one is armed.
+	 */
+	function takePrompt(base, password) {
+		if (password !== undefined || nextPasswordPrompt === undefined) return base
+		const prompt = nextPasswordPrompt
+		nextPasswordPrompt = undefined
+		return { ...base, needsPassword: prompt }
+	}
 
 	/**
 	 * A terminal emulator with the surface `app.js` uses.
@@ -165,9 +187,9 @@ function harness(options = {}) {
 
 	window.dshTabs = {
 		state: async () => state,
-		activate: async (id) => {
-			calls.push(['activate', id])
-			return state
+		activate: async (id, password) => {
+			calls.push(password === undefined ? ['activate', id] : ['activate', id, password])
+			return takePrompt(state, password)
 		},
 		select: async (id) => {
 			calls.push(['select', id])
@@ -177,9 +199,9 @@ function harness(options = {}) {
 			calls.push(['disconnect', id])
 			return state
 		},
-		restart: async (id) => {
-			calls.push(['restart', id])
-			return state
+		restart: async (id, password) => {
+			calls.push(password === undefined ? ['restart', id] : ['restart', id, password])
+			return takePrompt(state, password)
 		},
 		reap: async (id) => {
 			calls.push(['reap', id])
@@ -207,9 +229,9 @@ function harness(options = {}) {
 			calls.push(['checkUpdates'])
 			return { version: 'test' }
 		},
-		terminalOpen: async (id) => {
-			calls.push(['terminalOpen', id])
-			return state
+		terminalOpen: async (id, password) => {
+			calls.push(password === undefined ? ['terminalOpen', id] : ['terminalOpen', id, password])
+			return takePrompt(state, password)
 		},
 		terminalPresets: async () => {
 			calls.push(['terminalPresets'])
@@ -278,6 +300,10 @@ function harness(options = {}) {
 		},
 		failNextSave(message) {
 			failSave = message
+		},
+		/** Answer the next request with a password prompt, once. */
+		askPasswordNext(prompt) {
+			nextPasswordPrompt = prompt
 		},
 		tabs: () => [...window.document.querySelectorAll('.tab')],
 		guests: () => [...window.document.querySelectorAll('webview')],
@@ -573,6 +599,99 @@ await test('a failed tab names the reason and shows the transcript', async () =>
 	assert.match(text, /box-a could not start/u)
 	assert.match(text, /the ssh tunnel never began accepting connections/u)
 	assert.match(text, /FAILED: the ssh tunnel/u)
+})
+
+console.log('password prompts')
+
+/** An idle password device's tab, which is what a password request arrives on. */
+function idlePasswordTab() {
+	return { activeId: 'dev-p', tabs: [{ id: 'dev-p', kind: 'remote', label: 'box-p', state: 'idle' }] }
+}
+
+/**
+ * Click the Connect button in the panel that is showing.
+ * @param h - the harness.
+ */
+function pressConnect(h) {
+	const panel = h.panels()[0]
+	const connect = [...panel.querySelectorAll('button')].find((button) => button.textContent === 'Connect')
+	assert.ok(connect !== undefined, 'the idle panel has no Connect button')
+	connect.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+}
+
+await test('a request for a password opens a dialog, and the answer goes back to the main process', async () => {
+	const h = harness({ state: idlePasswordTab(), devices: [] })
+	await h.flush()
+	h.askPasswordNext({ id: 'dev-p', label: 'box-p', user: 'deploy', host: '10.0.0.2' })
+	pressConnect(h)
+	await h.flush()
+	const dialog = h.document.querySelector('.password-dialog')
+	assert.ok(dialog !== null, 'no dialog appeared for a password request')
+	assert.match(dialog.textContent, /deploy@10\.0\.0\.2/u)
+	assert.match(dialog.textContent, /this run only/u)
+	const input = dialog.querySelector('input')
+	assert.equal(input.type, 'password')
+	assert.equal(input.name, 'password')
+	input.value = 'secret'
+	dialog.dispatchEvent(new h.window.Event('submit', { bubbles: true, cancelable: true }))
+	await h.flush()
+	assert.equal(h.document.querySelector('.password-dialog'), null, 'the dialog stayed open')
+	assert.deepEqual(
+		h.calls.filter(([name]) => name === 'activate'),
+		[
+			['activate', 'dev-p'],
+			['activate', 'dev-p', 'secret']
+		]
+	)
+	// The password is not kept in the page: a state push redraws from the main
+	// process, and nothing here may echo the secret back into the document.
+	assert.equal(h.document.body.textContent.includes('secret'), false, 'the password was drawn on the page')
+})
+
+await test('cancelling the password dialog connects nothing', async () => {
+	const h = harness({ state: idlePasswordTab(), devices: [] })
+	await h.flush()
+	h.askPasswordNext({ id: 'dev-p', label: 'box-p', user: 'deploy', host: '10.0.0.2' })
+	pressConnect(h)
+	await h.flush()
+	const dialog = h.document.querySelector('.password-dialog')
+	const cancel = [...dialog.querySelectorAll('button')].find((button) => button.textContent === 'Cancel')
+	cancel.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.equal(h.document.querySelector('.password-dialog'), null, 'the dialog stayed open')
+	assert.deepEqual(h.calls.filter(([name]) => name === 'activate'), [['activate', 'dev-p']])
+})
+
+await test('a refused password reopens the dialog saying what the far side said', async () => {
+	const h = harness({ state: idlePasswordTab(), devices: [] })
+	await h.flush()
+	h.askPasswordNext({ id: 'dev-p', label: 'box-p', user: 'deploy', host: '10.0.0.2', error: 'Permission denied (password).' })
+	pressConnect(h)
+	await h.flush()
+	const dialog = h.document.querySelector('.password-dialog')
+	assert.match(dialog.textContent, /refused/u)
+	assert.match(dialog.textContent, /Permission denied/u)
+})
+
+await test('the add-device form offers the password choice and saves it', async () => {
+	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	const form = h.popover().querySelector('form')
+	const select = form.querySelector('select[name="auth"]')
+	assert.ok(select !== null, 'the form has no authentication choice')
+	assert.deepEqual([...select.options].map((option) => option.value), ['key', 'password'])
+	form.querySelector('input[name="host"]').value = 'build-01.example.net'
+	form.querySelector('input[name="user"]').value = 'deploy'
+	select.value = 'password'
+	form.dispatchEvent(new h.window.Event('submit', { bubbles: true, cancelable: true }))
+	await h.flush()
+	const save = h.calls.find(([name]) => name === 'save')
+	assert.equal(save[1].auth, 'password')
+	// The form goes back to the default the next device would want, not to the choice
+	// the last one made.
+	assert.equal(select.value, 'key')
 })
 
 console.log('interaction')
