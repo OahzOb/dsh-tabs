@@ -20,6 +20,7 @@ const net = require('node:net')
 const remote = require('./remote.js')
 const localdsh = require('./localdsh.js')
 const askpass = require('./askpass.js')
+const addresses = require('./addresses.js')
 
 /** Exit code ssh uses for its own failures, as opposed to the remote command's. */
 const SSH_FAILURE = 255
@@ -721,6 +722,17 @@ async function connectRemoteBody(device, options = {}) {
 	const onChild = typeof options.onChild === 'function' ? options.onChild : () => {}
 	const signal = options.signal
 	const ssh = sshExecutable()
+	// The address is chosen before ssh starts, so the probe, the server and the
+	// tunnel all reach the same machine by the same path. A cancel during the
+	// probes leaves nothing spawned, but still has to stop this connect here.
+	const chosen = await resolveAddress(device, {
+		onLine,
+		signal,
+		probe: options.addressProbe,
+		timeoutMs: options.addressTimeoutMs
+	})
+	if (signal?.aborted === true || chosen.cancelled === true) return { error: 'the connect was stopped before it finished' }
+	device = chosen.device
 	const target = `${device.user}@${device.host}`
 	const authEnv = authEnvFor(device, options)
 	onLine(`connect ${target}:${String(device.sshPort)}`)
@@ -1191,6 +1203,21 @@ async function connectLocal(options = {}) {
 }
 
 /**
+ * Pick the address a connect will use.
+ *
+ * Exported so a terminal — which opens ssh without going through `connectRemote`
+ * — makes the same choice by the same rules. The probe is injectable for the
+ * offline suites; nothing here runs a network check for a single-address device.
+ *
+ * @param device - the device record from the book.
+ * @param options - `onLine`, `signal`, `probe`, `timeoutMs`.
+ * @returns the chosen device and how the answer was reached.
+ */
+async function resolveAddress(device, options = {}) {
+	return addresses.resolve(device, options)
+}
+
+/**
  * Stop the host one persistent device is using, without a tab that owns it.
  *
  * The tab has usually let go already — closing a persistent tab drops the tunnel
@@ -1205,7 +1232,10 @@ async function connectLocal(options = {}) {
  */
 async function stopHost(device, platform = 'posix', options = {}) {
 	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
-	return stopPersistentHost(device, platform, sshExecutable(), onLine, authEnvFor(device, options))
+	// Stop host is reached without a tab, often after the tunnel has gone. It still
+	// has to reach the same machine the book now names, by the same selection rules.
+	const chosen = await resolveAddress(device, { onLine, probe: options.addressProbe, timeoutMs: options.addressTimeoutMs })
+	return stopPersistentHost(chosen.device, platform, sshExecutable(), onLine, authEnvFor(chosen.device, options))
 }
 
-module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, connectRemote, connectLocal, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }
+module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, resolveAddress, connectRemote, connectLocal, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }

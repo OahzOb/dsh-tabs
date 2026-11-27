@@ -789,12 +789,20 @@ async function startTerminal(tab, password) {
 
 		const stored = await devices.load()
 		if (attempt.cancelled) return
-		const device = stored.find((entry) => entry.id === tab.deviceId)
+		let device = stored.find((entry) => entry.id === tab.deviceId)
 		if (device === undefined) {
 			failTerminal(tab, attempt, 'this device is no longer in the book')
 			return
 		}
 		tab.label = `${device.label} — terminal`
+		// A terminal opens ssh directly, so it has to choose the address itself.
+		// The connect path uses the same resolver before its own ssh calls.
+		const chosen = await connect.resolveAddress(device, {
+			onLine: (line) => note(tab, line),
+			cancelled: () => attempt.cancelled
+		})
+		if (attempt.cancelled || chosen.cancelled === true) return
+		device = chosen.device
 
 		// Settled before the probe, for the same reason `activate` settles it before
 		// the first spawn: a probe with no credential is a `Permission denied` for a

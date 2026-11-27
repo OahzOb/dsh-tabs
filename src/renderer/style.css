@@ -556,6 +556,43 @@ body {
 	color: var(--bad);
 }
 
+/* The address choice sits on the row itself: it is a property of the machine,
+   not of a connect, and has to be reachable without opening a second dialog. */
+.row select.address-select {
+	max-width: 170px;
+	padding: 4px 6px;
+	background: #101014;
+	border: 1px solid var(--line);
+	border-radius: 5px;
+	color: var(--dim);
+	font: inherit;
+	font-size: 11px;
+}
+
+/* The editor is inline under the row so the operator can compare the list with
+   the machine it belongs to before saving. It is hidden until asked for. */
+.address-editor {
+	display: grid;
+	gap: 6px;
+	width: 100%;
+	padding-top: 6px;
+}
+
+.address-editor[hidden] {
+	display: none;
+}
+
+.address-editor textarea,
+form textarea {
+	padding: 6px 9px;
+	background: #101014;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	color: var(--fg);
+	font: inherit;
+	resize: vertical;
+}
+
 form {
 	display: grid;
 	gap: 6px;

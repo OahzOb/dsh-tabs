@@ -351,9 +351,20 @@ function harness(options = {}) {
 	 * @type {{device: Record<string, unknown>, options: Record<string, unknown>}[]}
 	 */
 	const connectCalls = []
+	/** Every address resolution a terminal asked for, with what it picked. */
+	const addressCalls = []
 
 	const connectStub = {
 		sshExecutable: () => 'ssh',
+		/**
+		 * Address selection is a pure decision; the stub lets a test name the
+		 * answer instead of opening sockets to invented hosts.
+		 */
+		async resolveAddress(device) {
+			const host = options.resolveTo ?? device.host
+			addressCalls.push({ device, host })
+			return { device: { ...device, host }, host, automatic: true, tried: [], unreachable: false }
+		},
 		async connectLocal(callOptions = {}) {
 			return pending(callOptions)
 		},
@@ -636,6 +647,7 @@ function harness(options = {}) {
 		legacyCookies,
 		removedCookies,
 		connectCalls,
+		addressCalls,
 		/**
 		 * Arm the next connect so it does not settle until the test says so.
 		 *
@@ -1701,6 +1713,25 @@ await test('a terminal opens as its own tab and starts exactly one session', asy
 	assert.equal(h.terminalSpawns[0].startOptions.platform, 'posix')
 	const listed = await h.call('devices:list')
 	assert.equal(listed.devices.find((device) => device.id === 'dev-a').platform, 'posix')
+})
+
+await test('a terminal opens through the address the book selected', async () => {
+	// The terminal path opens ssh itself, so it must ask the same resolver the
+	// connect path uses — otherwise it would reach a different machine than the
+	// Harness tab beside it.
+	const h = harness({
+		devices: [
+			{ id: 'dev-a', label: 'box-a', transport: 'ssh', host: '10.0.0.2', user: 'deploy', sshPort: 22, addresses: [{ host: '10.0.0.3' }] }
+		],
+		resolveTo: '10.0.0.3'
+	})
+	await h.boot()
+	await h.call('devices:list')
+	await h.call('terminal:open', 'dev-a')
+	assert.equal(h.addressCalls.length, 1, 'the terminal did not choose an address')
+	assert.equal(h.addressCalls[0].device.host, '10.0.0.2')
+	assert.equal(h.terminalSpawns.length, 1)
+	assert.equal(h.terminalSpawns[0].startOptions.device.host, '10.0.0.3')
 })
 
 await test('output is held until the renderer attaches, then routed to that tab', async () => {

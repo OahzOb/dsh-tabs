@@ -62,6 +62,7 @@ and the measurements are in [Keep it out of `$DSH_HOME`](#keep-it-out-of-dsh_hom
 | **Nothing installed on the far side** | An SSH server and a Node-installed `dsh` are the whole requirement; the remote's own OS picks the port, so a connect cannot collide with a server someone started by hand. |
 | **A device book in the plugin's schema** | `$DSH_HOME/dsh-tabs.json` — a file of its own, seeded from the Desktop plugin's `remote-devices.json` on first run, never written by two processes at once. |
 | **A key or a password, per device** | The default is the operator's own ssh — agent, `~/.ssh/config`, the usual identities — with `BatchMode=yes` so a key-less machine fails instead of hanging. A device marked **Password** is asked for one on first connect and reuses it for the rest of the run; it is never written to the book, and the helper that answers ssh reads it from the environment, not from the command line. |
+| **Several addresses per machine** | A device keeps a LAN address and a Tailscale one side by side. **Auto** probes them together and picks the first reachable LAN address, with the overlay as the fallback; a choice made in the device row is written to the book and stays until you change it. Terminals and `Stop host` use the same choice as the Harness tab. |
 | **A readable failure** | A connect that fails quotes the far side's own words, including the CLIXML error stream PowerShell produces on a Windows host. |
 | **A version floor that speaks up** | `src/localdsh.js` checks `dsh --version` before the local tab starts, so an old CLI names itself instead of arriving as a credential error 45 seconds later. |
 | **A restart that does not need a relaunch** | `⟲` on a tab stops its Harness and starts it again, waiting for the old process to actually exit — so picking up a changed Harness or profile is one click instead of closing the application. |
@@ -135,7 +136,9 @@ installed by hand; only the versions that contain the updater can update themsel
   local tab has `⟲` and no `×`, because nothing recreates a tab that was stopped.
 - **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
   inside a remote interface.
-- **`+`** lists the devices, adds one, and removes one. The form's **SSH key**
+- **`+`** lists the devices, adds one, and removes one. A row's **Auto / address**
+   selector writes the choice to the book; **Addresses** edits the full list, first
+   line primary, each extra line `label=host`. The form's **SSH key**
   (the default) and **Password** choices are the two ways an account can be answered:
   a password device asks for its password the first time it is connected, keeps it in
   memory for the rest of the run — reconnects and terminals reuse it — and forgets it
@@ -234,6 +237,7 @@ each section is a decision that cost something to learn.
 | **对端不装任何东西** | 只需要一个 SSH 服务和对端 `PATH` 上用 Node 安装的 `dsh`；端口由**远端**系统自己挑，绝不会和谁手动起的服务撞端口。 |
 | **设备簿沿用插件 schema** | `$DSH_HOME/dsh-tabs.json`，独立一个文件，首次运行时从桌面插件的 `remote-devices.json` 播种，绝不会有两个进程同时写它。 |
 | **每台设备可以选 key 或密码** | 默认走操作者自己的 ssh（agent、`~/.ssh/config`、默认私钥），带 `BatchMode=yes`，没 key 的机器立刻失败而不是挂住。把设备标成 **Password** 后，首次连接会问一次密码并在本次运行期间复用（重连、终端都用它）；密码不写入设备簿，回答 ssh 的 helper 从环境变量读它，而不是从命令行。 |
+| **一台机器多个地址** | 设备可以同时保存局域网和 Tailscale 地址。**Auto** 并发探测，优先选通了的局域网地址，否则退回 overlay；在设备行里选了某个地址会写进设备簿，直到你改回来。终端和 Stop host 与 Harness 标签页用同一个选择。 |
 | **失败能读懂** | 连接失败会引用对端自己的原话，包括 Windows 主机上 PowerShell 产生的 CLIXML 错误流。 |
 | **版本下限会自己说话** | 本地标签页启动前，`src/localdsh.js` 先查 `dsh --version`；CLI 太旧会直接报名，而不是 45 秒后变成一个凭据错误。 |
 | **每台设备一个终端** | `+` → 设备行 → **Terminal**，用同一条 SSH 打开交互式 shell：POSIX 用登录 shell，Windows 优先 PowerShell 7、退回 Windows PowerShell。窗口缩放会改变远端终端尺寸，`Ctrl+C`、`vim` 和全屏程序都正常。 |
@@ -277,7 +281,7 @@ release CDN 不可达时设 `ELECTRON_MIRROR`、环境拒绝在 workspace 外 `m
 - **标签页** 是本地 Harness 和设备簿里的每一台机器。标签页是*配置好的东西*，不是临时视图：
   点击只是选中它，面板里的 **Connect** 才启动；`×` 是**断开**、不是删除。删设备在 `+` 面板里。
 - **`Alt+1…9`** 切标签，在任何位置都有效，包括你正在远程界面里打字的时候。
-- **`+`** 列出设备、添加设备、删除设备。表单里的 **SSH key**（默认）和 **Password**
+- **`+`** 列出设备、添加设备、删除设备。设备行上的 **Auto / 地址** 下拉会把选择写进设备簿；**Addresses** 编辑完整列表（第一行是主地址，其余每行 `label=host`）。表单里的 **SSH key**（默认）和 **Password**
   是账号认证的两种方式：密码设备第一次连接时问一次，密码只在内存里留到本次运行结束 ——
   重连和终端会复用它，被对端拒绝就清掉重问。密码不会写到磁盘上。
 - **Terminal** 在设备行里，点开是一个独立的终端标签页。`×` 关闭并结束会话，`⟲` 原地重连，
@@ -427,10 +431,50 @@ purpose**: two processes writing one JSON file would clobber each other, and thi
 must not corrupt a book the Desktop plugin is still using. On first run the plugin's
 `remote-devices.json` is copied over, so devices configured there are waiting here.
 
-Each device is `{label, host, user, sshPort, directory?, auth?}`. A Windows host needs
-nothing extra — the shell family is detected. `auth: "password"` says the account is
-answered with a password instead of the operator's key; its absence is the key, so a
-book written before the field existed keeps its exact behaviour.
+Each device is `{label, host, user, sshPort, directory?, auth?, addresses?,
+addressChoice?}`. A Windows host needs nothing extra — the shell family is detected.
+`auth: "password"` says the account is answered with a password instead of the
+operator's key; its absence is the key, so a book written before the field existed
+keeps its exact behaviour.
+
+### One machine, several addresses
+
+A device can be reached by more than one address — a LAN IP at home and a
+Tailscale IP away from it. The book keeps `host` as the **primary** address and
+puts the others in `addresses`, so a record copied to the Desktop plugin or to
+the Android client (which both understand the older, single-address shape)
+still names a machine:
+
+```json
+{
+  "label": "box-a",
+  "host": "10.0.0.2",
+  "user": "deploy",
+  "sshPort": 22,
+  "addresses": [
+    { "host": "<tailscale-ip>", "label": "Tailscale" }
+  ],
+  "addressChoice": "auto"
+}
+```
+
+`addressChoice` is either `"auto"` or the host the operator picked in the `+`
+popover; a pick is written to the book and survives a restart. In automatic
+mode `src/addresses.js` probes every address **concurrently** with a short
+timeout and takes the first reachable one in preference order: private IPv4
+(`10/8`, `172.16/12`, `192.168/16`), IPv6 ULA and link-local first, then
+everything else. Tailscale's `100.64/10` is deliberately in the second group —
+it is the fallback, not a LAN. A name is never guessed to be local. When nothing
+answers, the primary address is used anyway so ssh says exactly why it failed,
+and the transcript names the addresses that were tried.
+
+The decision happens before any ssh client starts, so the platform probe, the
+server connection, the tunnel, a terminal and `Stop host` all reach the same
+machine by the same path. A device with only one address is never probed: there
+is no choice to make, and a connect should not pay a timeout for nothing. The
+choice is made once per connect, never in the middle of a live session; the
+host key pin stays per device, because the machine — not the path to it — is
+what was trusted.
 
 ### Every write goes through one door
 
@@ -1097,6 +1141,7 @@ src/preload.js     the renderer's entire view of the main process
 src/remote.js      what to run on the far side — a copy, see below
 src/askpass.js     the password half of an ssh login: the helper ssh asks, and the environment that makes it ask
 src/devices.js     the device book
+src/addresses.js   which of a device's addresses this connect uses
 src/terminal.js    a device's terminal: the ssh argv, the pty, and its buffer
 src/renderer/      the tab bar, the guest host and the terminal host
 assets/icon.svg    the application icon, 32 pixels and up

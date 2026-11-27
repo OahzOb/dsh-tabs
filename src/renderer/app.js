@@ -821,6 +821,44 @@ async function answerPasswordRequests(invoke) {
 }
 
 /** Build the device popover. */
+/**
+ * Parse the operator's address lines.
+ *
+ * One address per line, optionally `label=host`; the first line is the primary
+ * address when the whole list is being edited. Nothing here reaches ssh: the
+ * main process normalizes the book again through `devices.normalize`.
+ *
+ * @param text - the textarea's contents.
+ * @returns the addresses in the order they were written.
+ */
+function parseAddressEntries(text) {
+	return String(text ?? '')
+		.split(/\r?\n/u)
+		.map((line) => line.trim())
+		.filter((line) => line !== '')
+		.map((line) => {
+			const at = line.indexOf('=')
+			if (at === -1) return { host: line }
+			const label = line.slice(0, at).trim()
+			const host = line.slice(at + 1).trim()
+			return host === '' ? null : label === '' ? { host } : { host, label }
+		})
+		.filter((entry) => entry !== null)
+}
+
+/**
+ * The address list as the operator edits it: primary first, one per line.
+ * @param device - the device row.
+ * @returns the textarea contents.
+ */
+function formatAddressEntries(device) {
+	const lines = [device.host]
+	for (const entry of Array.isArray(device.addresses) ? device.addresses : []) {
+		lines.push(entry.label === undefined ? entry.host : `${entry.label}=${entry.host}`)
+	}
+	return lines.join('\n')
+}
+
 function renderPopover() {
 	popoverEl.replaceChildren()
 	// Any record the book could not hold is reported before anything else, because it
@@ -946,6 +984,83 @@ function renderPopover() {
 			void api.remove(device.id).then(() => refreshDevices())
 		})
 		row.appendChild(remove)
+
+		/** Report a refused address edit where the operator was looking. */
+		const complain = (error) => {
+			const hint = document.createElement('div')
+			hint.className = 'hint'
+			hint.textContent = String(error?.message ?? error)
+			popoverEl.appendChild(hint)
+		}
+
+		// The saved choice, when there is one, is a property of the device: the
+		// main process writes it to the book, so it survives a restart. "Auto"
+		// is recomputed on every connect rather than remembered.
+		const choice = document.createElement('select')
+		choice.className = 'address-select'
+		choice.title = 'Which address to reach this machine through'
+		const autoOption = document.createElement('option')
+		autoOption.value = 'auto'
+		autoOption.textContent = 'Auto: LAN first'
+		choice.appendChild(autoOption)
+		const hosts = new Set()
+		for (const entry of [{ host: device.host }, ...(Array.isArray(device.addresses) ? device.addresses : [])]) {
+			const host = String(entry?.host ?? '')
+			if (host === '' || hosts.has(host.toLowerCase())) continue
+			hosts.add(host.toLowerCase())
+			const option = document.createElement('option')
+			option.value = host
+			option.textContent = entry.label === undefined ? host : `${entry.label} (${host})`
+			choice.appendChild(option)
+		}
+		choice.value = hosts.has(String(device.addressChoice ?? '').toLowerCase()) ? device.addressChoice : 'auto'
+		choice.addEventListener('change', () => {
+			void api
+				.save({ ...device, addressChoice: choice.value })
+				.then(() => refreshDevices())
+				.catch(complain)
+		})
+		row.appendChild(choice)
+
+		// Addresses can be added or changed after a device was created — the
+		// original "+" form only asks for one. The first line is the primary
+		// address, so an older client still finds the machine in `host`.
+		const addressButton = document.createElement('button')
+		addressButton.type = 'button'
+		addressButton.className = 'address-edit'
+		addressButton.textContent = 'Addresses'
+		addressButton.title = 'Edit the addresses this machine can be reached at'
+		const editor = document.createElement('div')
+		editor.className = 'address-editor'
+		editor.hidden = true
+		const area = document.createElement('textarea')
+		area.rows = 3
+		area.value = formatAddressEntries(device)
+		const saveAddresses = document.createElement('button')
+		saveAddresses.type = 'button'
+		saveAddresses.textContent = 'Save addresses'
+		saveAddresses.addEventListener('click', () => {
+			const entries = parseAddressEntries(area.value)
+			if (entries.length === 0) {
+				complain(new Error('at least one address is required'))
+				return
+			}
+			const primary = entries[0].host
+			const extras = entries.slice(1)
+			const names = [primary, ...extras.map((entry) => entry.host)]
+			const keep = names.includes(device.addressChoice) ? device.addressChoice : 'auto'
+			void api
+				.save({ ...device, host: primary, addresses: extras, addressChoice: keep })
+				.then(() => refreshDevices())
+				.catch(complain)
+		})
+		editor.append(area, saveAddresses)
+		addressButton.addEventListener('click', () => {
+			editor.hidden = !editor.hidden
+			if (!editor.hidden) area.value = formatAddressEntries(device)
+		})
+		row.append(addressButton, editor)
+
 		popoverEl.appendChild(row)
 	}
 
@@ -973,6 +1088,14 @@ function renderPopover() {
 		inputs[field.name] = input
 		form.appendChild(input)
 	}
+	// Extra addresses are optional: the primary one above still goes into `host`,
+	// so a book copied to an older client keeps working.
+	const extraAddresses = document.createElement('textarea')
+	extraAddresses.name = 'addresses'
+	extraAddresses.rows = 2
+	extraAddresses.placeholder = 'extra addresses, one per line (label=host), e.g. Tailscale=<tailscale-ip>'
+	inputs.addresses = extraAddresses
+	form.appendChild(extraAddresses)
 	// **The authentication choice is per device, and it has to be visible at the
 	// moment the device is added.** A machine that only offers a password is not a
 	// broken device: without this field the connect would fail with
@@ -1000,6 +1123,8 @@ function renderPopover() {
 			.save({
 				label: inputs.label.value.trim() || inputs.host.value.trim(),
 				host: inputs.host.value.trim(),
+				addresses: parseAddressEntries(inputs.addresses.value),
+				addressChoice: 'auto',
 				user: inputs.user.value.trim(),
 				sshPort: inputs.sshPort.value.trim(),
 				directory: inputs.directory.value.trim(),

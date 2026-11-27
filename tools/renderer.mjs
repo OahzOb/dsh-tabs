@@ -894,6 +894,70 @@ await test('the add form submits the fields it was given', async () => {
 	assert.equal(saved[1].sshPort, '')
 })
 
+await test('the add form submits extra addresses with the device', async () => {
+	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const form = h.popover().querySelector('form')
+	form.querySelector('input[name=host]').value = '10.0.0.2'
+	form.querySelector('input[name=user]').value = 'deploy'
+	form.querySelector('textarea[name=addresses]').value = 'Tailscale=10.0.0.3'
+	form.dispatchEvent(new h.window.Event('submit', { bubbles: true, cancelable: true }))
+	await h.flush()
+	const saved = h.calls.find(([name]) => name === 'save')
+	// jsdom crosses a realm here, so the objects are not reference-equal to this
+	// file's own literals even when their contents agree.
+	assert.deepEqual(JSON.parse(JSON.stringify(saved[1].addresses)), [{ host: '10.0.0.3', label: 'Tailscale' }])
+	assert.equal(saved[1].addressChoice, 'auto')
+})
+
+await test('a device row offers auto and every address, and saves a choice', async () => {
+	const h = harness({
+		state: { activeId: 'local', tabs: [] },
+		devices: [{ id: 'dev-a', label: 'box-a', user: 'u', host: '10.0.0.2', sshPort: 22, addresses: [{ host: '10.0.0.3', label: 'Tailscale' }], addressChoice: 'auto' }]
+	})
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const select = h.popover().querySelector('.row select.address-select')
+	assert.ok(select !== null, 'the device row has no address choice')
+	assert.deepEqual([...select.options].map((option) => option.value), ['auto', '10.0.0.2', '10.0.0.3'])
+	select.value = '10.0.0.3'
+	select.dispatchEvent(new h.window.Event('change', { bubbles: true }))
+	await h.flush()
+	const saved = h.calls.find(([name]) => name === 'save')
+	assert.ok(saved !== undefined, 'the choice was not written to the book')
+	assert.equal(saved[1].addressChoice, '10.0.0.3')
+})
+
+await test('the address editor can change the primary address and the list', async () => {
+	const h = harness({
+		state: { activeId: 'local', tabs: [] },
+		devices: [{ id: 'dev-a', label: 'box-a', user: 'u', host: '10.0.0.2', sshPort: 22, addresses: [{ host: '10.0.0.3', label: 'Tailscale' }], addressChoice: 'auto' }]
+	})
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const row = h.popover().querySelector('.row')
+	const editor = row.querySelector('.address-editor')
+	assert.equal(editor.hidden, true)
+	row.querySelector('button.address-edit').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	assert.equal(editor.hidden, false)
+	const area = editor.querySelector('textarea')
+	assert.equal(area.value, '10.0.0.2\nTailscale=10.0.0.3')
+	area.value = '10.0.0.3\nLAN=10.0.0.2'
+	editor.querySelector('button').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	const saved = h.calls.find(([name]) => name === 'save')
+	assert.equal(saved[1].host, '10.0.0.3')
+	assert.deepEqual(JSON.parse(JSON.stringify(saved[1].addresses)), [{ host: '10.0.0.2', label: 'LAN' }])
+	assert.equal(saved[1].addressChoice, 'auto')
+})
+
 await test('a rejected save surfaces the reason instead of failing silently', async () => {
 	const h = harness({ state: { activeId: 'local', tabs: [] }, devices: [] })
 	await h.flush()

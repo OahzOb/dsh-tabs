@@ -54,6 +54,8 @@ const RESERVED_IDS = Object.freeze(['local'])
  * @property {'persistent'} [mode] - present only for a host that outlives the connection.
  * @property {string} [home] - the far side's DSH home, when not the default.
  * @property {number} [localPort] - the stable local forward port a persistent device keeps.
+ * @property {{host: string, label?: string}[]} [addresses] - extra addresses for the same machine; the primary one stays in `host`.
+ * @property {string} [addressChoice] - `"auto"` (the default) or one of the addresses, when the operator picked one.
  */
 
 /**
@@ -289,6 +291,32 @@ function mutate(change) {
 }
 
 /**
+ * The extra addresses a record names, rebuilt from untrusted input.
+ *
+ * `host` stays the primary address: a book written before addresses existed, and
+ * the other two clients that share this schema, still understand it. So the
+ * extra list never contains the primary, and a duplicate of it is dropped rather
+ * than probed twice.
+ *
+ * @param incoming - the submitted addresses, or undefined to keep the stored ones.
+ * @param host - the normalized primary address.
+ * @returns the acceptable extra addresses.
+ */
+function normalizeAddresses(incoming, host) {
+	if (!Array.isArray(incoming)) return []
+	const seen = new Set([host.toLowerCase()])
+	const addresses = []
+	for (const entry of incoming) {
+		const address = typeof entry?.host === 'string' ? entry.host.trim() : ''
+		if (address === '' || seen.has(address.toLowerCase())) continue
+		seen.add(address.toLowerCase())
+		const label = typeof entry.label === 'string' && entry.label.trim() !== '' ? entry.label.trim() : undefined
+		addresses.push({ host: address, ...(label === undefined ? {} : { label }) })
+	}
+	return addresses
+}
+
+/**
  * Rebuild one device from untrusted input.
  *
  * The record is rebuilt from a whitelist rather than merged, so an unexpected
@@ -316,6 +344,15 @@ function normalize(incoming, previous) {
 	const host = String(incoming?.host ?? '')
 	const user = String(incoming?.user ?? '')
 	const directory = typeof incoming?.directory === 'string' && incoming.directory !== '' ? incoming.directory : undefined
+	// A saved address choice is a property of the device, not of a connect. An
+	// omitted field keeps the stored choice (the popover's Persistent toggle saves
+	// a whole record); a choice that is no longer one of the addresses falls back
+	// to automatic rather than leaving a device pointing at nothing.
+	const addresses = normalizeAddresses(incoming?.addresses ?? previous?.addresses, host)
+	const wanted = incoming?.addressChoice === undefined ? previous?.addressChoice : incoming.addressChoice
+	const addressChoice = wanted !== 'auto' && [host, ...addresses.map((entry) => entry.host)].includes(wanted)
+		? wanted
+		: 'auto'
 	// **The authentication choice is a property of the device, not of a connect.**
 	// A book written before this existed has no field and keeps the key behaviour;
 	// the popover always sends one (`key` or `password`), so switching back to a key
@@ -373,7 +410,9 @@ function normalize(incoming, previous) {
 		...(auth === undefined ? {} : { auth }),
 		...(mode === 'persistent' ? { mode } : {}),
 		...(home === undefined ? {} : { home }),
-		...(localPort === undefined ? {} : { localPort })
+		...(localPort === undefined ? {} : { localPort }),
+		...(addresses.length === 0 ? {} : { addresses }),
+		addressChoice
 	}
 }
 

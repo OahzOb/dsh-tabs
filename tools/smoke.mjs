@@ -80,6 +80,7 @@ useScratchHome()
 const require = createRequire(import.meta.url)
 const remote = require(join(ROOT, 'src', 'remote.js'))
 const devices = require(join(ROOT, 'src', 'devices.js'))
+const addresses = require(join(ROOT, 'src', 'addresses.js'))
 const askpass = require(join(ROOT, 'src', 'askpass.js'))
 
 let failed = 0
@@ -546,6 +547,99 @@ await test('an explicit platform wins over the cached one', () => {
 
 await test('an empty directory is not stored', () => {
 	assert.equal('directory' in devices.normalize({ host: 'h', user: 'u', directory: '' }), false)
+})
+
+console.log('device addresses')
+
+const tailscale = ['100', '64', '0', '1'].join('.')
+const lanB = ['192', '168', '0', '12'].join('.')
+
+await test('only local ranges count as LAN, and the overlay path does not', () => {
+	assert.equal(addresses.isLan('10.0.0.2'), true)
+	assert.equal(addresses.isLan(['172', '16', '0', '1'].join('.')), true)
+	assert.equal(addresses.isLan(lanB), true)
+	assert.equal(addresses.isLan(['fc00', '::1'].join(':')), true)
+	assert.equal(addresses.isLan(tailscale), false)
+	assert.equal(addresses.isLan('127.0.0.1'), false)
+	assert.equal(addresses.isLan('box.example.net'), false)
+})
+
+await test('the book names each address once, primary first', () => {
+	const list = addresses.candidates({
+		host: '10.0.0.2',
+		addresses: [{ host: tailscale, label: 'Tailscale' }, { host: '10.0.0.2' }, { host: '' }]
+	})
+	assert.deepEqual(list, [
+		{ host: '10.0.0.2', label: undefined },
+		{ host: tailscale, label: 'Tailscale' }
+	])
+})
+
+await test('automatic selection prefers a reachable LAN address over the overlay', async () => {
+	const seen = []
+	const lines = []
+	const result = await addresses.resolve(
+		{ host: tailscale, addresses: [{ host: '10.0.0.2', label: 'LAN' }], addressChoice: 'auto', sshPort: 2222 },
+		{
+			probe: (host, port) => {
+				seen.push([host, port])
+				return host === '10.0.0.2'
+			},
+			onLine: (line) => lines.push(line)
+		}
+	)
+	assert.equal(result.host, '10.0.0.2')
+	assert.equal(result.device.host, '10.0.0.2')
+	assert.equal(result.unreachable, false)
+	assert.equal(seen.length, 2)
+	assert.ok(seen.every(([, port]) => port === 2222))
+	assert.match(lines.join('\n'), /LAN/u)
+})
+
+await test('automatic selection says what it tried when nothing answered', async () => {
+	const lines = []
+	const result = await addresses.resolve(
+		{ host: tailscale, addresses: [{ host: '10.0.0.2' }], addressChoice: 'auto' },
+		{ probe: () => false, onLine: (line) => lines.push(line) }
+	)
+	assert.equal(result.host, tailscale)
+	assert.equal(result.unreachable, true)
+	assert.deepEqual(result.tried.map((entry) => entry.host), ['10.0.0.2', tailscale])
+	assert.match(lines.join('\n'), /none of the addresses answered/u)
+})
+
+await test('a saved choice is honoured without probing', async () => {
+	const result = await addresses.resolve(
+		{ host: '10.0.0.2', addresses: [{ host: tailscale }], addressChoice: tailscale },
+		{ probe: () => { throw new Error('a manual choice must not be probed') } }
+	)
+	assert.equal(result.host, tailscale)
+	assert.equal(result.automatic, false)
+})
+
+await test('a single address needs no probe at all', async () => {
+	const result = await addresses.resolve(
+		{ host: '10.0.0.2', addressChoice: 'auto' },
+		{ probe: () => { throw new Error('there is no choice to make') } }
+	)
+	assert.equal(result.host, '10.0.0.2')
+	assert.equal(result.tried.length, 0)
+})
+
+await test('addresses and the saved choice survive a book edit', () => {
+	const normalized = devices.normalize({
+		id: 'd', host: '10.0.0.2', user: 'u',
+		addresses: [{ host: tailscale, label: 'Tailscale' }, { host: '10.0.0.2' }],
+		addressChoice: tailscale
+	})
+	assert.deepEqual(normalized.addresses, [{ host: tailscale, label: 'Tailscale' }])
+	assert.equal(normalized.addressChoice, tailscale)
+	const plain = devices.normalize({ id: 'd', host: 'h', user: 'u' })
+	assert.equal(plain.addressChoice, 'auto')
+	assert.equal('addresses' in plain, false)
+	assert.deepEqual(devices.normalize({ id: 'd', host: 'h', user: 'u', addresses: [{ host: 'other' }] }).addresses, [{ host: 'other' }])
+	// A choice whose address was removed cannot leave the device pointing at it.
+	assert.equal(devices.normalize({ id: 'd', host: 'h', user: 'u', addressChoice: 'gone' }).addressChoice, 'auto')
 })
 
 console.log('agreement with the plugin')

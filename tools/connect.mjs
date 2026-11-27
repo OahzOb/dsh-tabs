@@ -22,6 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const require = createRequire(import.meta.url)
 const connect = require(join(ROOT, 'src', 'connect.js'))
+const addresses = require(join(ROOT, 'src', 'addresses.js'))
 const localdsh = require(join(ROOT, 'src', 'localdsh.js'))
 
 let passes = 0
@@ -554,6 +555,49 @@ await test('the version this machine actually has is found and accepted', async 
 		null,
 		`this machine's dsh (${result.version}) is below the floor the application requires`
 	)
+})
+
+console.log('address selection')
+
+await test('the real TCP probe answers a listening port and refuses a closed one', async () => {
+	// Every other check here injects a probe; this one exercises the default, so
+	// a broken timeout option or a socket left open cannot hide behind a stub.
+	const port = await connect.freePort()
+	const server = createServer()
+	await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve))
+	try {
+		assert.equal(await addresses.probeTcp('127.0.0.1', port, { timeoutMs: 1000 }), true)
+		const closed = await connect.freePort()
+		assert.equal(await addresses.probeTcp('127.0.0.1', closed, { timeoutMs: 300 }), false)
+	} finally {
+		await new Promise((resolve) => server.close(resolve))
+	}
+})
+
+await test('the connect path exposes address selection to direct callers and terminals', async () => {
+	const overlay = ['100', '64', '0', '1'].join('.')
+	const device = {
+		id: 'dev-a', host: overlay, user: 'u', sshPort: 22,
+		addresses: [{ host: '10.0.0.2', label: 'LAN' }], addressChoice: 'auto'
+	}
+	const notes = []
+	const result = await connect.resolveAddress(device, {
+		probe: (host) => host === '10.0.0.2',
+		onLine: (line) => notes.push(line)
+	})
+	assert.equal(result.host, '10.0.0.2')
+	assert.equal(result.device.user, 'u')
+	assert.match(notes.join('\n'), /address:/u)
+})
+
+await test('a cancelled selection does not leave a connect guessing an address', async () => {
+	const controller = new AbortController()
+	controller.abort()
+	const result = await connect.resolveAddress(
+		{ host: '10.0.0.2', addresses: [{ host: '10.0.0.3' }], addressChoice: 'auto' },
+		{ signal: controller.signal, probe: () => true }
+	)
+	assert.equal(result.cancelled, true)
 })
 
 console.log(`\n${String(passes)} checks passed${failures.length === 0 ? '' : `, ${String(failures.length)} failed`}`)

@@ -1,6 +1,6 @@
 {
   "name": "dsh-tabs",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "Tabbed host for DSH web interfaces: the local one and remote ones over SSH, in a single always-visible tab bar.",
   "author": "OahzOb",
