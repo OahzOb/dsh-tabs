@@ -9,21 +9,28 @@
  * `app.js` is silently dropped — which is exactly what happened until the app was
  * first run with the renderer console forwarded to the terminal. The platform
  * arrives as a data attribute, which no policy restricts.
+ *
+ * The palette is the same one the Android client uses in its dark mode, so a
+ * machine and a phone look like the same application. It was nudged warmer and
+ * a little cooler in the neutrals at the same time as that one was refreshed;
+ * the contrast floors the phone measures hold here too.
  */
 :root {
-	--bg: #16161a;
-	--bar: #1d1d22;
-	--tab: #26262c;
-	--tab-active: #16161a;
-	--line: #33333b;
-	--fg: #e6e6ea;
-	--dim: #9a9aa4;
-	--accent: #5b9dff;
+	--bg: #15161b;
+	--bar: #1e2028;
+	--tab: #292c35;
+	--tab-active: #15161b;
+	--line: #333742;
+	--fg: #ececf2;
+	--dim: #9a9dac;
+	--accent: #6aa5ff;
 	--ok: #4ec97a;
 	--warn: #e0a33e;
 	--bad: #e2605e;
-	--chrome: 40px;
+	--chrome: 42px;
 	--controls: 138px;
+	--radius: 8px;
+	--ring: #6aa5ffaa;
 }
 
 /* macOS draws traffic lights on the left, so the right end is free. */
@@ -49,7 +56,24 @@ body {
 	color: var(--fg);
 	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
 	font-size: 13px;
+	line-height: 1.45;
 	user-select: none;
+}
+
+/*
+ * Keyboard focus has to be visible everywhere, including the icon-only controls
+ * in the tab bar and the small buttons in the device popover. `:focus-visible`
+ * keeps the ring off mouse clicks, where it would be noise.
+ */
+:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+
+button:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible) {
+	outline: none;
 }
 
 /* ---- tab bar ---- */
@@ -150,17 +174,18 @@ body {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	width: 16px;
-	height: 16px;
+	width: 20px;
+	height: 20px;
 	padding: 0;
 	background: transparent;
 	border: 0;
-	border-radius: 4px;
+	border-radius: 5px;
 	color: inherit;
 	cursor: pointer;
-	font-size: 13px;
+	font-size: 14px;
 	line-height: 1;
 	opacity: 0;
+	transition: background 120ms ease, opacity 120ms ease;
 }
 
 .tab:hover .tab-close,
@@ -169,7 +194,7 @@ body {
 .tab[aria-selected='true'] .tab-close,
 .tab[aria-selected='true'] .tab-restart,
 .tab[aria-selected='true'] .tab-reap {
-	opacity: 0.7;
+	opacity: 0.62;
 }
 
 .tab-close:hover,
@@ -177,6 +202,12 @@ body {
 .tab-reap:hover {
 	background: #45454f;
 	opacity: 1;
+}
+
+/* The destructive control stays distinct even at rest, so a half-seen button
+   on a selected tab is not mistaken for the reconnect beside it. */
+.tab-close:hover {
+	background: #5a3336;
 }
 
 .dot {
@@ -448,13 +479,16 @@ body {
 	top: var(--chrome);
 	left: 8px;
 	z-index: 10;
-	width: 380px;
-	max-height: 70vh;
+	/* Wide enough for a multi-IP address editor, but never wider than the window:
+	   a narrow window used to clip the picker and the buttons onto each other. */
+	width: min(440px, calc(100vw - 16px));
+	max-height: min(72vh, 640px);
 	padding: 10px;
 	overflow: auto;
+	overscroll-behavior: contain;
 	background: var(--bar);
 	border: 1px solid var(--line);
-	border-radius: 0 0 10px 10px;
+	border-radius: 0 0 var(--radius) var(--radius);
 	box-shadow: 0 18px 48px #0009;
 }
 
@@ -504,26 +538,36 @@ body {
 	cursor: default;
 }
 
+/*
+ * A device is a small card with three stacked parts, not one line of controls.
+ * Six controls plus a full-width address editor cannot fit in a popover without
+ * sitting on top of each other — which is what happened as soon as a machine had
+ * more than one address. Each part owns a line and wraps inside it.
+ */
 .row {
 	display: flex;
-	align-items: center;
+	flex-direction: column;
+	align-items: stretch;
 	gap: 8px;
-	padding: 7px 8px;
-	border-radius: 6px;
+	padding: 10px;
+	margin-bottom: 8px;
+	background: var(--tab);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
 }
 
 .row:hover {
-	background: #26262c;
+	background: #2f323c;
 }
 
 .row-main {
-	flex: 1;
 	min-width: 0;
 	cursor: pointer;
 }
 
 .row-label {
 	overflow: hidden;
+	font-weight: 600;
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
@@ -531,10 +575,21 @@ body {
 .row-sub {
 	color: var(--dim);
 	font-size: 11px;
+	line-height: 1.5;
+}
+
+.row-actions,
+.row-address {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
 }
 
 .row button {
-	padding: 4px 9px;
+	flex: none;
+	min-height: 28px;
+	padding: 5px 9px;
 	background: transparent;
 	border: 1px solid var(--line);
 	border-radius: 5px;
@@ -542,6 +597,7 @@ body {
 	cursor: pointer;
 	font: inherit;
 	font-size: 11px;
+	transition: border-color 120ms ease, color 120ms ease;
 }
 
 .row button:hover {
@@ -556,11 +612,13 @@ body {
 	color: var(--bad);
 }
 
-/* The address choice sits on the row itself: it is a property of the machine,
+/* The address choice sits on the device card: it is a property of the machine,
    not of a connect, and has to be reachable without opening a second dialog. */
 .row select.address-select {
-	max-width: 170px;
-	padding: 4px 6px;
+	flex: 1 1 150px;
+	min-width: 0;
+	max-width: none;
+	padding: 5px 6px;
 	background: #101014;
 	border: 1px solid var(--line);
 	border-radius: 5px;
@@ -575,7 +633,8 @@ body {
 	display: grid;
 	gap: 6px;
 	width: 100%;
-	padding-top: 6px;
+	padding-top: 10px;
+	border-top: 1px solid var(--line);
 }
 
 .address-editor[hidden] {
@@ -755,4 +814,59 @@ form select:focus {
 
 .password-actions button:hover {
 	border-color: var(--accent);
+}
+
+/* ---- narrow windows ---- */
+
+/* The desktop window can be resized down to a phone-sized sliver. The bar keeps
+   its window controls, so what gives is the tab decoration and the popover's
+   width — never the controls themselves. */
+@media (max-width: 640px) {
+	#bar {
+		padding-left: 4px;
+	}
+
+	.tab {
+		max-width: 140px;
+		padding: 0 8px;
+		gap: 5px;
+	}
+
+	.tab-key {
+		display: none;
+	}
+
+	#popover {
+		width: calc(100vw - 16px);
+	}
+
+	.local-buttons button {
+		flex-basis: calc(50% - 3px);
+	}
+
+	.panel {
+		padding: 20px;
+	}
+}
+
+@media (max-height: 420px) {
+	:root {
+		--chrome: 36px;
+	}
+
+	#tabs {
+		padding-top: 2px;
+	}
+}
+
+/* The starting dot pulses; a reader who asked the OS to stop motion should not
+   have a tab bar that never settles in the corner of their eye. */
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
 }

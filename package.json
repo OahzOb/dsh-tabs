@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron .",
     "install-electron": "node node_modules/electron/install.js",
-    "test": "node tools/smoke.mjs && node tools/connect.mjs && node tools/terminal.mjs && node tools/main.mjs && node tools/renderer.mjs",
+    "test": "node tools/scratch-guard.test.mjs && node tools/smoke.mjs && node tools/connect.mjs && node tools/terminal.mjs && node tools/main.mjs && node tools/renderer.mjs",
+    "test:guard": "node tools/scratch-guard.test.mjs",
     "test:smoke": "node tools/smoke.mjs",
     "test:connect": "node tools/connect.mjs",
     "test:terminal": "node tools/terminal.mjs",

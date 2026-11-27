@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
+import { assertScratch } from './scratch-guard.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -66,6 +67,7 @@ function useScratchHome() {
 	const isReal = target !== undefined && (resolve(target) === resolve(join(homedir(), '.dsh')) || resolve(target) === resolve(homedir()))
 	if (target !== undefined && target.trim() !== '' && !isReal) return
 	const scratch = process.env.DSH_TABS_TEST_HOME ?? join(tmpdir(), 'dsh-tabs-smoke-test')
+	assertScratch(scratch, { label: 'DSH_TABS_TEST_HOME', alsoProtect: [ROOT] })
 	rmSync(scratch, { recursive: true, force: true })
 	mkdirSync(scratch, { recursive: true })
 	process.env.DSH_HOME = scratch
@@ -1903,7 +1905,10 @@ await test('every local file the renderer loads exists, and is a runtime depende
 // Take the scratch book away again when this run created it. A directory left in
 // the system temp directory for every run is the kind of litter that eventually
 // gets mistaken for state.
-if (SCRATCH !== undefined) rmSync(SCRATCH, { recursive: true, force: true })
+if (SCRATCH !== undefined) {
+	assertScratch(SCRATCH, { label: 'scratch home', alsoProtect: [ROOT] })
+	rmSync(SCRATCH, { recursive: true, force: true })
+}
 
 console.log(`\n${String(passed)} checks passed${skipped === 0 ? '' : `, ${String(skipped)} skipped`}${failed === 0 ? '' : `, ${String(failed)} failed`}`)
 if (failed > 0) process.exitCode = 1

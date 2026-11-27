@@ -21,6 +21,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { assertScratch } from './scratch-guard.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -73,6 +74,12 @@ useScratchHome()
  * @returns a writable scratch directory that now exists and is empty.
  */
 function scratchHome() {
+	// An explicit DSH_TABS_TEST_HOME is the one input this suite cannot choose,
+	// so it is the one that is checked: refusing here fails the run instead of
+	// deleting a directory that is not ours to delete.
+	if (process.env.DSH_TABS_TEST_HOME !== undefined) {
+		assertScratch(process.env.DSH_TABS_TEST_HOME, { label: 'DSH_TABS_TEST_HOME', alsoProtect: [ROOT] })
+	}
 	const candidates = [process.env.DSH_TABS_TEST_HOME, join(ROOT, '.tmp-main-test'), join(tmpdir(), 'dsh-tabs-main-test')].filter(
 		(candidate) => typeof candidate === 'string' && candidate !== ''
 	)
@@ -152,6 +159,8 @@ function harness(options = {}) {
 	const appListeners = new Map()
 	const sent = []
 	const stops = []
+	/** Every explicit Stop host for the local host, which is not in `stops`. */
+	const localHostStops = []
 	/** Every folder chooser this harness was asked to show. */
 	const dialogCalls = []
 	const exits = { server: [], tunnel: [] }
@@ -367,6 +376,32 @@ function harness(options = {}) {
 		},
 		async connectLocal(callOptions = {}) {
 			return pending(callOptions)
+		},
+		/**
+		 * The local tab now uses a recorded, detached host. The stub keeps the
+		 * local result persistent so the suite can see that quitting lets go of
+		 * it rather than tearing it down — the distinction this change is about.
+		 */
+		async connectLocalPersistent(callOptions = {}) {
+			const connection = await pending(callOptions)
+			// A real local connection's `stop` is a no-op: letting go or quitting
+			// never ends the recorded host. The stub's ordinary `stop` would count
+			// as a teardown, so it is replaced with the real behaviour.
+			return {
+				...connection,
+				persistent: true,
+				adopted: false,
+				stop() {},
+				// A restart is the one action that really ends a local host.
+				terminate: async () => {
+					localHostStops.push('local')
+					return ['HOST stopped pid=1']
+				}
+			}
+		},
+		async stopLocalHost(callOptions = {}) {
+			callOptions.onLine?.('HOST stopped')
+			localHostStops.push('local')
 		},
 		async connectRemote(device, callOptions = {}) {
 			// What the connect path was handed, including the credential — the one
@@ -638,6 +673,7 @@ function harness(options = {}) {
 		ipc,
 		sent,
 		stops,
+		localHostStops,
 		dialogCalls,
 		queue,
 		ok,
@@ -698,15 +734,32 @@ function harness(options = {}) {
 		 * window's contents: the case that was never in doubt, and not the one the
 		 * README's headline feature rests on.
 		 */
+		/**
+		 * Boot, then press Connect on the local tab as the operator would.
+		 *
+		 * The application no longer starts a host by itself, so this helper is what
+		 * puts the tab into the running state the rest of the suite takes as its
+		 * fixture. Keeping that step here rather than in the application is the
+		 * point: `coldBoot` below is what asserts the new behaviour.
+		 */
 		async boot() {
-			for (const listener of appListeners.get('web-contents-created') ?? []) listener({}, windowContents)
-			readyResolve()
-			await waitFor(() => ipc.has('tabs:get'), 'the window to install its IPC handlers')
+			await this.coldBoot()
+			await ipc.get('tabs:activate')({}, 'local')
 			await waitFor(async () => {
 				const state = await ipc.get('tabs:get')()
 				return state.tabs[0]?.state === 'running'
 			}, 'the local tab to come up')
 			windowContents.emit('did-attach-webview', {}, guestContents)
+		},
+		/** Start the application and stop: no host is started on the operator's behalf. */
+		async coldBoot() {
+			for (const listener of appListeners.get('web-contents-created') ?? []) listener({}, windowContents)
+			readyResolve()
+			await waitFor(() => ipc.has('tabs:get'), 'the window to install its IPC handlers')
+			await waitFor(async () => {
+				const state = await ipc.get('tabs:get')()
+				return state.tabs[0]?.state === 'idle'
+			}, 'the local tab to be idle after a cold boot')
 		},
 		/** Emit an app-level event such as `before-quit`. */
 		emitApp(event) {
@@ -783,22 +836,28 @@ const book = [
 
 console.log('boot')
 
-await test('the local tab comes up on its own and is first', async () => {
+await test('a cold boot leaves the local tab first and idle, and starts no host', async () => {
+	// The local Harness is a host this application adopts, not a child it owns.
+	// Starting it at boot would make closing the window an implicit kill, which
+	// is the behaviour this change removes.
 	const h = harness({ devices: book })
-	await h.boot()
-	const state = await h.state()
-	assert.equal(state.tabs[0].id, 'local')
-	assert.equal(state.tabs[0].state, 'running')
-	assert.equal(state.activeId, 'local')
-})
-
-await test('the device book becomes one tab per device, none of them started', async () => {
-	const h = harness({ devices: book })
-	await h.boot()
+	await h.coldBoot()
 	await h.call('devices:list')
 	const state = await h.state()
 	assert.deepEqual(state.tabs.map((tab) => tab.id), ['local', 'dev-a', 'dev-b'])
-	assert.deepEqual(state.tabs.map((tab) => tab.state), ['running', 'idle', 'idle'])
+	assert.deepEqual(state.tabs.map((tab) => tab.state), ['idle', 'idle', 'idle'])
+	assert.equal(state.activeId, 'local')
+	assert.equal(h.stops.length, 0, 'a cold boot started something to stop')
+	assert.equal(h.connectCalls.length, 0, 'a cold boot reached a device')
+})
+
+await test('connecting the local tab adopts or starts a host that outlives the app', async () => {
+	const h = harness({ devices: book })
+	await h.coldBoot()
+	const result = await h.call('tabs:activate', 'local')
+	assert.equal(result.tabs[0].state, 'running')
+	assert.equal(result.tabs[0].persistent, true, 'the local host is not marked persistent')
+	assert.equal(h.stops.length, 0)
 })
 
 console.log('guest sessions')
@@ -1080,9 +1139,11 @@ await test('quitting tears down a connect that has not finished', async () => {
 	const activating = h.call('tabs:activate', 'dev-a')
 	await began.promise
 	h.emitApp('before-quit')
-	// The local tab, which is up, plus the connect that was in flight.
+	// Only the connect in flight is this application's to end. The local tab is
+	// a host that outlives the window, so quitting lets go of it instead.
 	assert.equal(connection.stopCount(), 1, 'quitting left the connect in flight running')
-	assert.equal(h.stops.length, 2, `expected the local tab and the pending connect, saw ${String(h.stops.length)}`)
+	assert.equal(h.stops.length, 1, `expected only the pending connect, saw ${String(h.stops.length)}`)
+	assert.equal(h.localHostStops.length, 0, 'quitting ended the local host')
 	connection.settle()
 	await activating
 })
@@ -1178,23 +1239,28 @@ await test('a rejection above the connect does not end the process silently', as
 	}
 })
 
-await test('the local tab cannot be disconnected out from under the operator', async () => {
+await test('disconnecting the local tab lets go of the host without ending it', async () => {
 	const h = harness({ devices: book })
 	await h.boot()
 	await h.call('tabs:disconnect', 'local')
-	assert.equal((await h.state()).tabs[0].state, 'running')
-	assert.equal(h.stops.length, 0)
+	const tab = (await h.state()).tabs[0]
+	assert.equal(tab.state, 'idle', 'a local host with no tunnel should offer Connect again')
+	assert.equal(h.stops.length, 0, 'the local host was killed by a disconnect')
+	assert.equal(h.localHostStops.length, 0, 'a disconnect ended the local host')
 })
 
-await test('quitting tears down every tab that is up', async () => {
+await test('quitting lets go of the local host but still tears down device tunnels', async () => {
 	const h = harness({ devices: book })
 	await h.boot()
 	await h.call('devices:list')
 	h.queue.push(h.ok())
 	await h.call('tabs:activate', 'dev-a')
 	h.emitApp('before-quit')
-	// local plus dev-a.
-	assert.equal(h.stops.length, 2, `expected two stops, saw ${String(h.stops.length)}`)
+	// The device tunnel is this application's to end; the local host is not.
+	assert.equal(h.stops.length, 1, `expected one stop, saw ${String(h.stops.length)}`)
+	assert.equal(h.localHostStops.length, 0, 'quitting ended the local host')
+	const tab = (await h.state()).tabs.find((entry) => entry.id === 'local')
+	assert.equal(tab.state, 'idle', 'a local host with no tunnel should offer Connect again')
 })
 
 console.log('password auth')
@@ -1376,7 +1442,10 @@ await test('restarting the local tab replaces the Harness instead of closing the
 	const after = (await h.state()).tabs[0]
 	assert.equal(after.state, 'running')
 	assert.equal(after.url, 'http://127.0.0.1:20001/', 'the tab is still on the connection it was told to replace')
-	assert.equal(h.stops.length, 1, `the old connection was torn down ${String(h.stops.length)} times`)
+	// A restart is the one control that ends a local host; an ordinary teardown
+	// only lets go of it. Nothing else in the application is asked to stop here.
+	assert.equal(h.localHostStops.length, 1, `the old local host was ended ${String(h.localHostStops.length)} times`)
+	assert.equal(h.stops.length, 0, 'an ordinary teardown was used instead of Stop host')
 })
 
 await test('a restart connects nothing until the old process has actually gone', async () => {
@@ -1934,6 +2003,7 @@ await test('the popover is told what this machine can open', async () => {
 	)
 })
 
+assertScratch(HOME, { label: 'scratch home', alsoProtect: [ROOT] })
 rmSync(HOME, { recursive: true, force: true })
 
 console.log(`\n${String(passes)} checks passed${failures.length === 0 ? '' : `, ${String(failures.length)} failed`}`)

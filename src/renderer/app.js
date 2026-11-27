@@ -118,6 +118,7 @@ function renderTabs() {
 			restart.textContent = '⟲'
 			restart.title =
 				tab.kind === 'local' ? 'Restart the local Harness' : tab.kind === 'terminal' ? 'Reconnect the terminal' : 'Reconnect'
+			restart.setAttribute('aria-label', restart.title)
 			restart.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void answerPasswordRequests((secret) => api.restart(tab.id, secret)).then(apply)
@@ -129,11 +130,11 @@ function renderTabs() {
 		// the configured things and stays in the bar, so the next click or
 		// Alt+digit brings it straight back. Removing a device lives in the popover.
 		//
-		// The local tab has no `×` and that is deliberate, not an omission: nothing
-		// recreates it, so stopping it there would leave a tab that can never come
-		// back. Restart above is what the local Harness gets instead, and it is the
-		// operation that is actually wanted.
-		if (tab.id !== 'local' && tab.state !== 'idle') {
+		// The local tab has a `×` now that its Harness is a recorded host: letting
+		// go of it leaves the host running, and the next Connect adopts it. There
+		// is no state that can strand the tab the way it could when the Harness
+		// was a child of this window.
+		if (tab.state !== 'idle') {
 			const stop = document.createElement('button')
 			stop.type = 'button'
 			stop.className = 'tab-close'
@@ -142,6 +143,7 @@ function renderTabs() {
 			// window by design, so the title has to say so rather than promise a stop
 			// it does not perform.
 			stop.title = tab.kind === 'terminal' ? 'Close terminal' : tab.persistent === true ? 'Disconnect (the host keeps running)' : 'Disconnect'
+			stop.setAttribute('aria-label', stop.title)
 			stop.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void api.disconnect(tab.id).then(apply)
@@ -158,6 +160,7 @@ function renderTabs() {
 			reap.className = 'tab-reap'
 			reap.textContent = '■'
 			reap.title = 'Stop the host on the far side. Anything it is running stops.'
+			reap.setAttribute('aria-label', reap.title)
 			reap.addEventListener('click', (event) => {
 				event.stopPropagation()
 				void api.reap(tab.id).then(apply)
@@ -400,20 +403,20 @@ function ensureTerminalView(tab) {
 		// The application's own palette, restated because xterm paints on a canvas
 		// and cannot read the CSS variables the rest of the window uses.
 		theme: {
-			background: '#16161a',
-			foreground: '#e6e6ea',
-			cursor: '#5b9dff',
-			cursorAccent: '#16161a',
+			background: '#15161b',
+			foreground: '#ececf2',
+			cursor: '#6aa5ff',
+			cursorAccent: '#15161b',
 			selectionBackground: '#33415c',
-			black: '#16161a',
+			black: '#15161b',
 			red: '#e2605e',
 			green: '#4ec97a',
 			yellow: '#e0a33e',
-			blue: '#5b9dff',
+			blue: '#6aa5ff',
 			magenta: '#b48ce6',
 			cyan: '#4ec9c9',
-			white: '#e6e6ea',
-			brightBlack: '#6f6f7a',
+			white: '#ececf2',
+			brightBlack: '#71768a',
 			brightRed: '#ff7b78',
 			brightGreen: '#6fe39a',
 			brightYellow: '#f2bb5c',
@@ -938,6 +941,14 @@ function renderPopover() {
 		})
 		row.appendChild(main)
 
+		// The controls used to be siblings of the label in one 380px flex row. With a
+		// handful of addresses the address picker, the buttons and the inline editor
+		// all fought for the same width and ended up on top of each other. Each group
+		// now owns a line of its own: what a machine *is*, what you can *do* to it, and
+		// how you *reach* it. The editor is a fourth line, full width, when asked for.
+		const actions = document.createElement('div')
+		actions.className = 'row-actions'
+
 		// A terminal is opened by name, from the device it belongs to, and is a tab
 		// of its own rather than a mode of the Harness tab: the two sessions are
 		// independent, and closing one must not close the other.
@@ -950,7 +961,7 @@ function renderPopover() {
 			popoverEl.hidden = true
 			void answerPasswordRequests((secret) => api.terminalOpen(device.id, secret)).then(apply)
 		})
-		row.appendChild(openTerminal)
+		actions.appendChild(openTerminal)
 
 		// The per-device switch for the persistent mode. It sits on the device row rather
 		// than in the add form because it is a property of a machine that is already in
@@ -974,7 +985,7 @@ function renderPopover() {
 					popoverEl.appendChild(hint)
 				})
 		})
-		row.appendChild(persistent)
+		actions.appendChild(persistent)
 
 		const remove = document.createElement('button')
 		remove.type = 'button'
@@ -983,7 +994,8 @@ function renderPopover() {
 		remove.addEventListener('click', () => {
 			void api.remove(device.id).then(() => refreshDevices())
 		})
-		row.appendChild(remove)
+		actions.appendChild(remove)
+		row.appendChild(actions)
 
 		/** Report a refused address edit where the operator was looking. */
 		const complain = (error) => {
@@ -992,6 +1004,11 @@ function renderPopover() {
 			hint.textContent = String(error?.message ?? error)
 			popoverEl.appendChild(hint)
 		}
+
+		// Addressing gets its own line. It is the part that grows with the number of
+		// IPs, so it must never compete with the action buttons for width.
+		const addressLine = document.createElement('div')
+		addressLine.className = 'row-address'
 
 		// The saved choice, when there is one, is a property of the device: the
 		// main process writes it to the book, so it survives a restart. "Auto"
@@ -1020,7 +1037,7 @@ function renderPopover() {
 				.then(() => refreshDevices())
 				.catch(complain)
 		})
-		row.appendChild(choice)
+		addressLine.appendChild(choice)
 
 		// Addresses can be added or changed after a device was created — the
 		// original "+" form only asks for one. The first line is the primary
@@ -1033,8 +1050,14 @@ function renderPopover() {
 		const editor = document.createElement('div')
 		editor.className = 'address-editor'
 		editor.hidden = true
+		// The hint travels with the field: "first line is primary" is the one thing
+		// a list of addresses cannot say for itself, and the overlap this replaces
+		// used to hide the field entirely on a narrow popover.
+		const editorHint = document.createElement('div')
+		editorHint.className = 'hint'
+		editorHint.textContent = 'One address per line. The first is primary; the rest are fallbacks.'
 		const area = document.createElement('textarea')
-		area.rows = 3
+		area.rows = 4
 		area.value = formatAddressEntries(device)
 		const saveAddresses = document.createElement('button')
 		saveAddresses.type = 'button'
@@ -1054,12 +1077,13 @@ function renderPopover() {
 				.then(() => refreshDevices())
 				.catch(complain)
 		})
-		editor.append(area, saveAddresses)
+		editor.append(editorHint, area, saveAddresses)
 		addressButton.addEventListener('click', () => {
 			editor.hidden = !editor.hidden
 			if (!editor.hidden) area.value = formatAddressEntries(device)
 		})
-		row.append(addressButton, editor)
+		addressLine.appendChild(addressButton)
+		row.append(addressLine, editor)
 
 		popoverEl.appendChild(row)
 	}

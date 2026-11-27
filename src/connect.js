@@ -13,8 +13,9 @@
  */
 
 const { spawn, spawnSync } = require('node:child_process')
-const { existsSync } = require('node:fs')
+const { existsSync, readFileSync } = require('node:fs')
 const { join } = require('node:path')
+const { homedir } = require('node:os')
 const net = require('node:net')
 
 const remote = require('./remote.js')
@@ -504,7 +505,7 @@ function awaitReady(child, onLine, timeoutMs, check = waitForHttpReady) {
  * @param onLine - receives each transcript line.
  * @returns the URL and whether it was adopted, or the reason it failed.
  */
-function awaitEnsure(child, onLine) {
+function awaitEnsure(child, onLine, spawnName = 'ssh') {
 	return new Promise((resolve) => {
 		let raw = ''
 		let err = ''
@@ -578,7 +579,7 @@ function awaitEnsure(child, onLine) {
 			finish({ error: said ?? (err.trim().split(/\r?\n/u)[0] || 'the persistent host command exited without announcing a URL') })
 		})
 		child.once('error', () => {
-			finish({ error: 'ssh could not be started', stop: true })
+			finish({ error: `${spawnName} could not be started`, stop: true })
 		})
 	})
 }
@@ -1203,6 +1204,143 @@ async function connectLocal(options = {}) {
 }
 
 /**
+ * The local Harness is a host, not a child of this application.
+ *
+ * **Why this is not `connectLocal` with a different teardown.** That function
+ * spawns `dsh web` with a pipe as its stdin: on POSIX the server's lifetime is
+ * bound to that pipe reaching EOF, which happens the moment this application
+ * exits. Skipping `stop()` on quit would therefore still kill it, and on Windows
+ * it would survive but leave no record of its port or token — the next Connect
+ * would start a second Harness over the same DSH home, which is the state that
+ * produces `session/writer-held`. A local host that outlives the window has to
+ * be a *detached, recorded* host, and the protocol for exactly that already
+ * exists in `remote.js` for persistent machines. Running the same ensure and
+ * stop programs on this machine gives the local tab adoption and a durable
+ * record without duplicating the protocol.
+ *
+ * The application therefore does not start it at boot and does not end it at
+ * quit. Connect starts or adopts it; Disconnect lets go of it; Stop host is the
+ * one explicit action that ends it.
+ */
+
+/** The shell family of the machine this application is running on. */
+function localFamily() {
+	return process.platform === 'win32' ? 'windows' : 'posix'
+}
+
+/**
+ * Run one host program on this machine.
+ *
+ * The Windows half reuses `remote.windowsCommand` rather than spelling the
+ * PowerShell flags again, so the encoding stays the one the protocol already
+ * pins; its encoded argument contains no spaces, so splitting the command is
+ * safe. POSIX uses the same interactive login bash as a remote command, for the
+ * same reason: `dsh` may only be on PATH after `~/.bashrc` has run.
+ *
+ * @param program - the ensure or stop program.
+ * @returns a command and its argv.
+ */
+function localHostArgv(program, platform = process.platform) {
+	if (platform === 'win32') {
+		const parts = remote.windowsCommand(program).split(' ')
+		return { command: parts[0], args: parts.slice(1) }
+	}
+	return { command: 'bash', args: ['-lic', program] }
+}
+
+/** The recorded local host, when the record still names a live process. */
+function localHostAlive() {
+	try {
+		const home = process.env.DSH_HOME === undefined || process.env.DSH_HOME === '' ? join(homedir(), '.dsh') : process.env.DSH_HOME
+		const record = JSON.parse(readFileSync(join(home, remote.HOST_DIR, remote.HOST_RECORD_FILE), 'utf8'))
+		if (!Number.isInteger(record.pid)) return false
+		// Signal 0 asks the OS whether the pid exists without sending anything.
+		process.kill(record.pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/**
+ * End the recorded local host, from an explicit operator action.
+ *
+ * The program owns the record: it checks the pid is still a Harness, kills it
+ * and removes the file. Nothing here infers a port or a pid from this process's
+ * memory, because this is also how a host from an earlier run is stopped.
+ *
+ * @param options - `onLine` for the transcript.
+ */
+async function stopLocalHost(options = {}) {
+	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
+	const { command, args } = localHostArgv(remote.persistentStopProgram({}, localFamily()))
+	const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+	for (const [stream, prefix] of [[child.stdout, ''], [child.stderr, '! ']]) {
+		stream?.setEncoding('utf8')
+		stream?.on('data', (chunk) => {
+			for (const line of String(chunk).split(/\r?\n/u)) {
+				if (line.trim() !== '') onLine(prefix + line)
+			}
+		})
+	}
+	await new Promise((resolve) => {
+		child.once('exit', resolve)
+		child.once('error', resolve)
+	})
+}
+
+/**
+ * Start or adopt the local Harness, for the local tab.
+ *
+ * @param options - `onLine` for the transcript and `onChild` to stop the one-shot
+ *   ensure client if the connect is cancelled while it runs.
+ * @returns the connection, or `{ error }`.
+ */
+async function connectLocalPersistent(options = {}) {
+	const onLine = typeof options.onLine === 'function' ? options.onLine : () => {}
+	const version = await localVersion()
+	if (version.problem !== null) {
+		onLine(`! ${version.problem}`)
+		return { error: version.problem }
+	}
+	if (version.reported !== null) onLine(`local dsh: ${version.reported}`)
+	if (options.signal?.aborted === true) return { error: 'the connect was stopped before it finished' }
+
+	const family = localFamily()
+	const { command, args } = localHostArgv(remote.persistentEnsureProgram({}, family))
+	onLine(`host program: ${command} <ensure>`)
+	const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+	// The ensure program is one-shot. Cancelling kills the *client*, never the
+	// host it may already have started — that host belongs to the record now.
+	const stopClient = () => {
+		try {
+			child.kill()
+		} catch {
+			/* already gone */
+		}
+	}
+	if (typeof options.onChild === 'function') options.onChild(stopClient)
+	options.signal?.addEventListener('abort', stopClient, { once: true })
+	const ensured = await awaitEnsure(child, onLine, family === 'windows' ? 'powershell' : 'bash')
+	if (ensured.error !== undefined) return { error: ensured.error }
+	const parsed = remote.parseReadyUrl(ensured.url)
+	onLine(ensured.adopted === true ? 'reusing the local host this machine already had' : 'started a local host that outlives this application')
+	return {
+		url: ensured.url,
+		port: parsed.port,
+		persistent: true,
+		adopted: ensured.adopted === true,
+		platform: family,
+		// There is no child to end here. Disconnect and quit both let go; only
+		// Stop host calls `terminate`, which runs the protocol's stop program.
+		stop() {},
+		detach() {},
+		terminate: () => stopLocalHost({ onLine }),
+		stillRunning: () => localHostAlive()
+	}
+}
+
+/**
  * Pick the address a connect will use.
  *
  * Exported so a terminal — which opens ssh without going through `connectRemote`
@@ -1238,4 +1376,4 @@ async function stopHost(device, platform = 'posix', options = {}) {
 	return stopPersistentHost(chosen.device, platform, sshExecutable(), onLine, authEnvFor(chosen.device, options))
 }
 
-module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, resolveAddress, connectRemote, connectLocal, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }
+module.exports = { sshExecutable, freePort, waitForLocalPort, waitForHttpReady, awaitReady, readableStderr, readyUrl: remote.readyUrl, detectPlatform, resolveAddress, connectRemote, connectLocal, connectLocalPersistent, stopLocalHost, localHostArgv, localHostAlive, stopHost, localVersion, SSH_FAILURE, HTTP_READY_TIMEOUT_MS, APP_MOUNT }

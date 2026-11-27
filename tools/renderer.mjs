@@ -322,7 +322,7 @@ function threeTabs() {
 	return {
 		activeId: 'local',
 		tabs: [
-			{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/', partition: 'dsh-tabs-guest-local' },
+			{ id: 'local', kind: 'local', label: 'Local', state: 'running', url: 'http://127.0.0.1:1000/', partition: 'dsh-tabs-guest-local', persistent: true },
 			{ id: 'dev-a', kind: 'remote', label: 'box-a', state: 'running', url: 'http://127.0.0.1:1001/?token=a', partition: 'dsh-tabs-guest-dev-a' },
 			{ id: 'dev-b', kind: 'remote', label: 'box-b', state: 'idle' }
 		]
@@ -709,8 +709,9 @@ await test('the disconnect control appears only when there is something to stop'
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
 	const tabs = h.tabs()
-	// local is never stoppable, an idle device has nothing to stop, a running one does.
-	assert.equal(tabs[0].querySelector('.tab-close'), null)
+	// Every running tab can be let go of, including the local one: its host
+	// survives the disconnect. An idle device has nothing to stop.
+	assert.equal(tabs[0].querySelector('.tab-close')?.title, 'Disconnect (the host keeps running)')
 	assert.equal(tabs[1].querySelector('.tab-close')?.title, 'Disconnect')
 	assert.equal(tabs[2].querySelector('.tab-close'), null)
 	tabs[1].querySelector('.tab-close').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
@@ -718,16 +719,21 @@ await test('the disconnect control appears only when there is something to stop'
 	assert.deepEqual(h.calls.filter(([name]) => name === 'disconnect'), [['disconnect', 'dev-a']])
 })
 
-await test('the local tab offers a restart instead of a control that would strand it', async () => {
-	// The local tab has no `×` on purpose — nothing recreates it — so restart is the
-	// only control it can have, and it is the one the operator actually wants: the
-	// local Harness is a child process, and replacing it used to mean closing the
-	// whole application.
+await test('the local tab can disconnect a host that outlives the window', async () => {
+	// The local Harness is a recorded host now, so `×` means "let go" and the
+	// next Connect adopts the same process. Restart still asks for a *new* one,
+	// which is why both controls belong on this tab.
 	const h = harness({ state: threeTabs(), devices: [] })
 	await h.flush()
 	const local = h.tabs()[0]
-	assert.equal(local.querySelector('.tab-close'), null, 'the local tab grew a stop control')
-	const restart = local.querySelector('.tab-restart')
+	const close = local.querySelector('.tab-close')
+	assert.ok(close !== null, 'the local tab cannot let go of its host')
+	assert.match(close.title, /keeps running/u)
+	close.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	assert.deepEqual(h.calls.filter(([name]) => name === 'disconnect'), [['disconnect', 'local']])
+	// The state push redrew the bar, so the restart control is read from the new row.
+	const restart = h.tabs()[0].querySelector('.tab-restart')
 	assert.ok(restart !== null, 'the local tab has no restart control')
 	assert.equal(restart.title, 'Restart the local Harness')
 	restart.dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
@@ -956,6 +962,34 @@ await test('the address editor can change the primary address and the list', asy
 	assert.equal(saved[1].host, '10.0.0.3')
 	assert.deepEqual(JSON.parse(JSON.stringify(saved[1].addresses)), [{ host: '10.0.0.2', label: 'LAN' }])
 	assert.equal(saved[1].addressChoice, 'auto')
+})
+
+await test('a device card keeps actions, addressing and the editor on separate lines', async () => {
+	// Reported from use: with several IPs configured, the address picker, the
+	// buttons and the inline editor were siblings in one 380px flex row and drew
+	// on top of one another. The card now gives each group its own line, and the
+	// editor is a sibling of the address line rather than a cramped flex child.
+	const h = harness({
+		state: { activeId: 'local', tabs: [] },
+		devices: [{
+			id: 'dev-a', label: 'box-a', user: 'u', host: '10.0.0.2', sshPort: 22,
+			addresses: [{ host: '10.0.0.3', label: 'Tailscale' }, { host: '192.0.2.4', label: 'LAN' }]
+		}]
+	})
+	await h.flush()
+	h.document.getElementById('add').dispatchEvent(new h.window.MouseEvent('click', { bubbles: true }))
+	await h.flush()
+	await h.flush()
+	const row = h.popover().querySelector('.row')
+	assert.ok(row.querySelector('.row-actions') !== null, 'the action controls have no line of their own')
+	const addressLine = row.querySelector('.row-address')
+	assert.ok(addressLine !== null, 'the addressing controls have no line of their own')
+	const editor = row.querySelector('.address-editor')
+	assert.equal(editor.parentElement, row, 'the editor is still packed into another control row')
+	assert.equal(addressLine.parentElement, row)
+	assert.equal(addressLine.querySelectorAll('button.address-edit').length, 1)
+	assert.match(editor.textContent, /first is primary/u)
+	assert.equal(editor.querySelector('textarea').value, '10.0.0.2\nTailscale=10.0.0.3\nLAN=192.0.2.4')
 })
 
 await test('a rejected save surfaces the reason instead of failing silently', async () => {

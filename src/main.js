@@ -554,7 +554,11 @@ function stopTab(tab, options = {}) {
 	// on the same port — and `connect.stop()` only drops the tunnel. This is what a
 	// disconnect, a quit and a lost connection all look like; `terminate` is the one
 	// that ends the host, and only a restart or an explicit "Stop host" asks for it.
-	if (connection?.persistent === true && options.keepPage === true) {
+	// A local host has no tunnel to lose, so there is no `detached` state to
+	// wait through: letting go of it leaves the tab idle with a Connect button
+	// that adopts the same host. `stop()` on a local connection is a no-op, so
+	// the ordinary path below does not end anything.
+	if (connection?.persistent === true && options.keepPage === true && tab.kind !== 'local') {
 		tab.state = 'detached'
 		connection.detach?.()
 		return
@@ -1467,11 +1471,13 @@ async function activate(id, password) {
 		/** @type {{url?: string, error?: string} & Record<string, unknown>} */
 		let result
 		if (tab.kind === 'local') {
-			// The local tab's own launch directory is not a device field, and the book
-			// is not read for it at all: after the session clear above there is nothing
-			// between here and the spawn that could change the operator's mind.
+			// The local Harness is a recorded, detached host rather than a child of
+			// this application: it survives a quit, and this connect adopts it on
+			// the next run instead of starting a second one over the same home.
+			// The one-shot ensure client is the only child handed to `runConnect`;
+			// cancelling stops that client, never the host it may have started.
 			result = await runConnect((onChild) =>
-				connect.connectLocal({
+				connect.connectLocalPersistent({
 					signal,
 					onLine: (line) => note(tab, line),
 					onChild
@@ -1953,8 +1959,11 @@ function installIpc() {
 		// `stopTab` covers a connect in flight as well as a settled one. It did not,
 		// and the `×` drawn beside a tab that says "starting" was therefore a control
 		// that did nothing at all — the exact moment an operator reaches for it.
+		//
+		// The local tab used to be excluded because nothing could recreate it. It
+		// is a recorded host now, so disconnecting it only lets go: the host keeps
+		// running and the next Connect adopts it.
 		const key = String(id)
-		if (key === LOCAL_ID) return snapshot()
 		const tab = tabs.get(key)
 		if (tab !== undefined) {
 			// A terminal's `×` is a close: the tab is a session, not a device, and
@@ -1995,9 +2004,28 @@ function installIpc() {
 		// reached from an explicit operator action, and it is awaited so the tab can
 		// show what the far side said.
 		const key = String(id)
-		if (key === LOCAL_ID) return snapshot()
 		const tab = tabs.get(key)
-		if (tab === undefined || tab.kind !== 'remote') return snapshot()
+		if (tab === undefined || (tab.kind !== 'remote' && tab.kind !== 'local')) return snapshot()
+		if (tab.kind === 'local') {
+			// The local host lives in this machine's DSH home, not in the device
+			// book, so Stop host reaches it through the local stop program instead
+			// of an ssh client. Everything else here is the same contract: only an
+			// explicit action ends a host, and the tab says what the program did.
+			tab.connection = undefined
+			cancelReconnect(tab)
+			try {
+				await connect.stopLocalHost({ onLine: (line) => note(tab, line) })
+			} catch (error) {
+				note(tab, `FAILED: ${error instanceof Error ? error.message : String(error)}`)
+			}
+			tab.url = undefined
+			tab.state = 'idle'
+			tab.persistent = undefined
+			tab.adopted = undefined
+			tab.localPort = undefined
+			publish()
+			return snapshot()
+		}
 		const platform = tab.platform ?? 'posix'
 		const stored = await devices.load()
 		const device = stored.find((entry) => entry.id === key)
@@ -2193,11 +2221,12 @@ void app
 		// `clearLegacyGuestCookies`.
 		await clearLegacyGuestCookies()
 		createWindow()
-		// The local Harness is what the operator opens the app for, so it comes up
-		// without being asked. A remote device waits to be selected.
-		await activate(LOCAL_ID)
-		// The launch check waits ten seconds: the local Harness is what the operator
-		// opened the application for, and an update dialog must not compete with it.
+		// The local tab is a host, not a child of this window: it is neither started
+		// at boot nor ended at quit. The operator connects it from its Connect button
+		// like any other machine, and a host already running from an earlier session
+		// is adopted rather than replaced. See `connectLocalPersistent`.
+		// The launch check waits ten seconds so an update dialog does not compete
+		// with the first thing the operator does.
 		// The timer is unref'd so a failed boot, or a suite that loads this file, is
 		// not held open by a check that has not run yet.
 		const updateTimer = setTimeout(() => {

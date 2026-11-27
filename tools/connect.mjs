@@ -22,6 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const require = createRequire(import.meta.url)
 const connect = require(join(ROOT, 'src', 'connect.js'))
+const remote = require(join(ROOT, 'src', 'remote.js'))
 const addresses = require(join(ROOT, 'src', 'addresses.js'))
 const localdsh = require(join(ROOT, 'src', 'localdsh.js'))
 
@@ -598,6 +599,33 @@ await test('a cancelled selection does not leave a connect guessing an address',
 		{ signal: controller.signal, probe: () => true }
 	)
 	assert.equal(result.cancelled, true)
+})
+
+console.log('the local host, which outlives this application')
+
+await test('the local ensure runs the recorded-host protocol, not a child process', async () => {
+	// The local tab used to spawn `dsh web` with a pipe as its stdin: on POSIX that
+	// pipe closing at process exit ended the server, and on Windows the surviving
+	// process had no recorded port or token for the next launch to adopt. Both are
+	// why a host meant to outlive the window has to use the same detached, recorded
+	// protocol a persistent remote already uses.
+	const argv = connect.localHostArgv(remote.persistentEnsureProgram({}, 'posix'), 'posix')
+	assert.equal(argv.command, 'bash')
+	assert.deepEqual(argv.args.slice(0, 1), ['-lic'])
+	assert.match(argv.args[1], /nohup dsh web/u)
+	assert.match(argv.args[1], /host\.json/u)
+	assert.match(argv.args[1], /HOST adopted/u, 'an existing local host would not be reused')
+})
+
+await test('the local stop program reaches the same record on Windows', async () => {
+	// The Windows half must carry the whole PowerShell program byte-for-byte:
+	// nesting quotes through `cmd /c` is what broke an earlier remote launcher.
+	const argv = connect.localHostArgv(remote.persistentStopProgram({}, 'windows'), 'win32')
+	assert.equal(argv.command, 'powershell')
+	assert.ok(argv.args.includes('-EncodedCommand'))
+	const decoded = Buffer.from(argv.args.at(-1), 'base64').toString('utf16le')
+	assert.match(decoded, /host\.json/u)
+	assert.match(decoded, /HOST stopped/u)
 })
 
 console.log(`\n${String(passes)} checks passed${failures.length === 0 ? '' : `, ${String(failures.length)} failed`}`)

@@ -132,8 +132,9 @@ installed by hand; only the versions that contain the updater can update themsel
   looking at it.
 - **`⟲` restarts** the tab's Harness: it stops what is running, waits for the
   process to be gone, and connects again. This is how you pick up a change to `dsh`
-  or to a profile — the operation that used to mean closing the application. The
-  local tab has `⟲` and no `×`, because nothing recreates a tab that was stopped.
+  or to a profile — the operation that used to mean closing the application. A
+  persistent host, including the local one, also has `■` to **Stop host**: `×` only
+  lets go of it, and `■` is the one control that ends it.
 - **`Alt+1…9`** selects a tab, from anywhere, including while you are typing
   inside a remote interface.
 - **`+`** lists the devices, adds one, and removes one. A row's **Auto / address**
@@ -1160,6 +1161,17 @@ tools/make-ico.cjs     those PNGs into one .ico
 paths in `index.html` are relative to the packaged layout, and `test:smoke` is what
 pins the files they name.
 
+**A device in the popover is a card, not a line of controls.** The picker, the
+action buttons and the inline address editor used to be siblings in one 380px flex
+row; with several addresses configured they drew on top of each other. The card now
+stacks what a machine *is*, what you can *do* to it and how you *reach* it, and the
+editor is a full-width line below both. The popover width follows the window on a
+narrow desktop, and `tools/renderer.mjs` pins the structure so the overlap cannot
+come back quietly. The palette is the Android client's dark one — including the
+contrast floors that client measures — and keyboard focus, reduced motion and
+narrow-window rules live in `style.css` rather than in inline styles, which the
+renderer's content policy forbids.
+
 **The icon is generated from a drawing, once per size, and the small rungs come from
 a second drawing.** `assets/icon.svg` says what the application is — a window with a
 tab bar, a dashed link out to two more machines, which is the sentence this whole
@@ -1300,7 +1312,37 @@ run no second local Harness) remain valid, but none of them was the actual fix, 
 of them is needed on a current install. The third one is no longer something an
 operator has to arrange: there is one instance and one local Harness, by construction.
 
+## The local Harness is a host, not a child of this window
+
+A cold start leaves the Local tab idle and starts nothing; the operator presses
+**Connect** when they want the Harness. Closing the window does not end it either.
+The local tab keeps the page's session only for the window that is showing it, so
+a host that outlives the window has to outlive its port, token and pid too — which
+is the problem the persistent-host protocol in `remote.js` already solves for
+machines reached over ssh. `connectLocalPersistent` runs that same ensure program
+on this machine: it adopts the host recorded in `$DSH_HOME/dsh-tabs/host.json`, or
+starts one detached and records it. `stopLocalHost` runs the matching stop program
+from an explicit **Stop host** action, and nothing else ends one.
+
+That is why the tab now has both `×` and `■` like a persistent device: `×` lets go
+of the host, leaving the tab idle so the next Connect adopts it; `■` ends the host
+and its Sessions, and `⟲` is the one operation that replaces it with a new one.
+`before-quit` no longer kills a local Harness. The three obligations this removes
+from the application are the reason for the change: no process to auto-start at
+boot, no port to hold hostage until the window closes, and no second Harness over
+one DSH home after a restart — two such processes contend for Session write
+leases and produce `session/writer-held`.
+
+`tools/main.mjs` drives the application with a stubbed connect path and asserts
+that a cold boot connects nothing, that quitting ends device tunnels but not the
+local host, and that only Restart/Stop host end one. `tools/connect.mjs` checks
+that the local argv really runs the recorded-host programs on both shell families.
+
 ## Restarting, one instance, and what "the web process is still there" was
+
+> The first paragraph below describes how things worked when the local Harness was
+> a child of this application. It is kept as the record of that design and of the
+> leak it fixed; the process that describes the current design is the section above.
 
 Closing the window is clean — verified on a real instance with nothing else running:
 `CloseMainWindow` on the window quits the application, the tree kill in `connect.js`
@@ -1888,7 +1930,7 @@ inside `$DSH_HOME`, which is where this application has to live:
 | Variable | Why |
 | --- | --- |
 | `DSH_REMOTE_DEVICES_PLUGIN` | The path to the plugin's `index.js`, for the parity check. Without it a few plausible locations are tried, and if none matches the check reports **SKIP** rather than passing quietly — losing it means losing the only thing that notices the copy drifting. |
-| `DSH_TABS_TEST_HOME` | Where `test:main` puts its scratch device book. The suite creates a directory, and some environments refuse that outside their own workspace. Unset, it tries `<repo>\.tmp-main-test` and then the system temp directory, and prints which one it used. |
+| `DSH_TABS_TEST_HOME` | Where `test:main` puts its scratch device book. The suite creates a directory, and some environments refuse that outside their own workspace. Unset, it tries `<repo>\.tmp-main-test` and then the system temp directory, and prints which one it used. The value is **validated** before anything is removed: a path that is, contains, or would delete `$HOME`, `$DSH_HOME`, a system directory, or this repository is refused with an error instead of being deleted. |
 
 > **Never run these files directly against a real `$DSH_HOME`.** `test:main`
 > overwrites the device book it is pointed at — that is how it arranges each
